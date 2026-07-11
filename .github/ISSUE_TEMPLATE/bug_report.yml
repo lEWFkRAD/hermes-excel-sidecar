@@ -1,0 +1,33 @@
+name: Bug report
+description: Report reproducible behavior without private workbook data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Never include workbook data, client information, tokens, attachments, or logs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Excel/Office build, OS, Node, port, and Hermes version.
+    validations:
+      required: true
