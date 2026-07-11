@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml)
 
-This standalone MIT-licensed distribution is proposed upstream in
+This is an independently installable Hermes plugin. It does not require an
+upstream Hermes PR to merge. The original integration lineage remains at
 [NousResearch/hermes-agent#44356](https://github.com/NousResearch/hermes-agent/pull/44356).
 Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and
 [SECURITY.md](SECURITY.md) before contributing or deploying.
@@ -74,6 +75,23 @@ schema, the read loop, and the formula-anchoring contract.
   Windows.
 
 ## Run
+
+Install the plugin directly from GitHub:
+
+```powershell
+hermes plugins install lEWFkRAD/hermes-excel-sidecar --enable
+hermes excel-sidecar check
+hermes excel-sidecar install
+hermes excel-sidecar status
+```
+
+To remove the per-user Excel installation without uninstalling the plugin:
+
+```powershell
+hermes excel-sidecar rollback
+```
+
+For development without plugin installation:
 
 From this directory:
 
