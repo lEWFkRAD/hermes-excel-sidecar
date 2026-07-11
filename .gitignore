@@ -2,3 +2,6 @@ uploads/
 exports/
 *.log
 
+__pycache__/
+*.pyc
+
