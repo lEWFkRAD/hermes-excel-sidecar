@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { mkdtemp, mkdir, writeFile, symlink, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   parseDelimitedText,
   markdownTableFromRows,
@@ -7,6 +10,8 @@ import {
   normalizeMatrix,
   normalizeAction,
   normalizeActions,
+  removeSatisfiedReadActions,
+  doclingTextFromResponse,
   legacyWriteToActions,
   parseMoney,
   extractedField,
@@ -25,12 +30,15 @@ import {
   buildChatMessages,
   buildSystemPrompt,
   fallbackResponse,
+  diagnosticFallback,
+  resolveContainedNativePath,
   scanWrittenCells,
   matrixToCsv,
   safeExportName,
   expectsWorkbookActions,
   claimsWorkbookChange,
   promptWantsWorkbookOutput,
+  parseHermesApiServerKey,
 } from "./server.mjs";
 import {
   columnLettersToNumber,
@@ -39,6 +47,50 @@ import {
   translateFormula,
   translateMatrixFormulas,
 } from "./formula-rebase.mjs";
+
+test("diagnosticFallback: certification failures never create workbook actions", () => {
+  const body = { prompt: "Parse this PDF and make a workbook", files: [{ name: "bank.pdf", extracted_text: "Balance 123" }] };
+  for (const reason of ["adapter_unavailable", "adapter_invalid", "adapter_timeout", "canceled"]) {
+    const result = diagnosticFallback(body, reason);
+    assert.deepStrictEqual(result.actions, []);
+    assert.equal(result.source, "fallback");
+    assert.equal(result.fallback_reason, reason);
+  }
+});
+
+test("Hermes API key parser accepts legacy root and nested config shapes", () => {
+  assert.equal(parseHermesApiServerKey("API_SERVER_KEY: root-secret\n"), "root-secret");
+  assert.equal(parseHermesApiServerKey("api_server:\n  enabled: true\n  api_key: nested-secret\n"), "nested-secret");
+  assert.equal(parseHermesApiServerKey("API_SERVER_KEY: old\napi_server:\n  key: newest\n"), "newest");
+});
+
+test("Docling v1 response extraction prefers markdown and supports text fallback", () => {
+  assert.equal(doclingTextFromResponse({ document: { md_content: "# Parsed" } }), "# Parsed");
+  assert.equal(doclingTextFromResponse({ document: { text_content: "plain" } }), "plain");
+  assert.equal(doclingTextFromResponse({ status: "failure" }), "");
+});
+
+test("Docling native path containment: child accepted; siblings and symlink escapes rejected", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "excel-docling-"));
+  try {
+    const root = path.join(temp, "root");
+    const sibling = path.join(temp, "root-evil");
+    await mkdir(root);
+    await mkdir(sibling);
+    const child = path.join(root, "result.md");
+    const outside = path.join(sibling, "secret.md");
+    await writeFile(child, "ok");
+    await writeFile(outside, "no");
+    assert.equal(await resolveContainedNativePath(root, child), child);
+    await assert.rejects(resolveContainedNativePath("", child), /configured output dir/);
+    await assert.rejects(resolveContainedNativePath(root, outside), /outside/);
+    const link = path.join(root, "escape-dir");
+    await symlink(sibling, link, "junction");
+    await assert.rejects(resolveContainedNativePath(root, path.join(link, "secret.md")), /outside/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
 
 test("parseDelimitedText: quoted cells, escaped quotes, CRLF, blank rows, TSV", () => {
   const csv = 'a "b", c\r\n"d ""e"", f"\r\n';
@@ -250,6 +302,19 @@ test("normalizeActions: prefers actions array, falls back to legacy write", () =
 
   assert.deepStrictEqual(normalizeActions({ write: { mode: "none", values: [[1]] } }, {}), []);
   assert.deepStrictEqual(legacyWriteToActions(null, {}), []);
+});
+
+test("removeSatisfiedReadActions removes only successful exact prior reads", () => {
+  const actions = [
+    { type: "read_range", range: "'Sheet 1'!$A$1:$B$2" },
+    { type: "read_range", range: "Sheet2!A1:C3" },
+    { type: "write_cells", start_cell: "D1", values: [[1]] },
+  ];
+  const filtered = removeSatisfiedReadActions(actions, [
+    { range: "'Sheet 1'!A1:B2", values: [[1]] },
+    { range: "Sheet2!A1:C3", error: "read failed" },
+  ]);
+  assert.deepStrictEqual(filtered, [actions[1], actions[2]]);
 });
 
 test("parseMoney: plain, currency, paren negatives, blanks, unparseable", () => {

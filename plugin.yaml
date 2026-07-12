@@ -1,6 +1,6 @@
 manifest_version: 1
 name: hermes-excel-sidecar
-version: 0.1.0
+version: 0.2.0
 description: >
   Install and operate the local Office.js task pane and authenticated bridge
   that connects Microsoft Excel to Hermes through structured workbook actions.
@@ -8,9 +8,15 @@ author: Jeffrey Watts
 kind: standalone
 platforms:
   - windows
-provides_tools: []
-requires_env: []
+provides_tools:
+  - excel_response
+requires_env:
+  - name: HERMES_EXCEL_INGEST_TOKEN
+    description: Shared secret between the bridge and Excel platform adapter
+    secret: true
 optional_env:
+  - name: HERMES_EXCEL_ALLOW_ALL_USERS
+    description: Allow token-authenticated dynamic workbook identities (must remain true for the local adapter)
   - name: HERMES_EXCEL_BRIDGE_TOKEN
     description: Per-install token required by the local Excel bridge API
     secret: true

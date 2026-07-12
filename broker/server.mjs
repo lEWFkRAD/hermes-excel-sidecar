@@ -1,5 +1,6 @@
 import http from "node:http";
-import { readFile, writeFile, mkdir, readdir, stat, unlink } from "node:fs/promises";
+import https from "node:https";
+import { readFile, writeFile, mkdir, readdir, stat, unlink, realpath } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,6 +17,13 @@ import {
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const port = Number(process.env.PORT || 8787);
+const tlsCertPath = process.env.HERMES_EXCEL_TLS_CERT || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.crt");
+const tlsKeyPath = process.env.HERMES_EXCEL_TLS_KEY || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.key");
+const tlsEnabled = existsSync(tlsCertPath) && existsSync(tlsKeyPath);
+const allowInsecureHttp = process.env.HERMES_EXCEL_ALLOW_INSECURE_HTTP === "1";
+if (!tlsEnabled && !allowInsecureHttp) {
+  throw new Error(`Hermes Excel requires localhost TLS; missing certificate or key (${tlsCertPath}, ${tlsKeyPath}).`);
+}
 
 // Writable data root, deliberately OUTSIDE the served web root so uploaded source
 // documents and exported CSVs are never reachable over HTTP (serveStatic only ever
@@ -30,8 +38,8 @@ const bridgeToken = process.env.HERMES_EXCEL_BRIDGE_TOKEN || "";
 // Only the bridge's own origin(s) may call /api/* — defeats arbitrary websites and
 // DNS-rebinding from reaching the loopback bridge. Comma-list extra origins if needed.
 const allowedOrigins = new Set([
-  `http://localhost:${port}`,
-  `http://127.0.0.1:${port}`,
+  `https://localhost:${port}`,
+  `https://127.0.0.1:${port}`,
   ...(process.env.HERMES_EXCEL_ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean),
 ]);
 
@@ -41,6 +49,12 @@ const llmApiKey = process.env.HERMES_EXCEL_LLM_API_KEY || readHermesApiServerKey
 const llmTimeoutMs = Number(process.env.HERMES_EXCEL_LLM_TIMEOUT_MS || 180000);
 const llmRequestBudgetMs = Number(process.env.HERMES_EXCEL_LLM_REQUEST_BUDGET_MS || 420000);
 const llmMaxTokens = Number(process.env.HERMES_EXCEL_LLM_MAX_TOKENS || 8000);
+const excelAdapterUrl = (process.env.HERMES_EXCEL_ADAPTER_URL || "http://127.0.0.1:8794/ingest").replace(/\/$/, "");
+const excelAdapterToken = process.env.HERMES_EXCEL_INGEST_TOKEN || "";
+// Certified releases have exactly one model boundary: the typed Excel adapter.
+// Legacy parser helpers remain temporarily for isolated regression tests only.
+const allowRawFallback = false;
+const excelTransport = "platform-only";
 const maxPromptChars = Number(process.env.HERMES_EXCEL_MAX_PROMPT_CHARS || 180000);
 const doclingBaseUrl = (process.env.HERMES_EXCEL_DOCLING_URL || "http://127.0.0.1:8200").replace(/\/$/, "");
 const doclingTimeoutMs = Number(process.env.HERMES_EXCEL_DOCLING_TIMEOUT_MS || 300000);
@@ -98,8 +112,19 @@ function readHermesApiServerKey() {
 
   try {
     const text = readFileSync(configPath, "utf8");
+    return parseHermesApiServerKey(text);
+  } catch {}
+
+  return "";
+}
+
+function parseHermesApiServerKey(text) {
     const lines = text.split(/\r?\n/);
     const matches = [];
+    for (const line of lines) {
+      const key = line.match(/^API_SERVER_KEY:\s*['"]?([^'"\r\n#]+)['"]?/);
+      if (key?.[1]) matches.push(key[1].trim());
+    }
     for (let index = 0; index < lines.length; index += 1) {
       const section = lines[index].match(/^(\s*)api_server:\s*$/);
       if (!section) continue;
@@ -114,9 +139,7 @@ function readHermesApiServerKey() {
       }
     }
     if (matches.length) return matches.at(-1);
-  } catch {}
-
-  return "";
+    return "";
 }
 
 // CORS is an allowlist, never "*". A same-origin request (the pane fetching the
@@ -185,29 +208,40 @@ async function healthStatus() {
     llmModel,
     doclingBaseUrl,
     time: new Date().toISOString(),
+    bridge_ready: true,
+    hermes_adapter_ready: false,
+    attachment_parser_ready: false,
+    raw_fallback_enabled: allowRawFallback,
     hermes: { ok: false },
     docling: { ok: false },
   };
 
   try {
-    const response = await fetch(`${llmBaseUrl}/models`, {
-      headers: { authorization: `Bearer ${llmApiKey}` },
+    const adapterHealth = new URL(excelAdapterUrl);
+    adapterHealth.pathname = "/health";
+    const response = await fetch(adapterHealth, {
+      headers: excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {},
       signal: AbortSignal.timeout(3000),
     });
-    status.hermes = { ok: response.ok, status: response.status };
+    const detail = response.ok ? await response.json().catch(() => null) : null;
+    const contractOk = response.ok && detail?.ok === true && detail?.service === "hermes-excel-adapter" &&
+      detail?.protocol === 1 && detail?.capability === "typed-proposals";
+    status.hermes = { ok: contractOk, status: response.status, detail };
+    status.hermes_adapter_ready = contractOk;
   } catch (error) {
     status.hermes = { ok: false, error: error.message };
   }
 
   try {
-    const response = await fetch(`${doclingBaseUrl}/healthz`, { signal: AbortSignal.timeout(3000) });
+    const response = await fetch(`${doclingBaseUrl}/health`, { signal: AbortSignal.timeout(3000) });
     status.docling = { ok: response.ok, status: response.status };
+    status.attachment_parser_ready = response.ok;
     if (response.ok) status.docling.detail = await response.json().catch(() => null);
   } catch (error) {
     status.docling = { ok: false, error: error.message };
   }
 
-  status.ok = status.hermes.ok && status.docling.ok;
+  status.ok = status.bridge_ready && status.hermes_adapter_ready;
   return status;
 }
 
@@ -425,7 +459,8 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
+    const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
+    const response = await fetch(url, { ...options, signal });
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text().catch(() => "")}`);
     return await response.json();
   } finally {
@@ -457,31 +492,38 @@ function doclingSourcePath(filePath) {
 // Containment: a spoofed or compromised Docling at 127.0.0.1:8200 could return an
 // arbitrary result path. Refuse parent-traversal and (when a known output root is
 // configured) anything outside it, before we cat/read it.
-function assertSafeDoclingPath(mdPath) {
+async function resolveSafeDoclingPath(mdPath, signal) {
   const p = String(mdPath || "");
   if (!p) throw new Error("Docling returned an empty result path");
-  if (p.includes("..")) throw new Error("Refusing Docling result path with parent traversal");
+  if (!doclingOutputDir) throw new Error("Docling path results require HERMES_EXCEL_DOCLING_OUTPUT_DIR");
   if (doclingMode === "wsl") {
     if (!p.startsWith("/")) throw new Error("Refusing non-absolute Docling result path");
-    if (doclingOutputDir && p !== doclingOutputDir && !p.startsWith(doclingOutputDir.replace(/\/?$/, "/"))) {
+    const canonical = async (value) => (await execFileAsync("wsl.exe", ["-d", wslDistro, "--", "readlink", "-f", "--", value],
+      { windowsHide: true, timeout: 30000, signal })).stdout.trim();
+    const [rootDir, resultPath] = await Promise.all([canonical(doclingOutputDir), canonical(p)]);
+    if (!rootDir || !resultPath || (resultPath !== rootDir && !resultPath.startsWith(rootDir.replace(/\/$/, "") + "/"))) {
       throw new Error("Docling result path is outside the configured output dir");
     }
+    return resultPath;
   } else {
-    const resolved = path.resolve(p);
-    if (doclingOutputDir) {
-      const rootDir = path.resolve(doclingOutputDir);
-      if (resolved !== rootDir && !resolved.startsWith(rootDir + path.sep)) {
-        throw new Error("Docling result path is outside the configured output dir");
-      }
-    }
+    return resolveContainedNativePath(doclingOutputDir, p);
   }
-  return p;
+}
+
+async function resolveContainedNativePath(root, candidate) {
+    if (!root) throw new Error("Docling path results require a configured output dir");
+    const [rootDir, resultPath] = await Promise.all([realpath(root), realpath(candidate)]);
+    const relative = path.relative(rootDir, resultPath);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error("Docling result path is outside the configured output dir");
+    }
+    return resultPath;
 }
 
 async function readDoclingResultText(mdPath, signal) {
-  assertSafeDoclingPath(mdPath);
+  const safePath = await resolveSafeDoclingPath(mdPath, signal);
   if (doclingMode === "wsl") {
-    const { stdout } = await execFileAsync("wsl.exe", ["-d", wslDistro, "--", "cat", mdPath], {
+    const { stdout } = await execFileAsync("wsl.exe", ["-d", wslDistro, "--", "cat", "--", safePath], {
       maxBuffer: maxExtractedCharsPerFile * 4,
       windowsHide: true,
       timeout: 30000,
@@ -490,41 +532,53 @@ async function readDoclingResultText(mdPath, signal) {
     return stdout;
   }
   // native / docker: Docling shares this host's filesystem.
-  return await readFile(mdPath, "utf8");
+  return await readFile(safePath, "utf8");
 }
 
-async function extractWithDocling(filePath, signal) {
-  const sourcePath = doclingSourcePath(filePath);
+function doclingTextFromResponse(result) {
+  const document = result?.document || result?.result?.document || {};
+  return result?.markdown || result?.text || document.md_content || document.text_content || "";
+}
+
+async function extractWithDocling(filePath, signal, fileName = path.basename(filePath), bytes = null) {
+  const content = bytes || await readFile(filePath);
   const created = await fetchJsonWithTimeout(
-    `${doclingBaseUrl}/jobs`,
+    `${doclingBaseUrl}/v1/convert/source/async`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ source_path: sourcePath, priority: 4 }),
+      body: JSON.stringify({
+        sources: [{ kind: "file", filename: String(fileName || path.basename(filePath)),
+                    base64_string: content.toString("base64") }],
+        options: { to_formats: ["md"], image_export_mode: "placeholder" },
+        target: { kind: "inbody" },
+      }),
+      signal,
     },
     30000,
   );
-  const jobId = created.id;
-  if (!jobId) throw new Error("Docling did not return a job id");
-
+  const taskId = created?.task_id;
+  if (!taskId) throw new Error("Docling v1 did not return a task_id");
   const started = Date.now();
-  let latest = created;
+  let status = created;
   while (Date.now() - started < doclingTimeoutMs) {
     if (signal?.aborted) throw new Error("client disconnected during Docling parse");
     await sleep(1500, signal);
-    latest = await fetchJsonWithTimeout(`${doclingBaseUrl}/jobs/${jobId}`, {}, 30000);
-    if (latest.status === "done") {
-      const result = await fetchJsonWithTimeout(`${doclingBaseUrl}/jobs/${jobId}/result`, {}, 30000);
-      if (result.markdown || result.text) return truncateText(result.markdown || result.text);
-      const mdPath = result.md_path || result.result_md_path || result.markdown_path;
-      if (!mdPath) throw new Error(`Docling job ${jobId} finished without markdown path`);
-      return truncateText(await readDoclingResultText(mdPath, signal));
-    }
-    if (["failed", "review"].includes(latest.status)) {
-      throw new Error(`Docling job ${jobId} ${latest.status}: ${latest.error || "no details"}`);
+    status = await fetchJsonWithTimeout(`${doclingBaseUrl}/v1/status/poll/${encodeURIComponent(taskId)}`,
+      { signal }, 30000);
+    if (status.task_status === "success") break;
+    if (status.task_status === "failure") {
+      throw new Error(`Docling conversion failed: ${status.error_message || "internal processing error"}`);
     }
   }
-  throw new Error(`Docling timed out after ${Math.round(doclingTimeoutMs / 1000)}s`);
+  if (status.task_status !== "success") {
+    throw new Error(`Docling timed out after ${Math.round(doclingTimeoutMs / 1000)}s`);
+  }
+  const result = await fetchJsonWithTimeout(
+    `${doclingBaseUrl}/v1/result/${encodeURIComponent(taskId)}`, { signal }, 60000);
+  const text = doclingTextFromResponse(result);
+  if (!text) throw new Error(`Docling conversion returned no markdown (status=${result?.status || "unknown"})`);
+  return truncateText(text);
 }
 
 async function prepareAttachedFiles(files = [], signal) {
@@ -589,7 +643,7 @@ async function prepareAttachedFiles(files = [], signal) {
       context.extracted_text = simple;
     } else {
       try {
-        context.extracted_text = await extractWithDocling(out, signal);
+        context.extracted_text = await extractWithDocling(out, signal, file.name || safeName, bytes);
         context.extraction_status = "parsed";
         context.extraction_method = "docling";
       } catch (error) {
@@ -1022,6 +1076,13 @@ function normalizeActions(parsed, body) {
   return actions;
 }
 
+function removeSatisfiedReadActions(actions, toolResults) {
+  if (!Array.isArray(actions) || !Array.isArray(toolResults) || !toolResults.length) return actions || [];
+  const canonical = (value) => String(value || "").replace(/\$/g, "").replace(/\s+/g, "").toLowerCase();
+  const satisfied = new Set(toolResults.filter((item) => item && !item.error).map((item) => canonical(item.range)));
+  return actions.filter((action) => action?.type !== "read_range" || !satisfied.has(canonical(action.range)));
+}
+
 function extractedField(text, label) {
   const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = String(text || "").match(new RegExp(`${escaped}:\\s*([^\\n]+)`, "i"));
@@ -1393,6 +1454,42 @@ function capMessagesSize(messages, budget) {
   return messages;
 }
 
+async function callHermesPlatform(body, { signal } = {}) {
+  const files = (body.files || []).map((file) => ({ name: file.name, type: file.type, size: file.size,
+    extraction_status: file.extraction_status, extraction_method: file.extraction_method,
+    extraction_error: file.extraction_error }));
+  let remaining = 16_000;
+  const platformFiles = files.map((file, index) => {
+    const extracted = String(body.files?.[index]?.extracted_text || "");
+    const extracted_text = extracted.slice(0, Math.max(0, remaining));
+    remaining -= extracted_text.length;
+    return { ...file, extracted_text };
+  });
+  try {
+    const response = await fetch(excelAdapterUrl, { method: "POST",
+      headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) },
+      body: JSON.stringify({ request_id: String(body.request_id || randomUUID()),
+        workbook_id: String(body.workbook_id || "legacy-workbook"),
+        conversation_id: String(body.conversation_id || body.workbook_id || "legacy-conversation"),
+        round: Number(body.loop_count || body.round || 0), prompt: String(body.prompt || ""),
+        context: { workbook: body.workbook, selection: body.selection, history: body.history,
+          tool_results: body.tool_results, files: platformFiles } }), signal });
+    if (!response.ok) throw new Error(`Excel adapter HTTP ${response.status}: ${await response.text().catch(() => "")}`);
+    const captured = await response.json();
+    if (!captured.proposal || typeof captured.proposal !== "object") throw new Error("Excel adapter returned no proposal");
+    const actions = removeSatisfiedReadActions(normalizeActions(captured.proposal, body), body.tool_results);
+    return { message: String(captured.message || captured.proposal.message || "Proposal ready for review."),
+      actions, files, source: "hermes-platform",
+      ...(actions.some((action) => action.type === "read_range")
+        ? { parsed_files: (body.files || []).map((file) => ({ ...file, base64: undefined })) } : {}) };
+  } catch (error) {
+    if (signal?.aborted || error?.name === "AbortError") throw error;
+    const reason = /HTTP 504|timed out/i.test(error.message) ? "adapter_timeout" :
+      /no proposal|invalid|HTTP 502/i.test(error.message) ? "adapter_invalid" : "adapter_unavailable";
+    return diagnosticFallback(body, reason);
+  }
+}
+
 async function callHermesModel(body, { signal, post: injectedPost } = {}) {
   const fileSummary = (body.files || []).map((file) => ({
     name: file.name,
@@ -1402,6 +1499,16 @@ async function callHermesModel(body, { signal, post: injectedPost } = {}) {
     extraction_method: file.extraction_method,
     extraction_error: file.extraction_error,
   }));
+  // The platform needs the parsed content, not merely a "parsed" badge. Keep
+  // raw bytes and host paths out of the agent envelope and cap attachment text
+  // so one large PDF cannot starve the local model/tool call.
+  let platformTextRemaining = 16_000;
+  const platformFiles = fileSummary.map((file, index) => {
+    const extracted = String(body.files?.[index]?.extracted_text || "");
+    const text = extracted.slice(0, Math.max(0, platformTextRemaining));
+    platformTextRemaining -= text.length;
+    return { ...file, extracted_text: text };
+  });
   const payload = {
     model: llmModel,
     temperature: 0.1,
@@ -1412,6 +1519,58 @@ async function callHermesModel(body, { signal, post: injectedPost } = {}) {
     // HERMES_EXCEL_LOCK_TOOLS=1 also hard-disables tool use at the model.
     ...(process.env.HERMES_EXCEL_LOCK_TOOLS === "1" ? { tool_choice: "none" } : {}),
   };
+  let rawFallbackReason = "";
+  if (!injectedPost && excelTransport === "raw" && !allowRawFallback) {
+    return diagnosticFallback(body, "adapter_unavailable");
+  }
+
+  // Preferred path: Hermes owns the agent turn, while the Excel platform's
+  // capture-only tool returns typed proposal arguments separately from prose.
+  // Keep the raw completion path below as a temporary compatibility fallback.
+  if (!injectedPost && excelTransport !== "raw") {
+    try {
+      const requestId = String(body.request_id || crypto.randomUUID());
+      const workbookId = String(body.workbook_id || "legacy-workbook");
+      const conversationId = String(body.conversation_id || workbookId);
+      const round = Number(body.loop_count || body.round || 0);
+      const response = await fetch(excelAdapterUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}),
+        },
+        body: JSON.stringify({
+          request_id: requestId,
+          workbook_id: workbookId,
+          conversation_id: conversationId,
+          round,
+          prompt: String(body.prompt || ""),
+          context: { workbook: body.workbook, selection: body.selection, history: body.history,
+            tool_results: body.tool_results, files: platformFiles },
+        }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`Excel adapter HTTP ${response.status}`);
+      const captured = await response.json();
+      const parsed = captured.proposal;
+      if (!parsed || typeof parsed !== "object") throw new Error("Excel adapter returned no proposal");
+      const result = {
+        message: String(captured.message || parsed.message || "Proposal ready for review."),
+        actions: removeSatisfiedReadActions(normalizeActions(parsed, body), body.tool_results),
+        files: fileSummary,
+        source: "hermes-platform",
+      };
+      if (result.actions.some((action) => action.type === "read_range")) {
+        result.parsed_files = (body.files || []).map((file) => ({ ...file, base64: undefined }));
+      }
+      return result;
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") throw error;
+      rawFallbackReason = /HTTP 504|timed out/i.test(error.message) ? "adapter_timeout" :
+        /no proposal|invalid/i.test(error.message) ? "adapter_invalid" : "adapter_unavailable";
+      if (!allowRawFallback) return diagnosticFallback(body, rawFallbackReason);
+    }
+  }
 
   // Each call gets its own full timeout AND honors the request-wide signal (overall
   // budget + client disconnect): a busy gateway can eat most of the budget on the
@@ -1501,7 +1660,8 @@ async function callHermesModel(body, { signal, post: injectedPost } = {}) {
       message: String(parsed.message || "Done."),
       actions,
       files: fileSummary,
-      source: "llm",
+      source: rawFallbackReason ? "raw-fallback" : "llm",
+      ...(rawFallbackReason ? { fallback_reason: rawFallbackReason } : {}),
     };
     if (actions.some((action) => action.type === "read_range")) {
       // Echoed back by the pane on loop rounds so attachments are not re-parsed.
@@ -1519,6 +1679,26 @@ async function callHermesModel(body, { signal, post: injectedPost } = {}) {
   } finally {
     // Per-call timeouts live inside postOnce now.
   }
+}
+
+function diagnosticFallback(body, fallbackReason = "adapter_unavailable") {
+  const reasonText = {
+    adapter_unavailable: "The typed Hermes Excel adapter is unavailable.",
+    adapter_invalid: "The typed Hermes Excel adapter returned an invalid response.",
+    adapter_timeout: "The typed Hermes Excel adapter timed out.",
+    canceled: "The Excel request was canceled.",
+  }[fallbackReason] || "The typed Hermes Excel request failed.";
+  return {
+    message: `${reasonText} No workbook changes were made.`,
+    actions: [],
+    files: (body.files || []).map((file) => ({
+      name: file.name, type: file.type, size: file.size,
+      extraction_status: file.extraction_status, extraction_method: file.extraction_method,
+      extraction_error: file.extraction_error,
+    })),
+    source: "fallback",
+    fallback_reason: fallbackReason,
+  };
 }
 
 function fallbackResponse(body, reason = null) {
@@ -1611,9 +1791,12 @@ async function handleChat(req, res) {
   // One end-to-end deadline covering Docling + every model retry, plus abort the
   // whole chain if the client disconnects — no more 10-minute orphaned requests.
   const controller = new AbortController();
-  const onClose = () => controller.abort();
-  req.on("close", onClose);
-  const budget = setTimeout(() => controller.abort(), llmRequestBudgetMs);
+  const onAborted = () => controller.abort();
+  const onResponseClose = () => { if (!res.writableEnded) controller.abort(); };
+  req.on("aborted", onAborted);
+  res.on("close", onResponseClose);
+  let budgetExpired = false;
+  const budget = setTimeout(() => { budgetExpired = true; controller.abort(); }, llmRequestBudgetMs);
   let body;
   try {
     body = await readJson(req);
@@ -1623,12 +1806,24 @@ async function handleChat(req, res) {
         ? body.parsed_files
         : await prepareAttachedFiles(body.files || [], controller.signal);
 
-    return send(res, 200, await callHermesModel(body, { signal: controller.signal }), undefined, origin);
+    return send(res, 200, await callHermesPlatform(body, { signal: controller.signal }), undefined, origin);
   } catch (error) {
-    return send(res, 200, fallbackResponse(body || { prompt: "", files: [] }, error.message), undefined, origin);
+    if (controller.signal.aborted && body?.request_id && body?.workbook_id) {
+      fetch(excelAdapterUrl.replace(/\/ingest$/, "/cancel"), {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) },
+        body: JSON.stringify({ request_id: body.request_id, workbook_id: body.workbook_id }),
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => {});
+    }
+    if (!res.writableEnded) {
+      const reason = budgetExpired ? "adapter_timeout" : controller.signal.aborted ? "canceled" : "adapter_unavailable";
+      return send(res, 200, diagnosticFallback(body || { prompt: "", files: [] }, reason), undefined, origin);
+    }
   } finally {
     clearTimeout(budget);
-    req.off("close", onClose);
+    req.off("aborted", onAborted);
+    res.off("close", onResponseClose);
   }
 }
 
@@ -1647,7 +1842,7 @@ function paneCsp() {
     "script-src 'self' https://appsforoffice.microsoft.com https://*.office.com",
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
-    `connect-src 'self' http://localhost:${port} http://127.0.0.1:${port}`,
+    `connect-src 'self' https://localhost:${port} https://127.0.0.1:${port}`,
     "object-src 'none'",
     "base-uri 'none'",
     "frame-ancestors https://*.officeapps.live.com https://*.office.com",
@@ -1722,7 +1917,7 @@ async function checkHermesEndpoint() {
 }
 
 async function checkDoclingEndpoint() {
-  const json = await fetchJsonWithTimeout(`${doclingBaseUrl}/healthz`, {}, 10000);
+  const json = await fetchJsonWithTimeout(`${doclingBaseUrl}/health`, {}, 10000);
   console.log(`Docling parser OK: ${doclingBaseUrl}`);
   console.log(`Docling health: ${JSON.stringify(json)}`);
 }
@@ -1778,7 +1973,7 @@ if (isMainModule) {
     process.on("uncaughtException", (error) => {
       console.error("uncaughtException:", error);
     });
-    const server = http.createServer(async (req, res) => {
+    const requestHandler = async (req, res) => {
       const origin = allowOrigin(req);
       try {
         // Reject a foreign Host header before doing anything (DNS-rebinding guard).
@@ -1801,10 +1996,13 @@ if (isMainModule) {
       } catch (error) {
         return send(res, 500, { error: error.message }, undefined, origin);
       }
-    });
+    };
+    const server = tlsEnabled
+      ? https.createServer({ key: readFileSync(tlsKeyPath), cert: readFileSync(tlsCertPath) }, requestHandler)
+      : http.createServer(requestHandler);
 
     server.listen(port, "127.0.0.1", () => {
-      console.log(`Hermes Excel add-in running at http://localhost:${port}`);
+      console.log(`Hermes Excel add-in running at ${tlsEnabled ? "https" : "http"}://localhost:${port}`);
       console.log(`Manifest: ${path.join(root, "manifest.xml")}`);
       console.log(`Hermes backend endpoint: ${llmBaseUrl}`);
     });
@@ -1818,6 +2016,8 @@ export {
   normalizeMatrix,
   normalizeAction,
   normalizeActions,
+  removeSatisfiedReadActions,
+  doclingTextFromResponse,
   legacyWriteToActions,
   parseMoney,
   extractedField,
@@ -1834,7 +2034,13 @@ export {
   buildChatMessages,
   buildSystemPrompt,
   fallbackResponse,
+  diagnosticFallback,
+  resolveSafeDoclingPath,
+  resolveContainedNativePath,
+  fetchJsonWithTimeout,
+  healthStatus,
   readHermesApiServerKey,
+  parseHermesApiServerKey,
   scanWrittenCells,
   matrixToCsv,
   safeExportName,

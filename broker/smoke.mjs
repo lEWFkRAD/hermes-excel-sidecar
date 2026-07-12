@@ -2,7 +2,7 @@
 //   node broker/smoke.mjs        (bridge must be running on :8787)
 // Exits non-zero if any assertion fails.
 
-const BASE_URL = process.env.HERMES_EXCEL_BRIDGE_URL || "http://127.0.0.1:8787";
+const BASE_URL = process.env.HERMES_EXCEL_BRIDGE_URL || "https://localhost:8787";
 const TOKEN = process.env.HERMES_EXCEL_BRIDGE_TOKEN || "";
 const TIMEOUT_MS = 120000;
 
@@ -48,14 +48,15 @@ async function testHealth() {
   try {
     const res = await fetch(`${BASE_URL}/api/health`, { headers: authHeaders(), signal: AbortSignal.timeout(TIMEOUT_MS) });
     const data = await res.json();
-    // The documented contract: ok === (hermes.ok AND docling.ok). Verify the
-    // relationship holds regardless of which upstreams happen to be up right now.
+    // Ordinary Excel readiness depends on the bridge and typed Hermes adapter;
+    // attachment parsing is independently degradable.
     assert(
       "health.and-contract",
-      data.ok === ((data.hermes?.ok === true) && (data.docling?.ok === true)),
-      JSON.stringify({ ok: data.ok, hermes: data.hermes?.ok, docling: data.docling?.ok }),
+      data.ok === (data.bridge_ready === true && data.hermes_adapter_ready === true),
+      JSON.stringify({ ok: data.ok, bridge: data.bridge_ready, adapter: data.hermes_adapter_ready, docling: data.attachment_parser_ready }),
     );
-    const hermesOk = data.hermes?.ok === true;
+    assert("health.raw-fallback-off", data.raw_fallback_enabled === false, "certification requires raw fallback disabled");
+    const hermesOk = data.hermes_adapter_ready === true;
     console.log(hermesOk ? "INFO: Hermes reachable — running model assertions." : "INFO: Hermes down — running fallback assertions.");
     return hermesOk;
   } catch (error) {
@@ -85,7 +86,7 @@ async function testSimpleA1(hermesOk) {
       assert("simple.fallback", res.source === "fallback" && res.actions.length === 0, JSON.stringify(res.actions));
       return;
     }
-    assert("simple.source", res.source === "llm", `got ${res.source}`);
+    assert("simple.source", res.source === "hermes-platform", `got ${res.source}`);
     const action = res.actions.find((a) => a.type === "create_sheet" || a.type === "write_cells");
     assert("simple.action", Boolean(action), "no create_sheet/write_cells");
     const flat = res.actions.flatMap((a) => a.values || []).flat().map(String).join(" ");
@@ -137,7 +138,7 @@ async function testMultiturn(hermesOk) {
       assert("mt.fallback", res1.source === "fallback", `got ${res1.source}`);
       return;
     }
-    assert("mt.turn1", res1.source === "llm", `got ${res1.source}`);
+    assert("mt.turn1", res1.source === "hermes-platform", `got ${res1.source}`);
     const res2 = await post("/api/chat", {
       prompt: "add a totals row with a SUM for the last column",
       workbook: { activeSheet: "Sheet1", sheets: [{ name: "Sheet1", usedRange: "A1:D4" }] },
@@ -148,7 +149,7 @@ async function testMultiturn(hermesOk) {
       ],
       files: [],
     });
-    assert("mt.turn2.source", res2.source === "llm", `got ${res2.source}`);
+    assert("mt.turn2.source", res2.source === "hermes-platform", `got ${res2.source}`);
     assert("mt.turn2.action", res2.actions.some((a) => a.type === "write_cells" || a.type === "create_sheet"), "no action in turn 2");
   } catch (error) {
     assert("mt.request", false, error.message);
@@ -178,7 +179,7 @@ async function testMediumBuild(hermesOk) {
     );
     // The original bug: the model produced unparseable JSON and the bridge fell
     // back, writing nothing. A real build must come back as a usable llm result.
-    assert("medium.not-fallback", res.source === "llm", `source=${res.source} — model output was unusable`);
+    assert("medium.not-fallback", res.source === "hermes-platform", `source=${res.source} — typed platform output was unusable`);
     const hasData = res.actions.some((a) => a.type === "create_sheet" || a.type === "write_cells");
     assert("medium.has-data", hasData, "no create_sheet/write_cells");
     // The native conditional_format action should be used instead of hand-written code.

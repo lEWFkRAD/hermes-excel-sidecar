@@ -38,11 +38,11 @@ group.
 | Script | Purpose |
 | --- | --- |
 | `apply.ps1` | Fleet entry point. Calls `addin-install.ps1`; `-SkipExcelAddin` opts a box out; passes `-Port` / `-SkipSideload` through. |
-| `addin-install.ps1` | The installer. Ensures Node, copies the payload to `%LOCALAPPDATA%\hermes\excel-addin`, creates the data dir, unblocks mark-of-the-web, generates the bridge token, emits the launchers, registers autostart + sideload, then health-checks the bridge (fails loudly if it doesn't come up). |
-| `run-bridge.cmd.template` | Template for the bridge launcher. The installer substitutes `__INSTALL_DIR__/__PORT__/__DATA_DIR__/__BRIDGE_TOKEN__/__DOCLING_MODE__/__WSL_DISTRO__`. Sets env, **kills any stale bridge from this install dir**, then `node <abs path>\broker\server.mjs`. |
+| `addin-install.ps1` | The installer. Ensures Node, copies the payload, generates ACL-restricted bridge and adapter tokens, restarts Hermes, registers autostart + sideload, then requires an authenticated typed-proposal certification turn. |
+| `run-bridge.cmd.template` | Template for the bridge launcher. Tokens are read at runtime from ACL-restricted files under the data directory; raw fallback is disabled. |
 | `run-bridge.vbs.template` | Hidden launcher for `run-bridge.cmd` (no console window, no elevation). |
 | `register-task.ps1` | Registers the logon-triggered Scheduled Task `Hermes_Excel_Bridge` (per-user, hidden, no elevation) running the supervisor. `-Unregister` removes it. |
-| `register-sideload.ps1` | Writes the manifest to the per-user catalog and sets `HKCU\...\WEF\Developer` so Excel sideloads it. Port-substitutes the manifest when `-Port` ≠ 8787. `-Unregister` reverses it. |
+| `register-sideload.ps1` | Writes a port-adjusted manifest and registers it with Microsoft's pinned `office-addin-dev-settings` tool. It also removes the obsolete legacy registry value. `-Unregister` reverses it. |
 | `service\bridge-service.cmd` | Restart-loop supervisor: relaunches the bridge on exit, backs off (stands down) when it crashes instantly, logs restart events with timestamps to `bridge-restarts.log` under the **data dir**. |
 | `rollback.ps1` | Reverses everything: stops/unregisters the task, removes any legacy Startup shortcut, removes the WEF value + catalog manifest, deletes the install dir (prompts unless `-Force`). |
 
@@ -53,6 +53,7 @@ group.
 | `PORT` | `8787` | Bridge port. |
 | `HERMES_EXCEL_DATA_DIR` | `%LOCALAPPDATA%\hermes\excel-addin\data` | Writable per-user data root for uploads/exports/logs, **outside** the served web root. |
 | `HERMES_EXCEL_BRIDGE_TOKEN` | generated per install | Random session token the bridge requires on `/api/*` and the pane sends. Persisted to `data\.bridge-token` (user-only ACL) and the `User` env scope. |
+| `HERMES_EXCEL_INGEST_TOKEN` | generated per install | Separate 64-hex secret shared only by the bridge and Hermes Excel platform adapter. Persisted in `data\.ingest-token` with current-user/SYSTEM ACLs. |
 | `HERMES_EXCEL_DOCLING_MODE` | `wsl` | `wsl` \| `native` \| `docker`. |
 | `HERMES_EXCEL_WSL_DISTRO` | `Ubuntu-24.04` | WSL distro used when docling mode is `wsl`. |
 

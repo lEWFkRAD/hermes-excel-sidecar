@@ -24,6 +24,9 @@ const state = {
   bridgeTimer: null,
   history: [],
   undoStack: [],
+  workbookId: "",
+  conversationId: "",
+  pendingProposal: null,
   workbookKey: "",
   controller: null,
   // Default ON: workbook changes are held for explicit Apply unless the user
@@ -31,6 +34,223 @@ const state = {
   // safe state survives pane reloads.
   reviewMode: true,
 };
+
+function randomId(prefix) {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return `${prefix}-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function stableMatrix(value) {
+  return JSON.stringify(value || []);
+}
+
+function consumePendingProposal(proposalId) {
+  if (!state.pendingProposal || state.pendingProposal.proposalId !== proposalId || state.pendingProposal.consumed) {
+    return false;
+  }
+  state.pendingProposal.consumed = true;
+  return true;
+}
+
+async function bindProposalToWorkbook(result) {
+  const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
+  const unsupported = actions.filter((action) => action && !["write_cells", "create_sheet", "export"].includes(action.type));
+  if (unsupported.length) {
+    throw new Error(
+      `Safe review preconditions are not implemented yet for: ${unsupported.map((a) => a.type).join(", ")}. No changes were applied.`,
+    );
+  }
+  return Excel.run(async (context) => {
+    const sheets = context.workbook.worksheets;
+    sheets.load("items/id,items/name");
+    const resolvedActions = [];
+    const preconditions = [];
+    const requestedSheetNames = new Set();
+    const writeBindings = [];
+    for (const action of actions) {
+      if (!action || action.type === "export") {
+        resolvedActions.push(action);
+        continue;
+      }
+      if (action.type === "create_sheet") {
+        const requested = safeSheetName(action.name || action.sheet_name || action.sheetName);
+        const folded = requested.toLowerCase();
+        if (requestedSheetNames.has(folded)) throw new Error(`Duplicate create_sheet name: "${requested}".`);
+        requestedSheetNames.add(folded);
+        resolvedActions.push({ ...action, name: requested });
+        preconditions.push({ type: "create_sheet", name: requested, absent: true });
+        continue;
+      }
+      const values = normalizeMatrix(action.values || action.table);
+      const start = rangeFromRef(context, action.start_cell || action.startCell);
+      const target = start.getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
+      target.load(["address", "formulas", "numberFormat"]);
+      target.worksheet.load(["id", "name"]);
+      const actionIndex = resolvedActions.length;
+      resolvedActions.push(null);
+      writeBindings.push({ action, target, actionIndex });
+    }
+    // Capture sheet identity and every target from one coherent workbook read.
+    await context.sync();
+    const sheetIdentity = sheets.items.map((sheet) => ({ id: sheet.id, name: sheet.name }));
+    for (const { action, target, actionIndex } of writeBindings) {
+      resolvedActions[actionIndex] = { ...action, start_cell: target.address, auto_format: false, review_bound: true };
+      preconditions.push({
+        type: "write_cells",
+        address: target.address,
+        worksheetId: target.worksheet.id,
+        worksheetName: target.worksheet.name,
+        formulas: target.formulas,
+        numberFormat: target.numberFormat,
+      });
+    }
+    return {
+      proposalId: randomId("proposal"),
+      workbookToken: state.workbookId,
+      sheetIdentity,
+      result: { ...result, actions: resolvedActions },
+      preconditions,
+      consumed: false,
+    };
+  });
+}
+
+async function validateProposalIsCurrent(proposal) {
+  if (!proposal || proposal.workbookToken !== state.workbookId) return "This proposal belongs to a different workbook.";
+  return Excel.run(async (context) => {
+    const sheets = context.workbook.worksheets;
+    sheets.load("items/id,items/name");
+    const rangeChecks = [];
+    for (const precondition of proposal.preconditions) {
+      if (precondition.type === "create_sheet") {
+        continue;
+      }
+      const range = rangeFromRef(context, precondition.address);
+      range.load(["formulas", "numberFormat"]);
+      range.worksheet.load("id");
+      rangeChecks.push({ precondition, range });
+    }
+    // One read barrier for the complete proposal: no earlier target is accepted
+    // while later targets are still being fetched.
+    await context.sync();
+    const currentById = new Map(sheets.items.map((sheet) => [sheet.id, sheet.name]));
+    const expectedSignature = stableMatrix(proposal.sheetIdentity.map((sheet) => [sheet.id, sheet.name]));
+    const currentSignature = stableMatrix(sheets.items.map((sheet) => [sheet.id, sheet.name]));
+    if (expectedSignature !== currentSignature) return "The workbook's sheet structure changed.";
+    for (const precondition of proposal.preconditions) {
+      if (precondition.type === "create_sheet" && sheets.items.some((sheet) => sheet.name.toLowerCase() === precondition.name.toLowerCase())) {
+        return `A sheet named "${precondition.name}" now exists.`;
+      }
+    }
+    for (const { precondition, range } of rangeChecks) {
+      if (currentById.get(precondition.worksheetId) !== precondition.worksheetName) {
+        return `The target sheet "${precondition.worksheetName}" was renamed or removed.`;
+      }
+      if (range.worksheet.id !== precondition.worksheetId || stableMatrix(range.formulas) !== stableMatrix(precondition.formulas) ||
+          stableMatrix(range.numberFormat) !== stableMatrix(precondition.numberFormat)) {
+        return `${precondition.address} changed after the proposal was prepared.`;
+      }
+    }
+    return "";
+  });
+}
+
+async function applyReviewedProposal(proposal) {
+  if (!proposal || proposal.workbookToken !== state.workbookId) throw new Error("This proposal belongs to a different workbook.");
+  const statusLines = await Excel.run(async (context) => {
+    const sheets = context.workbook.worksheets;
+    sheets.load("items/id,items/name");
+    const writeChecks = [];
+    for (const precondition of proposal.preconditions) {
+      if (precondition.type !== "write_cells") continue;
+      const range = rangeFromRef(context, precondition.address);
+      range.load(["address", "formulas", "numberFormat"]);
+      range.worksheet.load(["id", "name"]);
+      writeChecks.push({ precondition, range });
+    }
+    await context.sync();
+    const expectedSignature = stableMatrix(proposal.sheetIdentity.map((sheet) => [sheet.id, sheet.name]));
+    const currentSignature = stableMatrix(sheets.items.map((sheet) => [sheet.id, sheet.name]));
+    if (expectedSignature !== currentSignature) throw new Error("Proposal is stale: the workbook's sheet structure changed.");
+    for (const precondition of proposal.preconditions) {
+      if (precondition.type === "create_sheet" && sheets.items.some((sheet) => sheet.name.toLowerCase() === precondition.name.toLowerCase())) {
+        throw new Error(`Proposal is stale: a sheet named "${precondition.name}" now exists.`);
+      }
+    }
+    for (const { precondition, range } of writeChecks) {
+      if (range.worksheet.id !== precondition.worksheetId || range.worksheet.name !== precondition.worksheetName ||
+          stableMatrix(range.formulas) !== stableMatrix(precondition.formulas) ||
+          stableMatrix(range.numberFormat) !== stableMatrix(precondition.numberFormat)) {
+        throw new Error(`Proposal is stale: ${precondition.address} changed after review began.`);
+      }
+    }
+
+    // No await occurs between the compare and queued mutations. Office.js sends
+    // the complete batch at the next sync, minimizing the optimistic-lock race.
+    const undoWrites = [];
+    const createdSheets = [];
+    const statuses = [];
+    const seenWriteAddresses = new Set();
+    for (const action of proposal.result.actions || []) {
+      if (!action || action.type === "export") continue;
+      const values = normalizeMatrix(action.values || action.table);
+      if (action.type === "write_cells") {
+        const match = writeChecks.find((item) => item.precondition.address === action.start_cell);
+        if (!match) throw new Error(`Missing bound precondition for ${action.start_cell}.`);
+        if (seenWriteAddresses.has(match.range.address)) throw new Error(`Overlapping duplicate reviewed write: ${match.range.address}.`);
+        seenWriteAddresses.add(match.range.address);
+        undoWrites.push({ address: match.range.address, worksheetId: match.range.worksheet.id, range: match.range,
+          before: { formulas: match.range.formulas, numberFormat: match.range.numberFormat } });
+        match.range.values = values;
+        statuses.push(`Wrote ${values.length} row(s) to ${match.range.address}.`);
+      } else if (action.type === "create_sheet") {
+        const sheet = sheets.add(action.name);
+        const target = sheet.getRange("A1").getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
+        target.values = values;
+        statuses.push(`Created ${action.name} and wrote ${values.length} row(s).`);
+        createdSheets.push(action.name);
+      }
+    }
+    try {
+      await context.sync();
+    } catch (commitError) {
+      try {
+        for (const write of undoWrites) {
+          write.range.formulas = write.before.formulas;
+          write.range.numberFormat = write.before.numberFormat;
+        }
+        const created = createdSheets.map((name) => sheets.getItemOrNullObject(name));
+        for (const sheet of created) sheet.load("isNullObject");
+        await context.sync();
+        for (const sheet of created) if (!sheet.isNullObject) sheet.delete();
+        await context.sync();
+      } catch (restoreError) {
+        throw new Error(`Apply failed and automatic restoration could not be confirmed (${commitError.message}; restore: ${restoreError.message}). Inspect the listed targets before continuing.`);
+      }
+      throw new Error(`Apply failed; the reviewed targets were restored (${commitError.message}).`);
+    }
+    for (const write of undoWrites) {
+      write.range.load(["formulas", "numberFormat"]);
+    }
+    if (undoWrites.length) {
+      await context.sync();
+      state.undoStack.push({ kind: "reviewed_change_set", writes: undoWrites.map((write) => ({
+        address: write.address, worksheetId: write.worksheetId, before: write.before,
+        after: { formulas: write.range.formulas, numberFormat: write.range.numberFormat },
+      })) });
+    }
+    for (const name of createdSheets) {
+      state.undoStack.push({ kind: "non_undoable", type: `created sheet ${name}; delete it manually if unwanted` });
+    }
+    while (state.undoStack.length > 10) state.undoStack.shift();
+    return statuses;
+  });
+  for (const action of proposal.result.actions || []) {
+    if (action?.type === "export") statusLines.push(await exportAction(action));
+  }
+  return statusLines;
+}
 
 const els = {
   status: document.getElementById("status"),
@@ -356,6 +576,9 @@ async function askHermes(prompt, filesToSend) {
     try {
       response = await postChat(
         {
+          request_id: randomId("excel-request"),
+          workbook_id: state.workbookId,
+          conversation_id: state.conversationId,
           prompt,
           history: state.history.slice(-12),
           ...context,
@@ -691,11 +914,6 @@ async function beforeWriteCellsSnapshot(action, values) {
   }
 }
 
-function createSheetUndoRecord(name, formulas) {
-  state.undoStack.push({ kind: "create_sheet", name, formulas });
-  if (state.undoStack.length > 10) state.undoStack.shift();
-}
-
 // A change Hermes can't programmatically reverse (formatting, conditional format,
 // or model-authored Office.js). Sits on the stack so a later Undo announces it
 // instead of silently reverting an unrelated earlier write.
@@ -728,7 +946,37 @@ async function undoLast() {
         await context.sync();
       });
       addMessage("hermes", `Undid the last write: restored ${record.address}.`);
+    } else if (record.kind === "reviewed_change_set") {
+      const restored = await Excel.run(async (context) => {
+        const checks = record.writes.map((write) => {
+          const range = rangeFromRef(context, write.address);
+          range.load(["formulas", "numberFormat"]);
+          range.worksheet.load("id");
+          return { write, range };
+        });
+        await context.sync();
+        for (const { write, range } of checks) {
+          if (range.worksheet.id !== write.worksheetId || stableMatrix(range.formulas) !== stableMatrix(write.after.formulas) ||
+              stableMatrix(range.numberFormat) !== stableMatrix(write.after.numberFormat)) return false;
+        }
+        for (const { write, range } of checks) {
+          range.formulas = write.before.formulas;
+          range.numberFormat = write.before.numberFormat;
+        }
+        await context.sync();
+        return true;
+      });
+      if (!restored) {
+        state.undoStack.push(record);
+        addMessage("hermes", "Undo refused: at least one target was edited after Hermes applied this change set. No cells were restored.");
+        return;
+      }
+      addMessage("hermes", `Undid the reviewed change set (${record.writes.length} write${record.writes.length === 1 ? "" : "s"}).`);
     } else if (record.kind === "create_sheet") {
+      // Legacy in-memory records are never auto-deleted: formulas alone cannot
+      // prove that tables, charts, comments, formatting, or sheet settings are unchanged.
+      addMessage("hermes", `Hermes will not auto-delete the created sheet "${record.name}". Delete it manually if you no longer want it.`);
+      return;
       await Excel.run(async (context) => {
         const sheet = context.workbook.worksheets.getItemOrNullObject(record.name);
         const used = sheet.getUsedRangeOrNullObject();
@@ -756,6 +1004,9 @@ async function undoLast() {
     }
     saveChatHistory();
   } catch (error) {
+    if (record.kind === "reviewed_change_set" && state.undoStack[state.undoStack.length - 1] !== record) {
+      state.undoStack.push(record);
+    }
     addMessage("hermes", `Undo failed: ${error.message}`);
   }
 }
@@ -770,7 +1021,7 @@ async function writeCellsAction(action) {
     const target = start.getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
     target.values = values;
     if (action.auto_format) styleRange(target, values.length, values[0].length, { borders: "thin", auto_fit: true });
-    else {
+    else if (!action.review_bound) {
       target.format.autofitColumns();
       target.format.autofitRows();
     }
@@ -810,7 +1061,7 @@ async function createSheetAction(action) {
     // stable fingerprint so it never deletes a sheet the user edited later.
     target.load("formulas");
     await context.sync();
-    createSheetUndoRecord(name, target.formulas);
+    pushNonUndoable(`created sheet ${name}; delete it manually if unwanted`);
     return { status: `Created ${name} and wrote ${values.length} row(s) to ${target.address}.`, address: target.address };
   });
 }
@@ -1163,6 +1414,10 @@ function wireDropzone() {
 
 async function applyResultAndRecord(result, filesToSend, fileLines) {
   const statusLines = await runWorkbookActions(result);
+  recordAppliedResult(result, filesToSend, fileLines, statusLines);
+}
+
+function recordAppliedResult(result, filesToSend, fileLines, statusLines) {
   if (statusLines.length) addMessage("hermes", statusLines.join("\n"));
   state.history.push({
     role: "assistant",
@@ -1174,7 +1429,11 @@ async function applyResultAndRecord(result, filesToSend, fileLines) {
   if (filesToSend.length) clearFiles();
 }
 
-function renderReviewButtons(result, filesToSend, fileLines) {
+function renderReviewButtons(proposal, filesToSend, fileLines) {
+  if (state.pendingProposal && !state.pendingProposal.consumed) {
+    state.pendingProposal.consumed = true;
+    state.pendingProposal.bar?.remove();
+  }
   const bar = document.createElement("div");
   bar.className = "pending-actions";
 
@@ -1183,12 +1442,16 @@ function renderReviewButtons(result, filesToSend, fileLines) {
   applyBtn.className = "primary";
   applyBtn.textContent = "Apply";
   applyBtn.addEventListener("click", async () => {
-    bar.remove();
+    if (!consumePendingProposal(proposal.proposalId)) return;
+    applyBtn.disabled = true;
+    discardBtn.disabled = true;
     state.sending = true;
     startWorkIndicator([]);
     setWorkStage("Applying workbook output...");
     try {
-      await applyResultAndRecord(result, filesToSend, fileLines);
+      bar.remove();
+      const statusLines = await applyReviewedProposal(proposal);
+      recordAppliedResult(proposal.result, filesToSend, fileLines, statusLines);
       stopWorkIndicator("Ready");
     } catch (error) {
       stopWorkIndicator("Error");
@@ -1205,6 +1468,9 @@ function renderReviewButtons(result, filesToSend, fileLines) {
   discardBtn.className = "ghost";
   discardBtn.textContent = "Discard";
   discardBtn.addEventListener("click", () => {
+    if (!consumePendingProposal(proposal.proposalId)) return;
+    applyBtn.disabled = true;
+    discardBtn.disabled = true;
     bar.remove();
     addMessage("hermes", "Discarded — no changes made.");
   });
@@ -1213,6 +1479,10 @@ function renderReviewButtons(result, filesToSend, fileLines) {
   bar.setAttribute("aria-label", "Review pending workbook changes");
   bar.appendChild(applyBtn);
   bar.appendChild(discardBtn);
+  proposal.bar = bar;
+  proposal.applyBtn = applyBtn;
+  proposal.discardBtn = discardBtn;
+  state.pendingProposal = proposal;
   els.messages.appendChild(bar);
   els.messages.scrollTop = els.messages.scrollHeight;
   // Move focus to Apply so keyboard/AT users land on the actionable control rather
@@ -1275,7 +1545,8 @@ function wireActions() {
       if (state.reviewMode && applyable.length) {
         // Hold the changes; let the user approve them first.
         addMessage("hermes", `Review these changes:\n${describeActions(applyable)}`);
-        renderReviewButtons(result, filesToSend, fileLines);
+        const proposal = await bindProposalToWorkbook(result);
+        renderReviewButtons(proposal, filesToSend, fileLines);
         stopWorkIndicator("Waiting for review");
         return;
       }
@@ -1306,6 +1577,18 @@ Office.onReady((info) => {
   } catch {
     state.workbookKey = "default";
   }
+  try {
+    const identityKey = `hermes-excel-identity:${state.workbookKey}`;
+    if (!state.workbookKey || state.workbookKey === "default") {
+      state.workbookId = randomId("workbook");
+    } else {
+      state.workbookId = localStorage.getItem(identityKey) || randomId("workbook");
+      localStorage.setItem(identityKey, state.workbookId);
+    }
+  } catch {
+    state.workbookId = randomId("workbook");
+  }
+  state.conversationId = randomId("conversation");
   loadChatHistory();
   loadReviewMode();
   wireDropzone();

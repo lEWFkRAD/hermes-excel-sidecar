@@ -9,7 +9,7 @@ REM  and substitutes the __PLACEHOLDER__ tokens below with real values:
 REM      __INSTALL_DIR__   absolute install root (no trailing backslash)
 REM      __PORT__          bridge port (default 8787)
 REM      __DATA_DIR__      HERMES_EXCEL_DATA_DIR (writable, outside web root)
-REM      __BRIDGE_TOKEN__  per-install random session token
+REM  Tokens are read at runtime from ACL-restricted files under __DATA_DIR__.
 REM      __DOCLING_MODE__  wsl | native | docker
 REM      __WSL_DISTRO__    WSL distro name (e.g. Ubuntu-24.04)
 REM
@@ -25,7 +25,16 @@ setlocal
 set "INSTALL_DIR=__INSTALL_DIR__"
 set "PORT=__PORT__"
 set "HERMES_EXCEL_DATA_DIR=__DATA_DIR__"
-set "HERMES_EXCEL_BRIDGE_TOKEN=__BRIDGE_TOKEN__"
+set "HERMES_EXCEL_BRIDGE_TOKEN="
+set "HERMES_EXCEL_INGEST_TOKEN="
+if not exist "__DATA_DIR__\.bridge-token" exit /b 1
+if not exist "__DATA_DIR__\.ingest-token" exit /b 1
+set /p HERMES_EXCEL_BRIDGE_TOKEN=<"__DATA_DIR__\.bridge-token"
+set /p HERMES_EXCEL_INGEST_TOKEN=<"__DATA_DIR__\.ingest-token"
+powershell -NoProfile -Command "if ($env:HERMES_EXCEL_BRIDGE_TOKEN -notmatch '^[0-9a-f]{64}$' -or $env:HERMES_EXCEL_INGEST_TOKEN -notmatch '^[0-9a-f]{64}$') { exit 1 }"
+if errorlevel 1 exit /b 1
+set "HERMES_EXCEL_TRANSPORT=platform-only"
+set "HERMES_EXCEL_ALLOW_RAW_FALLBACK=0"
 set "HERMES_EXCEL_DOCLING_MODE=__DOCLING_MODE__"
 set "HERMES_EXCEL_WSL_DISTRO=__WSL_DISTRO__"
 
