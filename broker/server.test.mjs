@@ -13,6 +13,7 @@ import {
   deriveSheetName,
   promptWantsTableDump,
   deterministicTableProposal,
+  htmlWithoutTableGuidance,
   extractJsonObject,
   normalizeMatrix,
   normalizeAction,
@@ -939,4 +940,46 @@ test("htmlTablesToMarkdown: labels multiple tables", () => {
   const md = htmlTablesToMarkdown([[["A"], ["1"]], [["B"], ["2"]]]);
   assert.match(md, /Table 1:/);
   assert.match(md, /Table 2:/);
+});
+
+test("htmlWithoutTableGuidance: steers to structured export when HTML has no table", () => {
+  const body = {
+    prompt: "put this into a table",
+    files: [{
+      name: "Vendor-Disbursement-Amount-Review.html", type: "text/html", size: 12560119,
+      extraction_status: "skipped", extraction_method: "html-no-table",
+      extraction_error: "Large HTML with no table markup (looks like a rendered page or images).",
+    }],
+  };
+  const result = htmlWithoutTableGuidance(body);
+  assert.equal(result.source, "html-no-table");
+  assert.deepEqual(result.actions, []);
+  assert.match(result.message, /couldn't find a table/);
+  assert.match(result.message, /\.csv or \.xlsx/);
+});
+
+test("htmlWithoutTableGuidance: defers to the table path when a table did parse", () => {
+  const body = {
+    prompt: "put this into a table",
+    files: [{ name: "report.html", extraction_method: "local-html-table", tables: [[["A"], ["1"]]] }],
+  };
+  assert.equal(htmlWithoutTableGuidance(body), null);
+});
+
+test("htmlWithoutTableGuidance: leaves small prose HTML to the model", () => {
+  // Small no-table HTML goes through Docling, not the html-no-table skip, so it
+  // is not "stuck" and the model still gets a chance.
+  const body = {
+    prompt: "make a table",
+    files: [{ name: "notes.html", extraction_method: "docling", extraction_status: "parsed", extracted_text: "some prose" }],
+  };
+  assert.equal(htmlWithoutTableGuidance(body), null);
+});
+
+test("htmlWithoutTableGuidance: only for table-dump prompts", () => {
+  const body = {
+    prompt: "summarize the trends",
+    files: [{ name: "dash.html", extraction_method: "html-no-table", extraction_status: "skipped" }],
+  };
+  assert.equal(htmlWithoutTableGuidance(body), null);
 });

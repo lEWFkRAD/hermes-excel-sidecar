@@ -793,7 +793,8 @@ async function prepareAttachedFiles(files = [], signal) {
     };
 
     const ext = extensionOf(file.name);
-    const htmlTables = ext === ".html" || ext === ".htm" ? parseHtmlTables(bytes.toString("utf8")) : null;
+    const isHtml = ext === ".html" || ext === ".htm";
+    const htmlTables = isHtml ? parseHtmlTables(bytes.toString("utf8")) : null;
     const simple = extractSimpleText(file, bytes);
     if (htmlTables && htmlTables.length) {
       // HTML that already contains a table: parse it deterministically and keep
@@ -802,6 +803,13 @@ async function prepareAttachedFiles(files = [], signal) {
       context.extraction_method = "local-html-table";
       context.tables = htmlTables;
       context.extracted_text = truncateText(htmlTablesToMarkdown(htmlTables));
+    } else if (isHtml && bytes.length > 2 * 1024 * 1024) {
+      // Large HTML with no table markup (a rendered dashboard / embedded images).
+      // Docling over megabytes of base64 images is slow and pointless; skip it and
+      // let the chat layer steer the user to a structured export instead.
+      context.extraction_status = "skipped";
+      context.extraction_method = "html-no-table";
+      context.extraction_error = "Large HTML with no table markup (looks like a rendered page or images).";
     } else if (simple !== null) {
       context.extraction_status = "parsed";
       context.extraction_method = "local-text";
@@ -1469,6 +1477,39 @@ function deterministicTableProposal(body, { salvage = false } = {}) {
   };
 }
 
+// "Make a table" landed on HTML that has no <table> markup — a rendered
+// dashboard or an image page (e.g. a vision-pass render). The model path would
+// fail the same opaque way it did before this fix, so return clear guidance
+// pointing at the structured export rather than a dead end. Only fires for HTML
+// we already know is un-liftable (large no-table skip, or a failed extraction);
+// small prose HTML still falls through to the model.
+function htmlWithoutTableGuidance(body) {
+  if (!promptWantsTableDump(body?.prompt)) return null;
+  const files = Array.isArray(body?.files) ? body.files : [];
+  if (files.some((file) => Array.isArray(file.tables) && file.tables.length)) return null;
+  const stuck = files.filter(
+    (file) =>
+      [".html", ".htm"].includes(extensionOf(file.name)) &&
+      !(Array.isArray(file.tables) && file.tables.length) &&
+      (file.extraction_method === "html-no-table" || file.extraction_status === "failed"),
+  );
+  if (!stuck.length) return null;
+  const names = stuck.map((file) => file.name).join(", ");
+  return {
+    message: [
+      `I couldn't find a table in ${names} — it looks like a rendered page (a dashboard, or scanned/image content) rather than an HTML table, so there are no rows to lift directly.`,
+      "Attach the structured export instead — a .csv or .xlsx — and I'll drop it straight into the sheet. Or tell me the columns you want and I'll build it.",
+    ].join("\n"),
+    actions: [],
+    files: files.map((file) => ({
+      name: file.name, type: file.type, size: file.size,
+      extraction_status: file.extraction_status, extraction_method: file.extraction_method,
+      extraction_error: file.extraction_error,
+    })),
+    source: "html-no-table",
+  };
+}
+
 // The user asked for workbook output (write-intent verb, or a parsed file is
 // attached and presumably destined for the sheet).
 function expectsWorkbookActions(body) {
@@ -2041,6 +2082,10 @@ async function handleChat(req, res) {
     const directTable = deterministicTableProposal(body);
     if (directTable) return send(res, 200, directTable, undefined, origin);
 
+    // No table to lift from an HTML dashboard/image page: guide, don't dead-end.
+    const noTable = htmlWithoutTableGuidance(body);
+    if (noTable) return send(res, 200, noTable, undefined, origin);
+
     return send(res, 200, await callHermesPlatform(body, { signal: controller.signal }), undefined, origin);
   } catch (error) {
     if (controller.signal.aborted && body?.request_id && body?.workbook_id) {
@@ -2254,6 +2299,7 @@ export {
   deriveSheetName,
   promptWantsTableDump,
   deterministicTableProposal,
+  htmlWithoutTableGuidance,
   extractJsonObject,
   normalizeMatrix,
   normalizeAction,
