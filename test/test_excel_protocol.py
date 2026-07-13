@@ -25,9 +25,12 @@ def load(name: str):
     return module
 
 
-runtime = load("excel_runtime")
-tool = load("excel_tool")
-adapter_mod = load("adapter")
+try:
+    runtime = load("excel_runtime")
+    tool = load("excel_tool")
+    adapter_mod = load("adapter")
+except ModuleNotFoundError as error:  # pragma: no cover - bare checkout without the Hermes runtime
+    raise unittest.SkipTest(f"hermes gateway runtime not importable here: {error}")
 policy = load("excel_policy")
 
 
