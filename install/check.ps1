@@ -46,6 +46,17 @@ $installer = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'addin-install.ps
 if ($installer -notmatch "service\s+-eq\s+'hermes-excel-bridge'") {
   $failures.Add('Installer health check must validate the bridge service identity.')
 }
+if ($installer -notmatch 'Ensure-IngestToken' -or $installer -notmatch 'hermes gateway restart') {
+  $failures.Add('Installer must provision the adapter ingest token and restart Hermes gateway.')
+}
+if ($installer -notmatch 'PreviousTaskWasDisabled' -or $installer -notmatch 'Disable-ScheduledTask') {
+  $failures.Add('Installer must preserve an operator-disabled bridge task across upgrades.')
+}
+$launcherTemplate = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'run-bridge.cmd.template') -Raw
+if ($launcherTemplate -notmatch 'HERMES_EXCEL_INGEST_TOKEN=<"__DATA_DIR__\\\.ingest-token"' -or
+    $launcherTemplate -notmatch 'HERMES_EXCEL_ALLOW_RAW_FALLBACK=0') {
+  $failures.Add('Installed launcher must share the ingest token and disable raw fallback.')
+}
 
 $pane = Get-Content -LiteralPath (Join-Path $root 'taskpane.html') -Raw
 if ($pane -notmatch '<input[^>]+id="reviewToggle"[^>]+checked') {

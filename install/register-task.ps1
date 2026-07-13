@@ -110,6 +110,18 @@ Set shell = Nothing
   Write-Host "[register-task] Registered scheduled task '$TaskName' (logon-triggered, hidden, no elevation)."
 }
 catch {
-  Write-Error "[register-task] FAILED: $($_.Exception.Message)"
+  $failureMessage = $_.Exception.Message
+  $nativeCode = $null
+  if ($_.Exception.PSObject.Properties.Name -contains 'NativeErrorCode') {
+    $nativeCode = $_.Exception.NativeErrorCode
+  }
+  if ($_.Exception -is [System.UnauthorizedAccessException] -or
+      $_.Exception.HResult -eq [int]0x80070005 -or $nativeCode -eq 5 -or
+      $_.FullyQualifiedErrorId -match '0x80070005|E_ACCESSDENIED' -or
+      $failureMessage -like '*Access is denied*') {
+    Write-Warning "[register-task] ACCESS_DENIED: $failureMessage"
+    exit 5
+  }
+  Write-Error "[register-task] FAILED: $failureMessage"
   exit 1
 }

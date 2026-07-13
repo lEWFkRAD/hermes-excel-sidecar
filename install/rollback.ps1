@@ -76,13 +76,16 @@ try {
     Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
     Write-Host "    Removed '$lnk'."
   } else { Write-Host '    No Startup shortcut present.' }
+  $doclingLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Hermes Docling Serve.lnk'
+  Remove-Item -LiteralPath $doclingLnk -Force -ErrorAction SilentlyContinue
 
   # 4. Sideload (WEF Developer value + catalog manifest).
   Step '4. Remove developer sideload'
   $regSide = Join-Path $InstallDir 'install\register-sideload.ps1'
   if (-not (Test-Path -LiteralPath $regSide)) { $regSide = Join-Path $ScriptDir 'register-sideload.ps1' }
   if (Test-Path -LiteralPath $regSide) {
-    try { & powershell -NoProfile -ExecutionPolicy Bypass -File $regSide -InstallDir $InstallDir -OfficeVersion $OfficeVersion -Unregister } catch { Write-Warning $_.Exception.Message }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $regSide -InstallDir $InstallDir -Unregister
+    if ($LASTEXITCODE -ne 0) { throw "Office add-in unregistration failed with exit code $LASTEXITCODE; payload retained." }
   } else {
     # Inline fallback if the installed script is already gone.
     $key = "HKCU:\Software\Microsoft\Office\$OfficeVersion\WEF\Developer"
@@ -112,6 +115,16 @@ try {
 
   # Clean the User env var regardless.
   [Environment]::SetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', $null, 'User')
+  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', $null, 'User')
+  Remove-Item Env:HERMES_EXCEL_BRIDGE_TOKEN -ErrorAction SilentlyContinue
+  Remove-Item Env:HERMES_EXCEL_INGEST_TOKEN -ErrorAction SilentlyContinue
+  $hermesCommand = Get-Command hermes -ErrorAction SilentlyContinue
+  if ($hermesCommand) {
+    & hermes gateway restart
+    if ($LASTEXITCODE -ne 0) { Write-Warning 'Hermes gateway restart failed; the old adapter may remain active until the next restart.' }
+  } else {
+    Write-Warning 'Hermes CLI not found; restart the gateway manually to unload the Excel adapter.'
+  }
 
   Write-Host ''
   Write-Host 'Rollback complete.' -ForegroundColor Green

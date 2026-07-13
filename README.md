@@ -8,6 +8,10 @@ upstream Hermes PR to merge. The original integration lineage remains at
 Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and
 [SECURITY.md](SECURITY.md) before contributing or deploying.
 
+This standalone repository is the release source of truth. The historical
+`apps/excel` copy inside a Hermes monorepo is not a packaging input and must
+not be used to overwrite this plugin.
+
 A local Excel sidecar for Hermes: an Office.js task pane plus a small
 zero-dependency Node bridge that connects a live workbook to the Hermes
 `api_server` platform. Chat with Hermes in a side panel while it reads sheet
@@ -108,6 +112,9 @@ Configuration is environment-variable based (defaults shown):
 PORT=8787
 HERMES_EXCEL_DATA_DIR=                     # uploads/exports/logs root, OUTSIDE the web root (default: per-user app-data)
 HERMES_EXCEL_BRIDGE_TOKEN=                 # when set, every /api/* call requires it (the installer sets one per box)
+HERMES_EXCEL_INGEST_TOKEN=                 # required shared secret for the typed Excel platform adapter
+HERMES_EXCEL_TRANSPORT=platform-only       # installed/certified default
+HERMES_EXCEL_ALLOW_RAW_FALLBACK=0          # explicit emergency compatibility escape hatch only
 HERMES_EXCEL_ALLOWED_ORIGINS=              # extra comma-separated CORS origins (loopback origins always allowed)
 HERMES_EXCEL_LLM_BASE_URL=http://127.0.0.1:8642/v1
 HERMES_EXCEL_LLM_MODEL=hermes-agent
@@ -120,7 +127,7 @@ HERMES_EXCEL_LOCK_TOOLS=                   # 1 => also send tool_choice:none to 
 HERMES_EXCEL_DOCLING_URL=http://127.0.0.1:8200
 HERMES_EXCEL_DOCLING_MODE=                 # wsl | native | docker (default: wsl on Windows, else native)
 HERMES_EXCEL_WSL_DISTRO=Ubuntu-24.04       # used only when DOCLING_MODE=wsl
-HERMES_EXCEL_DOCLING_OUTPUT_DIR=           # if set, Docling result paths must resolve under it
+HERMES_EXCEL_DOCLING_OUTPUT_DIR=           # required for path-return results; canonical paths must remain under it
 HERMES_EXCEL_MAX_EXTRACTED_CHARS_PER_FILE=32000
 HERMES_EXCEL_MAX_EXTRACTED_CHARS_TOTAL=96000
 HERMES_EXCEL_MAX_UPLOAD_BYTES=26214400     # 25 MB per attachment

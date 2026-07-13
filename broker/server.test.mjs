@@ -1,12 +1,25 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   parseDelimitedText,
   markdownTableFromRows,
+  decodeHtmlEntities,
+  parseHtmlTables,
+  htmlTablesToMarkdown,
+  coerceTableMatrix,
+  deriveSheetName,
+  promptWantsTableDump,
+  deterministicTableProposal,
+  htmlWithoutTableGuidance,
   extractJsonObject,
   normalizeMatrix,
   normalizeAction,
   normalizeActions,
+  removeSatisfiedReadActions,
+  doclingTextFromResponse,
   legacyWriteToActions,
   parseMoney,
   extractedField,
@@ -25,12 +38,15 @@ import {
   buildChatMessages,
   buildSystemPrompt,
   fallbackResponse,
+  diagnosticFallback,
+  resolveContainedNativePath,
   scanWrittenCells,
   matrixToCsv,
   safeExportName,
   expectsWorkbookActions,
   claimsWorkbookChange,
   promptWantsWorkbookOutput,
+  parseHermesApiServerKey,
 } from "./server.mjs";
 import {
   columnLettersToNumber,
@@ -39,6 +55,52 @@ import {
   translateFormula,
   translateMatrixFormulas,
 } from "./formula-rebase.mjs";
+
+test("diagnosticFallback: certification failures never create workbook actions", () => {
+  const body = { prompt: "Parse this PDF and make a workbook", files: [{ name: "bank.pdf", extracted_text: "Balance 123" }] };
+  for (const reason of ["adapter_unavailable", "adapter_invalid", "adapter_timeout", "canceled"]) {
+    const result = diagnosticFallback(body, reason);
+    assert.deepStrictEqual(result.actions, []);
+    assert.equal(result.source, "fallback");
+    assert.equal(result.fallback_reason, reason);
+  }
+});
+
+test("Hermes API key parser accepts legacy root and nested config shapes", () => {
+  assert.equal(parseHermesApiServerKey("API_SERVER_KEY: root-secret\n"), "root-secret");
+  assert.equal(parseHermesApiServerKey("api_server:\n  enabled: true\n  api_key: nested-secret\n"), "nested-secret");
+  assert.equal(parseHermesApiServerKey("API_SERVER_KEY: old\napi_server:\n  key: newest\n"), "newest");
+});
+
+test("Docling v1 response extraction prefers markdown and supports text fallback", () => {
+  assert.equal(doclingTextFromResponse({ document: { md_content: "# Parsed" } }), "# Parsed");
+  assert.equal(doclingTextFromResponse({ document: { text_content: "plain" } }), "plain");
+  assert.equal(doclingTextFromResponse({ status: "failure" }), "");
+});
+
+test("Docling native path containment: child accepted; siblings and symlink escapes rejected", async () => {
+  // realpath: GitHub Windows runners hand out 8.3 short names (RUNNER~1) from
+  // os.tmpdir(); the containment check canonicalizes, so the fixture must too.
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), "excel-docling-")));
+  try {
+    const root = path.join(temp, "root");
+    const sibling = path.join(temp, "root-evil");
+    await mkdir(root);
+    await mkdir(sibling);
+    const child = path.join(root, "result.md");
+    const outside = path.join(sibling, "secret.md");
+    await writeFile(child, "ok");
+    await writeFile(outside, "no");
+    assert.equal(await resolveContainedNativePath(root, child), child);
+    await assert.rejects(resolveContainedNativePath("", child), /configured output dir/);
+    await assert.rejects(resolveContainedNativePath(root, outside), /outside/);
+    const link = path.join(root, "escape-dir");
+    await symlink(sibling, link, "junction");
+    await assert.rejects(resolveContainedNativePath(root, path.join(link, "secret.md")), /outside/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
 
 test("parseDelimitedText: quoted cells, escaped quotes, CRLF, blank rows, TSV", () => {
   const csv = 'a "b", c\r\n"d ""e"", f"\r\n';
@@ -250,6 +312,19 @@ test("normalizeActions: prefers actions array, falls back to legacy write", () =
 
   assert.deepStrictEqual(normalizeActions({ write: { mode: "none", values: [[1]] } }, {}), []);
   assert.deepStrictEqual(legacyWriteToActions(null, {}), []);
+});
+
+test("removeSatisfiedReadActions removes only successful exact prior reads", () => {
+  const actions = [
+    { type: "read_range", range: "'Sheet 1'!$A$1:$B$2" },
+    { type: "read_range", range: "Sheet2!A1:C3" },
+    { type: "write_cells", start_cell: "D1", values: [[1]] },
+  ];
+  const filtered = removeSatisfiedReadActions(actions, [
+    { range: "'Sheet 1'!A1:B2", values: [[1]] },
+    { range: "Sheet2!A1:C3", error: "read failed" },
+  ]);
+  assert.deepStrictEqual(filtered, [actions[1], actions[2]]);
 });
 
 test("parseMoney: plain, currency, paren negatives, blanks, unparseable", () => {
@@ -714,4 +789,233 @@ test("matrixToCsv: neutralizes CSV formula injection", () => {
   assert.strictEqual(matrixToCsv([["hello"]]), "hello");
   assert.strictEqual(matrixToCsv([["123"]]), "123");
   assert.strictEqual(matrixToCsv([["=evil"], ["normal"]]), "'=evil\r\nnormal");
+});
+
+// --- Deterministic HTML table extraction ------------------------------------
+
+test("decodeHtmlEntities: named, numeric, and hex entities", () => {
+  assert.equal(decodeHtmlEntities("A &amp; B &lt;C&gt;"), "A & B <C>");
+  assert.equal(decodeHtmlEntities("50&nbsp;%"), "50 %");
+  assert.equal(decodeHtmlEntities("&#36;1,234.56"), "$1,234.56");
+  assert.equal(decodeHtmlEntities("&#x2014;"), "—");
+  assert.equal(decodeHtmlEntities("&notareal;"), "&notareal;"); // unknown left intact
+});
+
+test("parseHtmlTables: basic grid with th header", () => {
+  const html = `<table><thead><tr><th>Date</th><th>Payee</th><th>Amount</th></tr></thead>
+    <tbody><tr><td>01/02/2023</td><td>Acme</td><td>$100.00</td></tr>
+    <tr><td>01/03/2023</td><td>Globex</td><td>$250.50</td></tr></tbody></table>`;
+  const tables = parseHtmlTables(html);
+  assert.equal(tables.length, 1);
+  assert.deepEqual(tables[0][0], ["Date", "Payee", "Amount"]);
+  assert.deepEqual(tables[0][2], ["01/03/2023", "Globex", "$250.50"]);
+});
+
+test("parseHtmlTables: entities and inline tags inside cells", () => {
+  const html = `<table><tr><td>Smith &amp; Co</td><td><b>Net</b> 30<br>days</td><td>&#36;1,000</td></tr></table>`;
+  const [rows] = parseHtmlTables(html);
+  assert.deepEqual(rows[0], ["Smith & Co", "Net 30 days", "$1,000"]);
+});
+
+test("parseHtmlTables: colspan pads columns to stay aligned", () => {
+  const html = `<table><tr><td colspan="2">Header band</td><td>X</td></tr>
+    <tr><td>a</td><td>b</td><td>c</td></tr></table>`;
+  const [rows] = parseHtmlTables(html);
+  assert.deepEqual(rows[0], ["Header band", "", "X"]);
+  assert.deepEqual(rows[1], ["a", "b", "c"]);
+});
+
+test("parseHtmlTables: tolerates omitted </td> and </tr> close tags", () => {
+  const html = `<table><tr><td>a<td>b<td>c<tr><td>d<td>e<td>f</table>`;
+  const [rows] = parseHtmlTables(html);
+  assert.deepEqual(rows, [["a", "b", "c"], ["d", "e", "f"]]);
+});
+
+test("parseHtmlTables: nested table does not leak into parent rows", () => {
+  const html = `<table><tr><td>outer1</td><td>outer2</td></tr>
+    <tr><td><table><tr><td>inner</td></tr></table></td><td>outer4</td></tr></table>`;
+  const tables = parseHtmlTables(html);
+  assert.equal(tables.length, 1); // inner consumed with parent, not emitted twice
+  assert.equal(tables[0][0][0], "outer1");
+  assert.ok(!JSON.stringify(tables[0]).includes("inner"));
+});
+
+test("parseHtmlTables: multiple sibling tables", () => {
+  const html = `<table><tr><td>one</td></tr></table><table><tr><td>two</td><td>three</td></tr></table>`;
+  const tables = parseHtmlTables(html);
+  assert.equal(tables.length, 2);
+  assert.deepEqual(tables[1][0], ["two", "three"]);
+});
+
+test("parseHtmlTables: no table returns [] (prose falls through to Docling)", () => {
+  assert.deepEqual(parseHtmlTables("<html><body><p>no tables here</p></body></html>"), []);
+});
+
+test("coerceTableMatrix: pads ragged rows, keeps cells verbatim", () => {
+  const { values, cols } = coerceTableMatrix([["007", "$1,000.00"], ["x"]]);
+  assert.equal(cols, 2);
+  assert.deepEqual(values, [["007", "$1,000.00"], ["x", ""]]); // leading zero preserved, no numeric coercion
+});
+
+test("coerceTableMatrix: flags truncation past the row cap", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => [String(i)]);
+  const { values, truncated } = coerceTableMatrix(rows, { maxRows: 10 });
+  assert.equal(values.length, 10);
+  assert.equal(truncated, true);
+});
+
+test("deriveSheetName: strips extension and illegal chars, caps at 31", () => {
+  assert.equal(deriveSheetName("Vendor-Disbursement-Amount-Review.html"), "Vendor-Disbursement-Amount-Revi");
+  assert.equal(deriveSheetName("a/b:c*d.csv"), "a b c d");
+  assert.equal(deriveSheetName(".html"), "Imported Table");
+});
+
+test("promptWantsTableDump: matches plain table requests, rejects analytical ones", () => {
+  assert.equal(promptWantsTableDump("put this into a table"), true);
+  assert.equal(promptWantsTableDump("make a table from this"), true);
+  assert.equal(promptWantsTableDump("import as a spreadsheet"), true);
+  assert.equal(promptWantsTableDump("tabulate this"), true);
+  assert.equal(promptWantsTableDump("total the amounts and put in a table"), false); // analytical
+  assert.equal(promptWantsTableDump("reconcile these into a sheet"), false);
+  assert.equal(promptWantsTableDump("summarize this"), false);
+});
+
+test("deterministicTableProposal: builds a verbatim create_sheet, model-free", () => {
+  const body = {
+    prompt: "put this into a table",
+    files: [{
+      name: "Disbursements.html", type: "text/html", size: 10,
+      extraction_status: "parsed", extraction_method: "local-html-table",
+      tables: [[["Date", "Payee", "Amount"], ["01/02/2023", "Acme", "$100.00"]]],
+    }],
+  };
+  const result = deterministicTableProposal(body);
+  assert.equal(result.source, "html-table");
+  assert.equal(result.actions.length, 1);
+  assert.equal(result.actions[0].type, "create_sheet");
+  assert.equal(result.actions[0].name, "Disbursements");
+  assert.deepEqual(result.actions[0].values[0], ["Date", "Payee", "Amount"]);
+  assert.ok(!("tables" in result.files[0])); // structured rows never echoed to the pane
+});
+
+test("deterministicTableProposal: picks the largest of several tables", () => {
+  const body = {
+    prompt: "drop this into a sheet",
+    files: [{
+      name: "report.html", extraction_status: "parsed",
+      tables: [
+        [["nav"]],
+        [["A", "B"], ["1", "2"], ["3", "4"]],
+      ],
+    }],
+  };
+  const result = deterministicTableProposal(body);
+  assert.equal(result.actions[0].values.length, 3);
+  assert.match(result.message, /Found 2 tables/);
+});
+
+test("deterministicTableProposal: null for analytical prompt (hands off to model)", () => {
+  const body = {
+    prompt: "sum the amount column",
+    files: [{ name: "x.html", tables: [[["Amount"], ["5"]]] }],
+  };
+  assert.equal(deterministicTableProposal(body), null);
+});
+
+test("deterministicTableProposal: null when no attachment parsed to a table", () => {
+  const body = { prompt: "put this into a table", files: [{ name: "notes.pdf", extracted_text: "prose" }] };
+  assert.equal(deterministicTableProposal(body), null);
+});
+
+test("deterministicTableProposal: salvage widens trigger to any write-intent prompt", () => {
+  const body = {
+    prompt: "reconcile the disbursements against the ledger", // analytical: not a plain dump
+    files: [{ name: "d.html", extraction_status: "parsed", tables: [[["A"], ["1"]]] }],
+  };
+  assert.equal(deterministicTableProposal(body), null); // analytical → hands off to model
+  const salvaged = deterministicTableProposal(body, { salvage: true });
+  assert.equal(salvaged.source, "html-table-salvage");
+  assert.match(salvaged.message, /couldn't complete/);
+});
+
+test("htmlTablesToMarkdown: labels multiple tables", () => {
+  const md = htmlTablesToMarkdown([[["A"], ["1"]], [["B"], ["2"]]]);
+  assert.match(md, /Table 1:/);
+  assert.match(md, /Table 2:/);
+});
+
+test("htmlWithoutTableGuidance: steers to structured export when HTML has no table", () => {
+  const body = {
+    prompt: "put this into a table",
+    files: [{
+      name: "Vendor-Disbursement-Amount-Review.html", type: "text/html", size: 12560119,
+      extraction_status: "skipped", extraction_method: "html-no-table",
+      extraction_error: "Large HTML with no table markup (looks like a rendered page or images).",
+    }],
+  };
+  const result = htmlWithoutTableGuidance(body);
+  assert.equal(result.source, "html-no-table");
+  assert.deepEqual(result.actions, []);
+  assert.match(result.message, /couldn't find a table/);
+  assert.match(result.message, /\.csv or \.xlsx/);
+});
+
+test("htmlWithoutTableGuidance: defers to the table path when a table did parse", () => {
+  const body = {
+    prompt: "put this into a table",
+    files: [{ name: "report.html", extraction_method: "local-html-table", tables: [[["A"], ["1"]]] }],
+  };
+  assert.equal(htmlWithoutTableGuidance(body), null);
+});
+
+test("htmlWithoutTableGuidance: leaves small prose HTML to the model", () => {
+  // Small no-table HTML goes through Docling, not the html-no-table skip, so it
+  // is not "stuck" and the model still gets a chance.
+  const body = {
+    prompt: "make a table",
+    files: [{ name: "notes.html", extraction_method: "docling", extraction_status: "parsed", extracted_text: "some prose" }],
+  };
+  assert.equal(htmlWithoutTableGuidance(body), null);
+});
+
+test("htmlWithoutTableGuidance: only for table-dump prompts", () => {
+  const body = {
+    prompt: "summarize the trends",
+    files: [{ name: "dash.html", extraction_method: "html-no-table", extraction_status: "skipped" }],
+  };
+  assert.equal(htmlWithoutTableGuidance(body), null);
+});
+
+// --- Review-pass regressions (2026-07-13) ------------------------------------
+
+test("parseHtmlTables: table markup inside <script>/<style>/comments is not data", () => {
+  const html = `<table><tr><td>Real</td><td>Data</td></tr></table>
+    <script>const tpl = \`<table><tr><td>\${esc(t.date)}</td></tr></table>\`;</script>
+    <style>.x{}</style><!-- <table><tr><td>ghost</td></tr></table> -->`;
+  const tables = parseHtmlTables(html);
+  assert.equal(tables.length, 1);
+  assert.deepEqual(tables[0][0], ["Real", "Data"]);
+});
+
+test("promptWantsTableDump: structural edits are not dumps", () => {
+  assert.equal(promptWantsTableDump("add a row to the table"), false);
+  assert.equal(promptWantsTableDump("insert two columns in the sheet"), false);
+  assert.equal(promptWantsTableDump("insert a new column in the table"), false);
+  // ...but dumping counted-noun-free row data still is
+  assert.equal(promptWantsTableDump("put these rows into a table"), true);
+  assert.equal(promptWantsTableDump("put this into a table"), true);
+});
+
+test("deterministicTableProposal: best table across ALL files, not first-file-wins", () => {
+  const body = {
+    prompt: "put this into a table",
+    files: [
+      { name: "nav.html", tables: [[["nav"]]] },
+      { name: "register.html", tables: [[["Date", "Payee", "Amount"], ["1", "2", "3"], ["4", "5", "6"]]] },
+    ],
+  };
+  const result = deterministicTableProposal(body);
+  assert.equal(result.actions[0].name, "register");
+  assert.equal(result.actions[0].values.length, 3);
+  assert.match(result.message, /from register\.html/);
 });
