@@ -364,6 +364,162 @@ function extractSimpleText(file, bytes) {
   return truncateText(text);
 }
 
+// --- Deterministic HTML table extraction -------------------------------------
+// The accountant's single most common attachment is a report that already IS a
+// table (GL export, disbursement register, AR/AP aging). Reconstructing that
+// through the model — Docling -> markdown -> 16k truncation -> typed-schema — is
+// both lossy and failure-prone on large files (found live: a 12MB report died
+// exactly this way with "invalid response"). When the source HTML
+// already contains <table> markup we parse it straight to cells, with the model
+// out of the loop. The task pane still previews + Undo-gates before applying,
+// so the deterministic path stays supervised and reversible.
+
+const HTML_ENTITIES = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  ndash: "-", mdash: "-", hellip: "...", middot: "·",
+  lsquo: "'", rsquo: "'", ldquo: '"', rdquo: '"',
+};
+
+function decodeHtmlEntities(text) {
+  return String(text || "").replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (match, name) => {
+    if (name[0] === "#") {
+      const code = name[1] === "x" || name[1] === "X"
+        ? parseInt(name.slice(2), 16)
+        : parseInt(name.slice(1), 10);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
+    }
+    return Object.prototype.hasOwnProperty.call(HTML_ENTITIES, name) ? HTML_ENTITIES[name] : match;
+  });
+}
+
+// A single cell's inner HTML -> plain text: <br> becomes a space, remaining
+// inline tags are stripped, entities decoded, whitespace collapsed.
+function cleanCellHtml(inner) {
+  return decodeHtmlEntities(
+    String(inner || "")
+      .replace(/<\s*br\s*\/?\s*>/gi, " ")
+      .replace(/<[^>]*>/g, " "),
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Cells within one <tr>, tolerant of omitted </td>/</th> close tags (legal HTML,
+// and common in hand-authored exports). colspan is honored by padding empty
+// cells so columns stay aligned; rowspan is not reconstructed.
+function parseTableRowCells(rowHtml) {
+  const cells = [];
+  const parts = String(rowHtml).split(/<\s*(?:td|th)\b/i);
+  for (let idx = 1; idx < parts.length; idx += 1) {
+    const seg = parts[idx];
+    const gt = seg.indexOf(">");
+    if (gt < 0) continue;
+    const attrs = seg.slice(0, gt);
+    const content = seg.slice(gt + 1).replace(/<\s*\/\s*(?:td|th)\b[\s\S]*$/i, "");
+    cells.push(cleanCellHtml(content));
+    const colspan = parseInt((attrs.match(/colspan\s*=\s*["']?(\d+)/i) || [])[1] || "1", 10);
+    for (let k = 1; k < Math.min(Math.max(colspan, 1), 50); k += 1) cells.push("");
+  }
+  return cells;
+}
+
+// Rows within one table's inner HTML (nested tables already removed by caller).
+function parseTableRows(inner, maxRows) {
+  const rows = [];
+  const parts = String(inner).split(/<\s*tr\b/i);
+  for (let idx = 1; idx < parts.length && rows.length < maxRows; idx += 1) {
+    const seg = parts[idx];
+    const gt = seg.indexOf(">");
+    if (gt < 0) continue;
+    const content = seg.slice(gt + 1).replace(/<\s*\/\s*tr\b[\s\S]*$/i, "");
+    const cells = parseTableRowCells(content);
+    if (cells.some((cell) => cell !== "")) rows.push(cells);
+  }
+  return rows;
+}
+
+// Every top-level <table> -> matrix of trimmed cell strings. Depth-aware so a
+// table nested inside another is consumed with its parent rather than emitted
+// twice, and its markup is stripped so its rows never leak into the parent.
+// Returns [] when the document has no table (prose HTML then falls through to
+// Docling unchanged).
+function parseHtmlTables(html, { maxTables = 20, maxRowsPerTable = 20000 } = {}) {
+  const source = String(html || "");
+  const lower = source.toLowerCase();
+  const tables = [];
+  let cursor = 0;
+  while (tables.length < maxTables) {
+    const open = lower.indexOf("<table", cursor);
+    if (open < 0) break;
+    const tagRe = /<\/?table\b[^>]*>/gi;
+    tagRe.lastIndex = open;
+    let depth = 0;
+    let contentStart = -1;
+    let end = -1;
+    let match;
+    while ((match = tagRe.exec(source))) {
+      if (match[0][1] === "/") {
+        depth -= 1;
+        if (depth === 0) { end = match.index; break; }
+      } else {
+        if (depth === 0) contentStart = tagRe.lastIndex;
+        depth += 1;
+      }
+    }
+    if (contentStart < 0) break;
+    if (end < 0) { end = source.length; cursor = source.length; } else { cursor = tagRe.lastIndex; }
+    // Drop any nested tables inside this one (innermost-first) so their <tr>/<td>
+    // do not bleed into the parent's rows.
+    let inner = source.slice(contentStart, end);
+    let prev;
+    do { prev = inner; inner = inner.replace(/<table\b[^>]*>[\s\S]*?<\/table>/i, ""); } while (inner !== prev);
+    const rows = parseTableRows(inner, maxRowsPerTable);
+    if (rows.length) tables.push(rows);
+    if (end >= source.length) break;
+  }
+  return tables;
+}
+
+// Model-context text for HTML that has tables: clean markdown instead of Docling
+// soup, so even analytical prompts ("total column D") get well-structured input.
+function htmlTablesToMarkdown(tables) {
+  return (tables || [])
+    .map((rows, index) =>
+      [tables.length > 1 ? `Table ${index + 1}:` : "", markdownTableFromRows(rows)].filter(Boolean).join("\n"),
+    )
+    .join("\n\n");
+}
+
+function tableCellCount(rows) {
+  return (rows || []).reduce((total, row) => total + (Array.isArray(row) ? row.length : 0), 0);
+}
+
+// Coerce a parsed table to a rectangular matrix the pane can apply. Cells are
+// kept VERBATIM as strings — no "$1,234.56" -> number coercion, which would
+// silently corrupt account numbers with leading zeros and parenthesized
+// negatives. The user (or a follow-up prompt) can type columns afterward.
+function coerceTableMatrix(rows, { maxRows = 5000, maxCols = 60 } = {}) {
+  const sliced = (rows || []).slice(0, maxRows).map((row) => (Array.isArray(row) ? row : []).slice(0, maxCols));
+  const width = Math.max(0, ...sliced.map((row) => row.length));
+  const values = sliced.map((row) => {
+    const copy = row.map((cell) => (typeof cell === "string" ? cell : String(cell ?? "")));
+    while (copy.length < width) copy.push("");
+    return copy;
+  });
+  return { values, truncated: (rows || []).length > maxRows, rows: values.length, cols: width };
+}
+
+// A valid Excel sheet name derived from the source file: 31 chars, no \ / ? * [ ] :
+function deriveSheetName(fileName) {
+  const cleaned = String(fileName || "")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[\\/?*[\]:]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 31);
+  return cleaned || "Imported Table";
+}
+
 function decodePdfLiteral(value) {
   return String(value || "")
     .replace(/\\n/g, "\n")
@@ -636,11 +792,24 @@ async function prepareAttachedFiles(files = [], signal) {
       extracted_text: "",
     };
 
+    const ext = extensionOf(file.name);
+    const htmlTables = ext === ".html" || ext === ".htm" ? parseHtmlTables(bytes.toString("utf8")) : null;
     const simple = extractSimpleText(file, bytes);
-    if (simple !== null) {
+    if (htmlTables && htmlTables.length) {
+      // HTML that already contains a table: parse it deterministically and keep
+      // the model out of the loop. No Docling, no truncation, works at any size.
+      context.extraction_status = "parsed";
+      context.extraction_method = "local-html-table";
+      context.tables = htmlTables;
+      context.extracted_text = truncateText(htmlTablesToMarkdown(htmlTables));
+    } else if (simple !== null) {
       context.extraction_status = "parsed";
       context.extraction_method = "local-text";
       context.extracted_text = simple;
+      if (ext === ".csv" || ext === ".tsv") {
+        const rows = parseDelimitedText(bytes.toString("utf8"), ext === ".tsv" ? "\t" : ",");
+        if (rows.length) context.tables = [rows];
+      }
     } else {
       try {
         context.extracted_text = await extractWithDocling(out, signal, file.name || safeName, bytes);
@@ -1244,6 +1413,62 @@ function promptWantsWorkbookOutput(prompt) {
   );
 }
 
+// The user wants a plain, verbatim table placed in the sheet — nothing computed.
+// Deliberately conservative: any analytical verb (sum, pivot, reconcile, filter,
+// compare, ...) disqualifies the deterministic path and hands the request to the
+// model, which is where transforms belong.
+function promptWantsTableDump(prompt) {
+  const text = String(prompt || "");
+  if (/\b(sum|totals?|subtotal|average|avg|mean|count|pivot|reconcile|reconcil\w*|compare|comparison|variance|filter|dedupe|de-dupe|group\s+by|sort\s+by|chart|graph|plot|formula|calculate|comput\w*|analy[sz]\w*|highlight|only\s+the|where\b)\b/i.test(text)) {
+    return false;
+  }
+  return (
+    /\b(put|paste|drop|load|import|insert|place|turn|convert|make|create|build|tabulate|populate|add|extract)\b[\s\S]{0,40}\b(table|sheet|spreadsheet|worksheet|grid|cells|workbook)\b/i.test(text) ||
+    /\b(as|into|in)\s+(a\s+)?(new\s+)?(table|sheet|spreadsheet|grid)\b/i.test(text) ||
+    /^\s*tabulate\b/i.test(text)
+  );
+}
+
+// Build a create_sheet proposal straight from a deterministically parsed table,
+// with the model out of the loop. `salvage` widens the trigger from "plain table
+// dump" to "any write-intent prompt" — used when the typed adapter has already
+// failed, so an accountant gets the raw table instead of a dead end.
+function deterministicTableProposal(body, { salvage = false } = {}) {
+  const files = Array.isArray(body?.files) ? body.files : [];
+  const withTables = files.filter((file) => Array.isArray(file.tables) && file.tables.length);
+  if (!withTables.length) return null;
+  const wanted = salvage ? promptWantsWorkbookOutput(body?.prompt) : promptWantsTableDump(body?.prompt);
+  if (!wanted) return null;
+
+  const file = withTables[0];
+  const table = file.tables.reduce((best, candidate) => (tableCellCount(candidate) > tableCellCount(best) ? candidate : best));
+  const { values, truncated, rows, cols } = coerceTableMatrix(table);
+  if (!values.length) return null;
+
+  const sheetName = deriveSheetName(file.name);
+  const notes = [];
+  if (file.tables.length > 1) {
+    notes.push(`Found ${file.tables.length} tables in ${file.name}; used the largest one.`);
+  }
+  if (truncated) {
+    notes.push(`The table was large — kept the first ${rows} rows. Ask me to split the rest if you need them.`);
+  }
+  const lead = salvage
+    ? `The typed Excel adapter couldn't complete this, so I placed the source table into a new sheet "${sheetName}" verbatim — nothing was computed or invented.`
+    : `Placed the table from ${file.name} into a new sheet "${sheetName}" (${rows} rows × ${cols} cols), copied verbatim from the source.`;
+
+  return {
+    message: [lead, ...notes, "Review the sheet before applying."].join("\n"),
+    actions: [{ type: "create_sheet", name: sheetName.slice(0, 31), values }],
+    files: files.map((file) => ({
+      name: file.name, type: file.type, size: file.size,
+      extraction_status: file.extraction_status, extraction_method: file.extraction_method,
+      extraction_error: file.extraction_error,
+    })),
+    source: salvage ? "html-table-salvage" : "html-table",
+  };
+}
+
 // The user asked for workbook output (write-intent verb, or a parsed file is
 // attached and presumably destined for the sheet).
 function expectsWorkbookActions(body) {
@@ -1481,11 +1706,15 @@ async function callHermesPlatform(body, { signal } = {}) {
     return { message: String(captured.message || captured.proposal.message || "Proposal ready for review."),
       actions, files, source: "hermes-platform",
       ...(actions.some((action) => action.type === "read_range")
-        ? { parsed_files: (body.files || []).map((file) => ({ ...file, base64: undefined })) } : {}) };
+        ? { parsed_files: (body.files || []).map((file) => ({ ...file, base64: undefined, tables: undefined })) } : {}) };
   } catch (error) {
     if (signal?.aborted || error?.name === "AbortError") throw error;
     const reason = /HTTP 504|timed out/i.test(error.message) ? "adapter_timeout" :
       /no proposal|invalid|HTTP 502/i.test(error.message) ? "adapter_invalid" : "adapter_unavailable";
+    // Rather than a dead end, salvage a verbatim table dump when the prompt asked
+    // for workbook output and an attachment parsed to a table.
+    const salvage = deterministicTableProposal(body, { salvage: true });
+    if (salvage) return { ...salvage, fallback_reason: reason };
     return diagnosticFallback(body, reason);
   }
 }
@@ -1806,6 +2035,12 @@ async function handleChat(req, res) {
         ? body.parsed_files
         : await prepareAttachedFiles(body.files || [], controller.signal);
 
+    // Deterministic short-circuit: a plain "put this into a table" over an
+    // attachment that already parsed to a table never needs the model. Build the
+    // proposal here; the pane still previews + Undo-gates it.
+    const directTable = deterministicTableProposal(body);
+    if (directTable) return send(res, 200, directTable, undefined, origin);
+
     return send(res, 200, await callHermesPlatform(body, { signal: controller.signal }), undefined, origin);
   } catch (error) {
     if (controller.signal.aborted && body?.request_id && body?.workbook_id) {
@@ -2012,6 +2247,13 @@ if (isMainModule) {
 export {
   parseDelimitedText,
   markdownTableFromRows,
+  decodeHtmlEntities,
+  parseHtmlTables,
+  htmlTablesToMarkdown,
+  coerceTableMatrix,
+  deriveSheetName,
+  promptWantsTableDump,
+  deterministicTableProposal,
   extractJsonObject,
   normalizeMatrix,
   normalizeAction,
