@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { mkdtemp, mkdir, writeFile, symlink, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -79,7 +79,9 @@ test("Docling v1 response extraction prefers markdown and supports text fallback
 });
 
 test("Docling native path containment: child accepted; siblings and symlink escapes rejected", async () => {
-  const temp = await mkdtemp(path.join(os.tmpdir(), "excel-docling-"));
+  // realpath: GitHub Windows runners hand out 8.3 short names (RUNNER~1) from
+  // os.tmpdir(); the containment check canonicalizes, so the fixture must too.
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), "excel-docling-")));
   try {
     const root = path.join(temp, "root");
     const sibling = path.join(temp, "root-evil");
