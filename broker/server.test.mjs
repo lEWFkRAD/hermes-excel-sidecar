@@ -983,3 +983,37 @@ test("htmlWithoutTableGuidance: only for table-dump prompts", () => {
   };
   assert.equal(htmlWithoutTableGuidance(body), null);
 });
+
+// --- Review-pass regressions (2026-07-13) ------------------------------------
+
+test("parseHtmlTables: table markup inside <script>/<style>/comments is not data", () => {
+  const html = `<table><tr><td>Real</td><td>Data</td></tr></table>
+    <script>const tpl = \`<table><tr><td>\${esc(t.date)}</td></tr></table>\`;</script>
+    <style>.x{}</style><!-- <table><tr><td>ghost</td></tr></table> -->`;
+  const tables = parseHtmlTables(html);
+  assert.equal(tables.length, 1);
+  assert.deepEqual(tables[0][0], ["Real", "Data"]);
+});
+
+test("promptWantsTableDump: structural edits are not dumps", () => {
+  assert.equal(promptWantsTableDump("add a row to the table"), false);
+  assert.equal(promptWantsTableDump("insert two columns in the sheet"), false);
+  assert.equal(promptWantsTableDump("insert a new column in the table"), false);
+  // ...but dumping counted-noun-free row data still is
+  assert.equal(promptWantsTableDump("put these rows into a table"), true);
+  assert.equal(promptWantsTableDump("put this into a table"), true);
+});
+
+test("deterministicTableProposal: best table across ALL files, not first-file-wins", () => {
+  const body = {
+    prompt: "put this into a table",
+    files: [
+      { name: "nav.html", tables: [[["nav"]]] },
+      { name: "register.html", tables: [[["Date", "Payee", "Amount"], ["1", "2", "3"], ["4", "5", "6"]]] },
+    ],
+  };
+  const result = deterministicTableProposal(body);
+  assert.equal(result.actions[0].name, "register");
+  assert.equal(result.actions[0].values.length, 3);
+  assert.match(result.message, /from register\.html/);
+});

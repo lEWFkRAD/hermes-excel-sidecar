@@ -444,7 +444,13 @@ function parseTableRows(inner, maxRows) {
 // Returns [] when the document has no table (prose HTML then falls through to
 // Docling unchanged).
 function parseHtmlTables(html, { maxTables = 20, maxRowsPerTable = 20000 } = {}) {
-  const source = String(html || "");
+  // Table markup inside <script>/<style> or comments is code, not data — a JS
+  // render-template or a commented-out table must never become a phantom table
+  // (found live: a script template's `${esc(t.date)}` row parsed as data).
+  const source = String(html || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "");
   const lower = source.toLowerCase();
   const tables = [];
   let cursor = 0;
@@ -1430,6 +1436,12 @@ function promptWantsTableDump(prompt) {
   if (/\b(sum|totals?|subtotal|average|avg|mean|count|pivot|reconcile|reconcil\w*|compare|comparison|variance|filter|dedupe|de-dupe|group\s+by|sort\s+by|chart|graph|plot|formula|calculate|comput\w*|analy[sz]\w*|highlight|only\s+the|where\b)\b/i.test(text)) {
     return false;
   }
+  // "add a row to the table" / "insert two columns in the sheet" are edits to an
+  // existing structure, not a request to dump the attachment — hand those to the
+  // model. ("put these rows into a table" stays a dump: no counted determiner.)
+  if (/\b(add|insert)\b\s+(?:(?:a|an|one|two|three|\d+|another|new|blank|empty|extra)\s+){1,3}(rows?|columns?|cells?|tabs?)\b/i.test(text)) {
+    return false;
+  }
   return (
     /\b(put|paste|drop|load|import|insert|place|turn|convert|make|create|build|tabulate|populate|add|extract)\b[\s\S]{0,40}\b(table|sheet|spreadsheet|worksheet|grid|cells|workbook)\b/i.test(text) ||
     /\b(as|into|in)\s+(a\s+)?(new\s+)?(table|sheet|spreadsheet|grid)\b/i.test(text) ||
@@ -1448,18 +1460,30 @@ function deterministicTableProposal(body, { salvage = false } = {}) {
   const wanted = salvage ? promptWantsWorkbookOutput(body?.prompt) : promptWantsTableDump(body?.prompt);
   if (!wanted) return null;
 
-  const file = withTables[0];
-  const table = file.tables.reduce((best, candidate) => (tableCellCount(candidate) > tableCellCount(best) ? candidate : best));
+  // Best table across ALL attachments, not first-file-wins: a junk nav table in
+  // file one must not shadow the actual register in file two.
+  let file = withTables[0];
+  let table = null;
+  let totalTables = 0;
+  for (const candidateFile of withTables) {
+    totalTables += candidateFile.tables.length;
+    for (const candidate of candidateFile.tables) {
+      if (!table || tableCellCount(candidate) > tableCellCount(table)) {
+        table = candidate;
+        file = candidateFile;
+      }
+    }
+  }
   const { values, truncated, rows, cols } = coerceTableMatrix(table);
   if (!values.length) return null;
 
   const sheetName = deriveSheetName(file.name);
   const notes = [];
-  if (file.tables.length > 1) {
-    notes.push(`Found ${file.tables.length} tables in ${file.name}; used the largest one.`);
+  if (totalTables > 1) {
+    notes.push(`Found ${totalTables} tables across the attachment(s); used the largest one (from ${file.name}).`);
   }
   if (truncated) {
-    notes.push(`The table was large — kept the first ${rows} rows. Ask me to split the rest if you need them.`);
+    notes.push(`The table was large — kept the first ${rows} rows. Attach the data as .csv/.xlsx for the full set.`);
   }
   const lead = salvage
     ? `The typed Excel adapter couldn't complete this, so I placed the source table into a new sheet "${sheetName}" verbatim — nothing was computed or invented.`
