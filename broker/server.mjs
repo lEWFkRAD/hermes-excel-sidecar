@@ -21,8 +21,12 @@ const tlsCertPath = process.env.HERMES_EXCEL_TLS_CERT || path.join(process.env.U
 const tlsKeyPath = process.env.HERMES_EXCEL_TLS_KEY || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.key");
 const tlsEnabled = existsSync(tlsCertPath) && existsSync(tlsKeyPath);
 const allowInsecureHttp = process.env.HERMES_EXCEL_ALLOW_INSECURE_HTTP === "1";
-if (!tlsEnabled && !allowInsecureHttp) {
-  throw new Error(`Hermes Excel requires localhost TLS; missing certificate or key (${tlsCertPath}, ${tlsKeyPath}).`);
+// Enforced at server startup (requireTransportSecurity), not at import: unit
+// tests import this module for its pure helpers and must not require certs.
+function requireTransportSecurity() {
+  if (!tlsEnabled && !allowInsecureHttp) {
+    throw new Error(`Hermes Excel requires localhost TLS; missing certificate or key (${tlsCertPath}, ${tlsKeyPath}).`);
+  }
 }
 
 // Writable data root, deliberately OUTSIDE the served web root so uploaded source
@@ -2269,6 +2273,7 @@ if (isMainModule) {
       },
     );
   } else {
+    requireTransportSecurity();
     pruneUploads().catch(() => {});
     // Never let one bad request kill the bridge.
     process.on("unhandledRejection", (reason) => {
