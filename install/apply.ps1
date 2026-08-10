@@ -26,14 +26,20 @@ param(
   [ValidateRange(0, 65535)]
   [int]    $Port           = 0,
   [switch] $SkipExcelAddin,
-  [switch] $SkipSideload
+  [switch] $SkipSideload,
+  [string] $ProfileName,
+  [string] $HermesHome,
+  [string] $OwnerReceiptPath,
+  [switch] $AdoptLegacy
 )
 
 $ErrorActionPreference = 'Stop'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Import-Module (Join-Path $ScriptDir 'profile-ownership.psm1') -Force
 
 try {
+  $context = Resolve-HermesExcelProfileContext -ProfileName $ProfileName -HermesHome $HermesHome -OwnerReceiptPath $OwnerReceiptPath
   if ($SkipExcelAddin) {
     Write-Host '[apply] -SkipExcelAddin set; this box opts out of the Excel add-in. Nothing to do.'
     exit 0
@@ -44,8 +50,14 @@ try {
     throw "addin-install.ps1 not found next to apply.ps1 ('$installer')."
   }
 
-  $passthru = @{ Port = $Port }
+  $passthru = @{
+    Port = $Port
+    ProfileName = $context.ProfileName
+    HermesHome = $context.ProfileHome
+    OwnerReceiptPath = $context.ReceiptPath
+  }
   if ($SkipSideload) { $passthru['SkipSideload'] = $true }
+  if ($AdoptLegacy) { $passthru['AdoptLegacy'] = $true }
 
   $portLabel = if ($Port -eq 0) { 'auto (starting at 8788)' } else { "$Port" }
   Write-Host "[apply] Installing Hermes for Excel (port $portLabel)..."

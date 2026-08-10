@@ -43,7 +43,11 @@ param(
   [ValidateRange(0, 65535)]
   [int]    $Port         = 0,
   [switch] $SkipSideload,
-  [string] $SourceDir
+  [string] $SourceDir,
+  [string] $ProfileName,
+  [string] $HermesHome,
+  [string] $OwnerReceiptPath,
+  [switch] $AdoptLegacy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,43 +56,69 @@ $ErrorActionPreference = 'Stop'
 #  Config block -- a deployer can retarget paths/port/modes here.
 # ============================================================================
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
+Import-Module (Join-Path $ScriptDir 'profile-ownership.psm1') -Force
+$ProfileContext = Resolve-HermesExcelProfileContext -ProfileName $ProfileName -HermesHome $HermesHome -OwnerReceiptPath $OwnerReceiptPath
 if (-not $SourceDir) { $SourceDir = Split-Path -Parent $ScriptDir }   # apps/excel
-$InstallDir  = Join-Path $env:LOCALAPPDATA 'hermes\excel-addin'
-$StageDir    = Join-Path $env:LOCALAPPDATA 'hermes\excel-addin.stage'
-$BackupDir   = Join-Path $env:LOCALAPPDATA 'hermes\excel-addin.previous'
-$HadExistingInstall = Test-Path -LiteralPath $InstallDir
-$PreviousTask = Get-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
-$HadPreviousTask = [bool]$PreviousTask
-$PreviousTaskWasDisabled = $HadPreviousTask -and $PreviousTask.State -eq 'Disabled'
+$InstallDir  = $ProfileContext.InstallPath
+$StageDir    = Join-Path $ProfileContext.ProfileHome 'excel-addin.stage'
+$BackupDir   = Join-Path $ProfileContext.ProfileHome 'excel-addin.previous'
+$HadExistingInstall = $false
+$PreviousTask = $null
+$HadPreviousTask = $false
+$PreviousTaskWasDisabled = $false
+$HadPreviousExcelShortcut = $false
+$PreviousExcelShortcutBytes = $null
+$HadPreviousDoclingShortcut = $false
+$PreviousDoclingShortcutBytes = $null
 $WefDevKey = 'HKCU:\Software\Microsoft\Office\16.0\WEF\Developer'
-$PreviousWef = Get-ItemProperty -LiteralPath $WefDevKey -Name 'HermesExcelAddinCatalog' -ErrorAction SilentlyContinue
-$HadPreviousSideload = $null -ne $PreviousWef
+$WefDevSubKey = 'Software\Microsoft\Office\16.0\WEF\Developer'
+$LegacyWefValueName = 'HermesExcelAddinCatalog'
+$HadPreviousLegacyWef = $false
+$PreviousLegacyWefValue = $null
+$PreviousLegacyWefKind = $null
+$HadPreviousCatalog = $false
+$PreviousCatalogBytes = $null
+$HadPreviousSideload = $false
 $PreviousPort = 8788
-if (Test-Path -LiteralPath (Join-Path $InstallDir 'run-bridge.cmd')) {
-  $priorLauncher = Get-Content -LiteralPath (Join-Path $InstallDir 'run-bridge.cmd') -Raw
-  if ($priorLauncher -match 'set "PORT=(\d+)"') { $PreviousPort = [int]$Matches[1] }
-}
-$DataDir     = Join-Path $InstallDir 'data'                            # HERMES_EXCEL_DATA_DIR
+$DataDir     = $ProfileContext.DataPath                                # HERMES_EXCEL_DATA_DIR
 $TokenFile   = Join-Path $DataDir   '.bridge-token'                    # 0600-ish secret
 $IngestTokenFile = Join-Path $DataDir '.ingest-token'
 $DoclingMode = 'native'                                                # v1 uses in-body base64; no shared result path
 $WslDistro   = 'Ubuntu'                                                # local Docling Serve runtime on this box
 $NodeWingetId = 'OpenJS.NodeJS.LTS'
 $HealthTimeoutSec = 45
-$PreviousIngestToken = [Environment]::GetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', 'User')
-$PreviousBridgeToken = [Environment]::GetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', 'User')
-$PreviousAllowAllUsers = [Environment]::GetEnvironmentVariable('HERMES_EXCEL_ALLOW_ALL_USERS', 'User')
+$PreviousIngestToken = $null
+$PreviousBridgeToken = $null
+$PreviousAllowAllUsers = $null
+$PreviousProcessIngestToken = $null
+$PreviousProcessBridgeToken = $null
+$PreviousProcessAllowAllUsers = $null
+$PreviousProcessHermesHome = $env:HERMES_HOME
+$TransactionLock = $null
+$TransactionProof = $null
+$PreviousTransactionEnvironment = @{
+  Proof = $env:HERMES_EXCEL_TRANSACTION_PROOF
+  Profile = $env:HERMES_EXCEL_TRANSACTION_PROFILE
+  Home = $env:HERMES_EXCEL_TRANSACTION_HOME
+  Receipt = $env:HERMES_EXCEL_TRANSACTION_RECEIPT
+}
+$OwnershipValidated = $false
+$InstallMutationStarted = $false
+$PluginVersion = $null
+$OwnerFingerprint = $null
+$PreviousOwnerReceipt = $null
+$PreviousOwnerFingerprint = $null
+$PreviousOwnerReceiptBytes = $null
+$HadPreviousOwnerReceipt = $false
+$ReceiptCommitted = $false
+$SideloadMutationAttempted = $false
 $GatewayRestartAttempted = $false
 $ExcelPlatformEnableAttempted = $false
 $PreviousExcelEnabled = $null
-try {
-  $cfgPath = Join-Path $env:LOCALAPPDATA 'hermes\config.yaml'
-  $cfgText = if (Test-Path -LiteralPath $cfgPath) { Get-Content -LiteralPath $cfgPath -Raw } else { '' }
-  if ($cfgText -match '(?ms)^excel:\s*\r?\n(?:^[ \t].*\r?\n)*?^[ \t]+enabled:\s*(true|false)\s*$') {
-    $PreviousExcelEnabled = $Matches[1] -eq 'true'
-  }
-} catch { }
 $PreferredPort = 8788
+$ExcelShortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Hermes Excel Bridge.lnk'
+$DoclingShortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Hermes Docling Serve.lnk'
+$CatalogPath = Join-Path $InstallDir 'OfficeAddinManifests\hermes-excel-addin.xml'
 # Items copied; uploads/exports/logs are deliberately excluded.
 $ExcludeDirs  = @('uploads', 'exports', 'node_modules', '.git')
 $ExcludeFiles = @('*.log')
@@ -198,7 +228,9 @@ function Copy-Payload {
   if (-not (Test-Path -LiteralPath (Join-Path $SourceDir 'broker\server.mjs'))) {
     throw "Source payload looks wrong: '$SourceDir\broker\server.mjs' not found."
   }
-  Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $StageDir) {
+    throw "Interrupted-install staging directory exists at '$StageDir'. Preserve and inspect it before retrying."
+  }
   if (Test-Path -LiteralPath $BackupDir) {
     throw "Recovery backup already exists at '$BackupDir'. Resolve or preserve it manually before reinstalling."
   }
@@ -273,8 +305,6 @@ function Ensure-BridgeToken {
     $tok = (Get-Content -LiteralPath $TokenFile -Raw).Trim()
     if ($tok -notmatch '^[0-9a-f]{64}$') { throw 'Existing bridge token is invalid; remove it and reinstall to rotate.' }
     Protect-SecretFile $TokenFile
-    [Environment]::SetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', $tok, 'User')
-    $env:HERMES_EXCEL_BRIDGE_TOKEN = $tok
     Write-Info 'Existing bridge token validated and secured.'; return $tok
   }
   # Two GUIDs concatenated (hex, no braces) -> 64 hex chars of entropy.
@@ -283,9 +313,7 @@ function Ensure-BridgeToken {
 
   Protect-SecretFile $TokenFile
 
-  # Also expose as a user env var so other tooling/tests can read it.
-  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', $tok, 'User')
-  Write-Info 'Generated new bridge token (persisted to data dir + User env).'
+  Write-Info 'Generated new bridge token (persisted only to the selected profile data dir).'
   return $tok
 }
 
@@ -295,16 +323,12 @@ function Ensure-IngestToken {
     $tok = (Get-Content -LiteralPath $IngestTokenFile -Raw).Trim()
     if ($tok -notmatch '^[0-9a-f]{64}$') { throw 'Existing ingest token is invalid; remove it and reinstall to rotate.' }
     Protect-SecretFile $IngestTokenFile
-    [Environment]::SetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', $tok, 'User')
-    $env:HERMES_EXCEL_INGEST_TOKEN = $tok
     return $tok
   }
   $tok = ([guid]::NewGuid().ToString('N')) + ([guid]::NewGuid().ToString('N'))
   Set-Content -LiteralPath $IngestTokenFile -Value $tok -Encoding ASCII -Force -NoNewline
   Protect-SecretFile $IngestTokenFile
-  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', $tok, 'User')
-  $env:HERMES_EXCEL_INGEST_TOKEN = $tok
-  Write-Info 'Generated adapter ingest token (ACL-restricted; shared with gateway and bridge).'
+  Write-Info 'Generated adapter ingest token (ACL-restricted in the selected profile data dir).'
   return $tok
 }
 
@@ -322,36 +346,230 @@ function Emit-Launchers([string]$BridgeToken, [string]$IngestToken) {
   $idir = $InstallDir.TrimEnd('\')
 
   $cmd = Get-Content -LiteralPath $cmdTpl -Raw
-  $cmd = $cmd.Replace('__INSTALL_DIR__',   $idir)
   $cmd = $cmd.Replace('__PORT__',          "$Port")
-  $cmd = $cmd.Replace('__DATA_DIR__',      $DataDir)
+  $cmd = $cmd.Replace('__PROFILE_NAME__',  $ProfileContext.ProfileName)
+  $cmd = $cmd.Replace('__OWNER_FINGERPRINT__', $OwnerFingerprint)
   $cmd = $cmd.Replace('__DOCLING_MODE__',  $DoclingMode)
   $cmd = $cmd.Replace('__WSL_DISTRO__',    $WslDistro)
   Set-Content -LiteralPath (Join-Path $InstallDir 'run-bridge.cmd') -Value $cmd -Encoding ASCII -Force
 
   $vbs = Get-Content -LiteralPath $vbsTpl -Raw
   $vbs = $vbs.Replace('__INSTALL_DIR__', $idir)
-  Set-Content -LiteralPath (Join-Path $InstallDir 'run-bridge.vbs') -Value $vbs -Encoding ASCII -Force
+  $vbs = $vbs.Replace('__DATA_DIR__', $DataDir)
+  $vbs = $vbs.Replace('__HERMES_HOME__', $ProfileContext.ProfileHome)
+  $vbs = $vbs.Replace('__HERMES_CONFIG__', $ProfileContext.ConfigPath)
+  $vbs = $vbs.Replace('__PROFILE_NAME__', $ProfileContext.ProfileName)
+  $vbs = $vbs.Replace('__OWNER_RECEIPT__', $ProfileContext.ReceiptPath)
+  $vbs = $vbs.Replace('__OWNER_FINGERPRINT__', $OwnerFingerprint)
+  # WScript reads UTF-16LE launchers reliably on Windows PowerShell 5.1. The
+  # companion CMD remains ASCII and contains no substituted profile path.
+  Set-Content -LiteralPath (Join-Path $InstallDir 'run-bridge.vbs') -Value $vbs -Encoding Unicode -Force
 
   Write-Info 'Launchers written with absolute paths and env baked in.'
 }
 
 # ---------------------------------------------------------------------------
-# Stop any bridge previously launched from this install dir.
+# Stop only the supervisor/bridge processes whose command lines name an exact
+# launcher or server path inside this selected profile's install directory.
 # ---------------------------------------------------------------------------
-function Stop-ExistingBridge {
-  Write-Info 'Stopping any previously-running bridge from this install dir...'
-  $idir = $InstallDir.TrimEnd('\')
-  try {
-    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-      Where-Object { $_.CommandLine -and ($_.CommandLine -like "*$idir*") } |
-      ForEach-Object {
-        Write-Info "  killing stale bridge PID $($_.ProcessId)"
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-      }
-  } catch {
-    Write-Warn2 "Could not enumerate node processes: $($_.Exception.Message)"
+function Get-OwnedBridgeProcesses {
+  $targets = @{
+    'wscript.exe' = @((Join-Path $InstallDir 'run-bridge.vbs'), (Join-Path $InstallDir 'service\bridge-service.vbs'))
+    'cscript.exe' = @((Join-Path $InstallDir 'run-bridge.vbs'), (Join-Path $InstallDir 'service\bridge-service.vbs'))
+    'cmd.exe' = @((Join-Path $InstallDir 'run-bridge.cmd'), (Join-Path $InstallDir 'service\bridge-service.cmd'))
+    'node.exe' = @((Join-Path $InstallDir 'broker\server.mjs'))
   }
+  $owned = New-Object System.Collections.Generic.List[object]
+  foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
+    $name = ([string]$process.Name).ToLowerInvariant()
+    if (-not $targets.ContainsKey($name) -or [string]::IsNullOrWhiteSpace([string]$process.CommandLine)) { continue }
+    foreach ($target in $targets[$name]) {
+      if ($process.CommandLine.IndexOf($target, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $owned.Add($process)
+        break
+      }
+    }
+  }
+  return @($owned)
+}
+
+function Stop-ExistingBridge {
+  Write-Info 'Stopping the exact owned bridge supervisor chain...'
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $owned = @(Get-OwnedBridgeProcesses)
+    if ($owned.Count -eq 0) { return }
+    # Stop relaunching parents before their cmd/node children.
+    $ordered = @($owned | Sort-Object @{ Expression = {
+      switch (([string]$_.Name).ToLowerInvariant()) {
+        'wscript.exe' { 0 }
+        'cscript.exe' { 0 }
+        'cmd.exe' { 1 }
+        default { 2 }
+      }
+    } })
+    foreach ($process in $ordered) {
+      Write-Info "  stopping owned $($process.Name) PID $($process.ProcessId)"
+      try {
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+      } catch {
+        if (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue) { throw }
+      }
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  $remaining = @(Get-OwnedBridgeProcesses)
+  throw "Owned bridge processes survived termination: $((@($remaining | ForEach-Object { \"$($_.Name):$($_.ProcessId)\" })) -join ', ')."
+}
+
+function Assert-OwnedBridgeQuiescent([int] $OwnedPort) {
+  $remaining = @(Get-OwnedBridgeProcesses)
+  if ($remaining.Count -ne 0) {
+    throw "Owned bridge processes remain: $((@($remaining | ForEach-Object { \"$($_.Name):$($_.ProcessId)\" })) -join ', ')."
+  }
+  $listeners = @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+    Where-Object { $_.Port -eq $OwnedPort })
+  if ($listeners.Count -ne 0) {
+    throw "Bridge port $OwnedPort is still listening after owned process teardown. Refusing to retire ownership."
+  }
+}
+
+function Restore-FileSnapshot(
+  [string] $Path,
+  [bool] $HadPrevious,
+  [byte[]] $PreviousBytes,
+  [string] $Label
+) {
+  if (-not $HadPrevious) {
+    if (Test-Path -LiteralPath $Path) {
+      Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $Path) {
+      throw "Failed-install $Label survived removal."
+    }
+    return
+  }
+  if ($null -eq $PreviousBytes -or $PreviousBytes.Length -eq 0) {
+    throw "The exact prior $Label snapshot is unavailable."
+  }
+
+  $parent = Split-Path -Parent $Path
+  if (-not (Test-Path -LiteralPath $parent)) {
+    New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+  }
+  $temp = Join-Path $parent ('.hermes-shortcut.' + [guid]::NewGuid().ToString('N') + '.lnk.tmp')
+  $backup = Join-Path $parent ('.hermes-shortcut.' + [guid]::NewGuid().ToString('N') + '.lnk.bak')
+  $replaced = $false
+  try {
+    [IO.File]::WriteAllBytes($temp, $PreviousBytes)
+    if (Test-Path -LiteralPath $Path) {
+      [IO.File]::Replace($temp, $Path, $backup, $true)
+      $replaced = $true
+    } else {
+      [IO.File]::Move($temp, $Path)
+    }
+    $actual = [IO.File]::ReadAllBytes($Path)
+    if ($actual.Length -ne $PreviousBytes.Length -or
+        [Convert]::ToBase64String($actual) -cne [Convert]::ToBase64String($PreviousBytes)) {
+      throw "Restored $Label differs from the exact prior snapshot."
+    }
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+  } catch {
+    $snapshotError = $_.Exception.Message
+    if ($replaced -and (Test-Path -LiteralPath $backup)) {
+      try { [IO.File]::Replace($backup, $Path, $temp, $true) } catch {
+        throw "$Label restore failed ('$snapshotError') and the displaced artifact is retained at '$backup': $($_.Exception.Message)"
+      }
+    }
+    throw
+  } finally {
+    Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    # Retain a backup if an atomic restore could not be completed.
+  }
+}
+
+function Test-ExactValue($Left, $Right) {
+  if ($null -eq $Left -or $null -eq $Right) { return $null -eq $Left -and $null -eq $Right }
+  if ($Left -is [Array] -or $Right -is [Array]) {
+    if ($Left -isnot [Array] -or $Right -isnot [Array] -or $Left.Count -ne $Right.Count) { return $false }
+    for ($i = 0; $i -lt $Left.Count; $i++) {
+      if (-not [object]::Equals($Left[$i], $Right[$i])) { return $false }
+    }
+    return $true
+  }
+  return [object]::Equals($Left, $Right)
+}
+
+function Restore-LegacyWefSnapshot {
+  if ($HadPreviousLegacyWef) {
+    if ([string]::IsNullOrWhiteSpace($PreviousLegacyWefKind)) {
+      throw 'The prior legacy WEF registry value kind is unavailable.'
+    }
+    $kind = [Microsoft.Win32.RegistryValueKind]([Enum]::Parse(
+      [Microsoft.Win32.RegistryValueKind], $PreviousLegacyWefKind, $false))
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($WefDevSubKey)
+    if (-not $key) { throw 'Could not open the legacy WEF registry key for exact restoration.' }
+    try {
+      $key.SetValue($LegacyWefValueName, $PreviousLegacyWefValue, $kind)
+    } finally {
+      $key.Dispose()
+    }
+  } elseif (Test-Path -LiteralPath $WefDevKey) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($WefDevSubKey, $true)
+    if (-not $key) { throw 'Could not open the legacy WEF registry key for verified removal.' }
+    try {
+      if (@($key.GetValueNames()) -ccontains $LegacyWefValueName) {
+        $key.DeleteValue($LegacyWefValueName, $false)
+      }
+    } finally {
+      $key.Dispose()
+    }
+  }
+
+  $verifyKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($WefDevSubKey, $false)
+  try {
+    $present = $verifyKey -and (@($verifyKey.GetValueNames()) -ccontains $LegacyWefValueName)
+    if ($HadPreviousLegacyWef) {
+      if (-not $present) { throw 'The exact prior legacy WEF registry value was not restored.' }
+      $actualKind = [string]$verifyKey.GetValueKind($LegacyWefValueName)
+      $actualValue = $verifyKey.GetValue(
+        $LegacyWefValueName, $null,
+        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+      if ($actualKind -cne $PreviousLegacyWefKind -or
+          -not (Test-ExactValue $actualValue $PreviousLegacyWefValue)) {
+        throw 'The restored legacy WEF registry value differs in type or exact value.'
+      }
+    } elseif ($present) {
+      throw 'A legacy WEF registry value remains even though none existed before installation.'
+    }
+  } finally {
+    if ($verifyKey) { $verifyKey.Dispose() }
+  }
+}
+
+function Restore-SideloadSnapshot {
+  if ($HadPreviousCatalog) {
+    # Restore exact bytes before registration, then again afterward in case the
+    # external helper normalized or rewrote the manifest while registering it.
+    Restore-FileSnapshot -Path $CatalogPath -HadPrevious $true `
+      -PreviousBytes $PreviousCatalogBytes -Label 'Office catalog manifest'
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir 'register-sideload.ps1') `
+      -InstallDir $InstallDir -RegisterExistingCatalog -ProfileName $ProfileContext.ProfileName `
+      -HermesHome $ProfileContext.ProfileHome -OwnerReceiptPath $ProfileContext.ReceiptPath `
+      -TransactionProof $TransactionProof
+    $catalogRegisterExit = $LASTEXITCODE
+    if ($catalogRegisterExit -ne 0) {
+      throw "Prior modern Office catalog registration restore failed (exit $catalogRegisterExit)."
+    }
+    Restore-FileSnapshot -Path $CatalogPath -HadPrevious $true `
+      -PreviousBytes $PreviousCatalogBytes -Label 'Office catalog manifest'
+  } else {
+    Restore-FileSnapshot -Path $CatalogPath -HadPrevious $false `
+      -PreviousBytes $null -Label 'Office catalog manifest'
+  }
+
+  # Restore legacy state after modern registration so the both-present state is
+  # represented exactly. A WEF-only prior state never invokes modern registration.
+  Restore-LegacyWefSnapshot
 }
 
 # ---------------------------------------------------------------------------
@@ -364,7 +582,7 @@ function Register-Autostart {
   # Remove the legacy Startup shortcut. Running both it and the Scheduled Task
   # creates competing supervisors after logon and can cause restart churn.
   $startup = [Environment]::GetFolderPath('Startup')
-  $lnkPath = Join-Path $startup 'Hermes Excel Bridge.lnk'
+  $lnkPath = $ExcelShortcutPath
   if (Test-Path -LiteralPath $lnkPath) {
     Remove-Item -LiteralPath $lnkPath -Force -ErrorAction SilentlyContinue
     Write-Info "Removed legacy Startup shortcut '$lnkPath'."
@@ -374,7 +592,10 @@ function Register-Autostart {
   $regTask = Join-Path $InstallDir 'install\register-task.ps1'
   if (Test-Path -LiteralPath $regTask) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $regTask `
-      -InstallDir $InstallDir -DataDir $DataDir -Port $Port
+      -InstallDir $InstallDir -DataDir $DataDir -Port $Port `
+      -ProfileName $ProfileContext.ProfileName -HermesHome $ProfileContext.ProfileHome `
+      -OwnerReceiptPath $ProfileContext.ReceiptPath -TransactionProof $TransactionProof `
+      -OwnerFingerprint $OwnerFingerprint
     $taskExit = $LASTEXITCODE
     if ($taskExit -eq 5) {
       Stop-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
@@ -410,16 +631,15 @@ function Ensure-DoclingAutostart {
     Write-Warn2 'Docling Serve is not installed in WSL; attachment parsing remains optional and ordinary edits stay available.'
     return
   }
-  $shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Hermes Docling Serve.lnk'
   $shell = New-Object -ComObject WScript.Shell
-  $shortcut = $shell.CreateShortcut($shortcutPath)
+  $shortcut = $shell.CreateShortcut($DoclingShortcutPath)
   $shortcut.TargetPath = (Join-Path $env:SystemRoot 'System32\wsl.exe')
   $shortcut.Arguments = "-d $WslDistro -- env DOCLING_DEVICE=cpu $doclingExe run --host 127.0.0.1 --port 8200"
   $shortcut.WorkingDirectory = $env:LOCALAPPDATA
   $shortcut.WindowStyle = 7
   $shortcut.Description = 'Independent CPU Docling Serve for Hermes Excel attachments'
   $shortcut.Save()
-  Write-Info "Docling startup launcher ready: '$shortcutPath'."
+  Write-Info "Docling startup launcher ready: '$DoclingShortcutPath'."
 }
 
 function Ensure-OfficeTlsCertificate {
@@ -468,8 +688,14 @@ function Register-Sideload {
   Write-Step '(h) Registering developer sideload'
   $regSide = Join-Path $InstallDir 'install\register-sideload.ps1'
   if (Test-Path -LiteralPath $regSide) {
+    # From this boundary onward the child may partially mutate Office state,
+    # even if it ultimately exits non-zero. Only this path enables compensation.
+    $script:SideloadMutationAttempted = $true
     & powershell -NoProfile -ExecutionPolicy Bypass -File $regSide `
-      -InstallDir $InstallDir -Port $Port
+      -InstallDir $InstallDir -Port $Port `
+      -ProfileName $ProfileContext.ProfileName -HermesHome $ProfileContext.ProfileHome `
+      -OwnerReceiptPath $ProfileContext.ReceiptPath -TransactionProof $TransactionProof
+    if ($LASTEXITCODE -ne 0) { throw "Office add-in registration failed (exit $LASTEXITCODE)." }
   } else {
     Write-Warn2 "register-sideload.ps1 not found at '$regSide'; sideload skipped."
   }
@@ -505,6 +731,8 @@ function Invoke-HealthCheck([string]$BridgeToken) {
     try {
       $resp = Invoke-RestMethod -Uri "https://localhost:$Port/api/health" -Headers @{ 'X-Hermes-Token' = $BridgeToken } -TimeoutSec 3 -Method Get
       if ($resp -and $resp.service -eq 'hermes-excel-bridge' -and [int]$resp.port -eq $Port -and
+          $resp.profile_name -eq $ProfileContext.ProfileName -and
+          $resp.owner_fingerprint -eq $OwnerFingerprint -and
           $resp.hermes_adapter_ready -eq $true -and $resp.raw_fallback_enabled -eq $false) {
         $health = $resp
         break
@@ -546,11 +774,6 @@ function Invoke-HealthCheck([string]$BridgeToken) {
 # ============================================================================
 #  Main
 # ============================================================================
-if (Test-Path -LiteralPath $BackupDir) {
-  Write-Error "Recovery backup already exists at '$BackupDir'. Resolve or preserve it manually before reinstalling."
-  exit 1
-}
-
 function Wait-ExcelAdapter([string]$IngestToken) {
   Write-Step '(f3) Verifying authenticated Excel platform adapter'
   $deadline = (Get-Date).AddSeconds(150)
@@ -560,7 +783,9 @@ function Wait-ExcelAdapter([string]$IngestToken) {
       $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8794/health' `
         -Headers @{ 'X-Excel-Token' = $IngestToken } -TimeoutSec 3 -Method Get
       if ($health.ok -eq $true -and $health.service -eq 'hermes-excel-adapter' -and
-          [int]$health.protocol -eq 1 -and $health.capability -eq 'typed-proposals') {
+          [int]$health.protocol -eq 1 -and $health.capability -eq 'typed-proposals' -and
+          $health.profile_name -eq $ProfileContext.ProfileName -and
+          $health.owner_fingerprint -eq $OwnerFingerprint -and [int]$health.bridge_port -eq $Port) {
         Write-Info 'Excel platform adapter: authenticated typed-proposals capability ready.'
         return
       }
@@ -569,14 +794,108 @@ function Wait-ExcelAdapter([string]$IngestToken) {
   throw 'Excel platform adapter did not become ready on 127.0.0.1:8794 within 150 seconds.'
 }
 try {
+  # Resolve identity first, then serialize all singleton inspection/mutation for
+  # this Windows user. No token, config, task, Office, or payload state is read
+  # before the receipt proves this profile owns it (or explicit legacy adoption
+  # verifies every existing artifact is anchored to this exact install).
+  $TransactionProof = [guid]::NewGuid().ToString('N')
+  $TransactionLock = Enter-HermesExcelTransaction -Context $ProfileContext -Proof $TransactionProof
+  $PreviousOwnerReceipt = Assert-HermesExcelOwnership -Context $ProfileContext -Operation Install -AdoptLegacy:$AdoptLegacy
+  if ($PreviousOwnerReceipt) { $PreviousOwnerFingerprint = Get-HermesExcelOwnerFingerprint -Receipt $PreviousOwnerReceipt }
+  $HadPreviousOwnerReceipt = Test-Path -LiteralPath $ProfileContext.ReceiptPath -PathType Leaf
+  if ($HadPreviousOwnerReceipt) {
+    $PreviousOwnerReceiptBytes = [IO.File]::ReadAllBytes($ProfileContext.ReceiptPath)
+  }
+  $OwnershipValidated = $true
+  $env:HERMES_EXCEL_TRANSACTION_PROOF = $TransactionProof
+  $env:HERMES_EXCEL_TRANSACTION_PROFILE = $ProfileContext.ProfileName
+  $env:HERMES_EXCEL_TRANSACTION_HOME = $ProfileContext.ProfileHome
+  $env:HERMES_EXCEL_TRANSACTION_RECEIPT = $ProfileContext.ReceiptPath
+
+  if ((Test-Path -LiteralPath $BackupDir) -or (Test-Path -LiteralPath $StageDir)) {
+    throw "Interrupted install state exists (stage '$StageDir' or backup '$BackupDir'). Preserve and recover it explicitly before retrying."
+  }
+  $HadExistingInstall = Test-Path -LiteralPath $InstallDir
+  $PreviousTask = Get-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
+  $HadPreviousTask = [bool]$PreviousTask
+  $PreviousTaskWasDisabled = $HadPreviousTask -and $PreviousTask.State -eq 'Disabled'
+  $HadPreviousExcelShortcut = Test-Path -LiteralPath $ExcelShortcutPath -PathType Leaf
+  if ($HadPreviousExcelShortcut) {
+    $PreviousExcelShortcutBytes = [IO.File]::ReadAllBytes($ExcelShortcutPath)
+  }
+  $HadPreviousDoclingShortcut = Test-Path -LiteralPath $DoclingShortcutPath -PathType Leaf
+  if ($HadPreviousDoclingShortcut) {
+    $PreviousDoclingShortcutBytes = [IO.File]::ReadAllBytes($DoclingShortcutPath)
+  }
+  if (Test-Path -LiteralPath $WefDevKey) {
+    $previousWefKey = Get-Item -LiteralPath $WefDevKey -ErrorAction Stop
+    try {
+      $HadPreviousLegacyWef = @($previousWefKey.GetValueNames()) -ccontains $LegacyWefValueName
+      if ($HadPreviousLegacyWef) {
+        $rawLegacyValue = $previousWefKey.GetValue(
+          $LegacyWefValueName, $null,
+          [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $PreviousLegacyWefValue = if ($rawLegacyValue -is [Array]) { $rawLegacyValue.Clone() } else { $rawLegacyValue }
+        $PreviousLegacyWefKind = [string]$previousWefKey.GetValueKind($LegacyWefValueName)
+      }
+    } finally {
+      $previousWefKey.Dispose()
+    }
+  }
+  $HadPreviousCatalog = Test-Path -LiteralPath $CatalogPath -PathType Leaf
+  if ($HadPreviousCatalog) { $PreviousCatalogBytes = [IO.File]::ReadAllBytes($CatalogPath) }
+  $HadPreviousSideload = $HadPreviousLegacyWef -or $HadPreviousCatalog
+  if (Test-Path -LiteralPath (Join-Path $InstallDir 'run-bridge.cmd')) {
+    $priorLauncher = Get-Content -LiteralPath (Join-Path $InstallDir 'run-bridge.cmd') -Raw
+    if ($priorLauncher -match 'set "PORT=(\d+)"') { $PreviousPort = [int]$Matches[1] }
+  }
+  $PreviousIngestToken = [Environment]::GetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', 'User')
+  $PreviousBridgeToken = [Environment]::GetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', 'User')
+  $PreviousAllowAllUsers = [Environment]::GetEnvironmentVariable('HERMES_EXCEL_ALLOW_ALL_USERS', 'User')
+  $PreviousProcessIngestToken = $env:HERMES_EXCEL_INGEST_TOKEN
+  $PreviousProcessBridgeToken = $env:HERMES_EXCEL_BRIDGE_TOKEN
+  $PreviousProcessAllowAllUsers = $env:HERMES_EXCEL_ALLOW_ALL_USERS
+  try {
+    $cfgText = if (Test-Path -LiteralPath $ProfileContext.ConfigPath) { Get-Content -LiteralPath $ProfileContext.ConfigPath -Raw } else { '' }
+    if ($cfgText -match '(?ms)^excel:\s*\r?\n(?:^[ \t].*\r?\n)*?^[ \t]+enabled:\s*(true|false)\s*$') {
+      $PreviousExcelEnabled = $Matches[1] -eq 'true'
+    }
+  } catch { }
+  $env:HERMES_HOME = $ProfileContext.ProfileHome
+  $packageMetadata = Get-Content -LiteralPath (Join-Path $SourceDir 'package.json') -Raw | ConvertFrom-Json
+  $PluginVersion = [string]$packageMetadata.version
+
   # A re-run may own the requested port already. Stop only bridges launched
   # from this install directory before deciding whether the port is available.
+  $InstallMutationStarted = $true
+  # Retire legacy user-global secrets only after the non-secret owner receipt
+  # has authorized this profile. The launchers and adapter read the selected
+  # profile's ACL-restricted token files directly.
+  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', $null, 'User')
+  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', $null, 'User')
+  Remove-Item Env:HERMES_EXCEL_INGEST_TOKEN -ErrorAction SilentlyContinue
+  Remove-Item Env:HERMES_EXCEL_BRIDGE_TOKEN -ErrorAction SilentlyContinue
   if ($HadPreviousTask) {
-    Stop-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -Confirm:$false -ErrorAction SilentlyContinue
+    if (@('Running', 'Queued') -contains [string]$PreviousTask.State) {
+      Stop-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction Stop
+    }
+    Unregister-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -Confirm:$false -ErrorAction Stop
+    if (Get-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue) {
+      throw 'Existing Hermes_Excel_Bridge task survived pre-install unregistration.'
+    }
   }
   Stop-ExistingBridge
   $Port = Resolve-BridgePort
+  $plannedReceipt = [pscustomobject]@{
+    Schema = 1
+    ProfileName = $ProfileContext.ProfileName
+    ProfileHome = $ProfileContext.ProfileHome
+    InstallPath = $ProfileContext.InstallPath
+    BridgePort = $Port
+    PluginVersion = $PluginVersion
+    ManifestId = '4fd4d435-7f9a-4d6d-9251-32f154f83a1f'
+  }
+  $OwnerFingerprint = Get-HermesExcelOwnerFingerprint -Receipt $plannedReceipt
   Write-Host ''
   Write-Host "Hermes for Excel installer  (port $Port)" -ForegroundColor White
   Write-Host "Source : $SourceDir"
@@ -597,9 +916,16 @@ try {
     Write-Step '(f2) Restarting Hermes gateway to activate Excel adapter'
     [Environment]::SetEnvironmentVariable('HERMES_EXCEL_ALLOW_ALL_USERS', 'true', 'User')
     $env:HERMES_EXCEL_ALLOW_ALL_USERS = 'true'
+    $ExcelPlatformEnableAttempted = $true
     & hermes config set excel.enabled true
     if ($LASTEXITCODE -ne 0) { throw 'Could not enable the Excel platform in Hermes config.' }
-    $ExcelPlatformEnableAttempted = $true
+    # The selected gateway and adapter require an authoritative receipt at
+    # startup. Commit it only after the payload, token files, and launchers are
+    # complete, but before the gateway restart that consumes it. A crash leaves
+    # this same-owner receipt in place so no other profile can claim the singleton.
+    [void](Write-HermesExcelOwnerReceipt -Context $ProfileContext -BridgePort $Port `
+      -PluginVersion $PluginVersion -ExpectedFingerprint $OwnerFingerprint)
+    $ReceiptCommitted = $true
     $GatewayRestartAttempted = $true
     & hermes gateway restart
     if ($LASTEXITCODE -ne 0) { throw 'Hermes gateway restart failed; Excel adapter was not activated.' }
@@ -626,20 +952,60 @@ try {
 }
 catch {
   $InstallError = $_.Exception.Message
+  if (-not $OwnershipValidated -or -not $InstallMutationStarted) {
+    Write-Host ''
+    Write-Error "INSTALL FAILED: $InstallError"
+    exit 1
+  }
   $RestoreFailed = $false
-  try { Stop-ExistingBridge } catch { }
+  try {
+    Stop-ExistingBridge
+  } catch {
+    $RestoreFailed = $true
+    Write-Warning "Could not stop the failed install's owned bridge processes: $($_.Exception.Message)"
+  }
   # External state must be removed while cleanup scripts and the live payload
   # still exist. Payload restoration/deletion happens only after this block.
   try {
-    Stop-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath('Startup')) 'Hermes Excel Bridge.lnk') -Force -ErrorAction SilentlyContinue
-    if (-not $HadExistingInstall) {
-      & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir 'register-sideload.ps1') -InstallDir $InstallDir -Unregister
+    $failedTask = Get-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
+    if ($failedTask) {
+      try { Stop-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction Stop } catch {
+        # A task which already stopped is acceptable only if it can still be
+        # unregistered and proven absent below.
+        Write-Verbose "Failed-install task stop reported: $($_.Exception.Message)"
+      }
+      Unregister-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -Confirm:$false -ErrorAction Stop
     }
-  } catch { Write-Warning "Could not fully remove failed install external state: $($_.Exception.Message)" }
+    if (Get-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue) {
+      throw 'Failed-install Scheduled Task survived unregistration.'
+    }
+    if ($SideloadMutationAttempted) {
+      # Clear the possibly-mutated registration to a verified empty baseline.
+      # The exact prior modern/legacy state table is restored later.
+      & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir 'register-sideload.ps1') `
+        -InstallDir $InstallDir -Unregister -ProfileName $ProfileContext.ProfileName `
+        -HermesHome $ProfileContext.ProfileHome -OwnerReceiptPath $ProfileContext.ReceiptPath `
+        -TransactionProof $TransactionProof
+      $cleanupSideloadExit = $LASTEXITCODE
+      if ($cleanupSideloadExit -ne 0) {
+        throw "Failed-install Office sideload cleanup failed (exit $cleanupSideloadExit)."
+      }
+      if ($null -ne (Get-ItemProperty -LiteralPath $WefDevKey -Name $LegacyWefValueName -ErrorAction SilentlyContinue)) {
+        throw 'Failed-install Office sideload cleanup left the WEF developer value registered.'
+      }
+      if (Test-Path -LiteralPath $CatalogPath) {
+        throw 'Failed-install Office sideload cleanup left the catalog manifest behind.'
+      }
+    }
+  } catch {
+    $RestoreFailed = $true
+    Write-Warning "Could not fully remove failed install external state: $($_.Exception.Message)"
+  }
   try {
-    Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $StageDir) {
+      Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $StageDir) { throw 'Failed-install staging directory survived cleanup.' }
     if (Test-Path -LiteralPath $BackupDir) {
       $liveData = Join-Path $InstallDir 'data'
       $backupData = Join-Path $BackupDir 'data'
@@ -654,51 +1020,127 @@ catch {
       Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
       Move-Item -LiteralPath $BackupDir -Destination $InstallDir -ErrorAction Stop
     } elseif (-not $HadExistingInstall) {
-      Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+      if (Test-Path -LiteralPath $InstallDir) {
+        Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
+      }
+      if (Test-Path -LiteralPath $InstallDir) { throw 'Failed-install payload survived cleanup.' }
     }
   } catch {
     $RestoreFailed = $true
     Write-Warning "CRITICAL: could not restore previous Excel payload: $($_.Exception.Message). Backup: '$BackupDir'; live: '$InstallDir'."
   }
   try {
-    Stop-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath('Startup')) 'Hermes Excel Bridge.lnk') `
-      -Force -ErrorAction SilentlyContinue
-  } catch { }
+    $postRestoreTask = Get-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue
+    if ($postRestoreTask) {
+      try { Stop-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction Stop } catch {
+        Write-Verbose "Post-payload task stop reported: $($_.Exception.Message)"
+      }
+      Unregister-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -Confirm:$false -ErrorAction Stop
+    }
+    if (Get-ScheduledTask -TaskName 'Hermes_Excel_Bridge' -ErrorAction SilentlyContinue) {
+      throw 'A Scheduled Task survived failed-install payload restoration.'
+    }
+  } catch {
+    $RestoreFailed = $true
+    Write-Warning "PARTIAL RESTORE: could not prove failed-install task removal: $($_.Exception.Message)"
+  }
+  try {
+    Restore-FileSnapshot -Path $ExcelShortcutPath -HadPrevious $HadPreviousExcelShortcut `
+      -PreviousBytes $PreviousExcelShortcutBytes -Label 'Excel Startup shortcut'
+    Restore-FileSnapshot -Path $DoclingShortcutPath -HadPrevious $HadPreviousDoclingShortcut `
+      -PreviousBytes $PreviousDoclingShortcutBytes -Label 'Docling Startup shortcut'
+  } catch {
+    $RestoreFailed = $true
+    Write-Warning "PARTIAL RESTORE: could not restore exact prior Startup shortcut state: $($_.Exception.Message)"
+  }
   if ($HadExistingInstall -and -not $RestoreFailed) {
     try {
       if ($HadPreviousTask) {
+        $restoreOwnerArgs = @{}
+        if ($PreviousOwnerFingerprint) { $restoreOwnerArgs['OwnerFingerprint'] = $PreviousOwnerFingerprint }
         & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir 'register-task.ps1') `
-          -InstallDir $InstallDir -DataDir (Join-Path $InstallDir 'data') -Port $PreviousPort
+          -InstallDir $InstallDir -DataDir (Join-Path $InstallDir 'data') -Port $PreviousPort `
+          -ProfileName $ProfileContext.ProfileName -HermesHome $ProfileContext.ProfileHome `
+          -OwnerReceiptPath $ProfileContext.ReceiptPath -TransactionProof $TransactionProof @restoreOwnerArgs
+        if ($LASTEXITCODE -ne 0) { throw "Prior Scheduled Task restore failed (exit $LASTEXITCODE)." }
         if ($PreviousTaskWasDisabled) { Disable-ScheduledTask -TaskName 'Hermes_Excel_Bridge' | Out-Null }
-      }
-      if ($HadPreviousSideload) {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir 'register-sideload.ps1') `
-          -InstallDir $InstallDir -Port $PreviousPort
       }
     } catch {
       $RestoreFailed = $true
-      Write-Warning "PARTIAL RESTORE: could not restore prior task/sideload state: $($_.Exception.Message)"
+      Write-Warning "PARTIAL RESTORE: could not restore prior task state: $($_.Exception.Message)"
     }
   }
-  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', $PreviousIngestToken, 'User')
-  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', $PreviousBridgeToken, 'User')
-  [Environment]::SetEnvironmentVariable('HERMES_EXCEL_ALLOW_ALL_USERS', $PreviousAllowAllUsers, 'User')
+  if ($SideloadMutationAttempted -and -not $RestoreFailed) {
+    try {
+      Restore-SideloadSnapshot
+    } catch {
+      $RestoreFailed = $true
+      Write-Warning "PARTIAL RESTORE: could not restore exact prior Office sideload state: $($_.Exception.Message)"
+    }
+  }
+  try {
+    [Environment]::SetEnvironmentVariable('HERMES_EXCEL_INGEST_TOKEN', $PreviousIngestToken, 'User')
+    [Environment]::SetEnvironmentVariable('HERMES_EXCEL_BRIDGE_TOKEN', $PreviousBridgeToken, 'User')
+    [Environment]::SetEnvironmentVariable('HERMES_EXCEL_ALLOW_ALL_USERS', $PreviousAllowAllUsers, 'User')
+  } catch {
+    $RestoreFailed = $true
+    Write-Warning "Could not restore prior legacy user environment: $($_.Exception.Message)"
+  }
   if ($ExcelPlatformEnableAttempted) {
     try {
       if ($null -eq $PreviousExcelEnabled) { & hermes config set excel.enabled false | Out-Null }
       else { & hermes config set excel.enabled $PreviousExcelEnabled.ToString().ToLowerInvariant() | Out-Null }
-    } catch { Write-Warning 'Could not restore prior Excel platform enabled state.' }
+      $configRestoreExit = $LASTEXITCODE
+      if ($configRestoreExit -ne 0) { throw "Hermes config restore failed (exit $configRestoreExit)." }
+    } catch {
+      $RestoreFailed = $true
+      Write-Warning "Could not restore prior Excel platform enabled state: $($_.Exception.Message)"
+    }
   }
-  if ($PreviousIngestToken) { $env:HERMES_EXCEL_INGEST_TOKEN = $PreviousIngestToken }
+  if ($null -ne $PreviousProcessIngestToken) { $env:HERMES_EXCEL_INGEST_TOKEN = $PreviousProcessIngestToken }
   else { Remove-Item Env:HERMES_EXCEL_INGEST_TOKEN -ErrorAction SilentlyContinue }
-  if ($PreviousBridgeToken) { $env:HERMES_EXCEL_BRIDGE_TOKEN = $PreviousBridgeToken }
+  if ($null -ne $PreviousProcessBridgeToken) { $env:HERMES_EXCEL_BRIDGE_TOKEN = $PreviousProcessBridgeToken }
   else { Remove-Item Env:HERMES_EXCEL_BRIDGE_TOKEN -ErrorAction SilentlyContinue }
-  if ($GatewayRestartAttempted -and -not $RestoreFailed) {
-    try { & hermes gateway restart | Out-Null } catch { Write-Warning 'Could not restore gateway environment after failed install.' }
+  if ($null -ne $PreviousProcessAllowAllUsers) { $env:HERMES_EXCEL_ALLOW_ALL_USERS = $PreviousProcessAllowAllUsers }
+  else { Remove-Item Env:HERMES_EXCEL_ALLOW_ALL_USERS -ErrorAction SilentlyContinue }
+  # Restore/remove the exact pre-install receipt only after payload, task,
+  # sideload, environment, and config restoration all succeeded. The final
+  # gateway restart must then bind against that prior receipt (or no receipt
+  # after a failed fresh install), never against the failed install identity.
+  if ($ReceiptCommitted -and -not $RestoreFailed) {
+    try {
+      Assert-OwnedBridgeQuiescent -OwnedPort $Port
+      Restore-HermesExcelOwnerReceiptSnapshot -Context $ProfileContext `
+        -ExpectedCurrentFingerprint $OwnerFingerprint -HadPrevious $HadPreviousOwnerReceipt `
+        -PreviousBytes $PreviousOwnerReceiptBytes
+      $ReceiptCommitted = $false
+    } catch {
+      $RestoreFailed = $true
+      Write-Warning "Could not safely restore the exact prior owner receipt: $($_.Exception.Message)"
+    }
+  }
+  if ($GatewayRestartAttempted -and -not $RestoreFailed -and -not $ReceiptCommitted) {
+    try {
+      & hermes gateway restart | Out-Null
+      $gatewayRestoreExit = $LASTEXITCODE
+      if ($gatewayRestoreExit -ne 0) { throw "Hermes gateway restore restart failed (exit $gatewayRestoreExit)." }
+    } catch {
+      # The exact prior receipt is already authoritative. Retain it even when
+      # the final native restart fails, and report the partial restoration.
+      $RestoreFailed = $true
+      Write-Warning "Could not restart the gateway against the restored owner receipt: $($_.Exception.Message)"
+    }
   }
   Write-Host ''
   Write-Error "INSTALL FAILED: $InstallError"
   exit 1
+}
+finally {
+  if ($null -eq $PreviousProcessHermesHome) { Remove-Item Env:HERMES_HOME -ErrorAction SilentlyContinue }
+  else { $env:HERMES_HOME = $PreviousProcessHermesHome }
+  if ($null -eq $PreviousTransactionEnvironment.Proof) { Remove-Item Env:HERMES_EXCEL_TRANSACTION_PROOF -ErrorAction SilentlyContinue } else { $env:HERMES_EXCEL_TRANSACTION_PROOF = $PreviousTransactionEnvironment.Proof }
+  if ($null -eq $PreviousTransactionEnvironment.Profile) { Remove-Item Env:HERMES_EXCEL_TRANSACTION_PROFILE -ErrorAction SilentlyContinue } else { $env:HERMES_EXCEL_TRANSACTION_PROFILE = $PreviousTransactionEnvironment.Profile }
+  if ($null -eq $PreviousTransactionEnvironment.Home) { Remove-Item Env:HERMES_EXCEL_TRANSACTION_HOME -ErrorAction SilentlyContinue } else { $env:HERMES_EXCEL_TRANSACTION_HOME = $PreviousTransactionEnvironment.Home }
+  if ($null -eq $PreviousTransactionEnvironment.Receipt) { Remove-Item Env:HERMES_EXCEL_TRANSACTION_RECEIPT -ErrorAction SilentlyContinue } else { $env:HERMES_EXCEL_TRANSACTION_RECEIPT = $PreviousTransactionEnvironment.Receipt }
+  Exit-HermesExcelTransaction -Lock $TransactionLock
 }

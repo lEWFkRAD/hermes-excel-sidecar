@@ -2,12 +2,39 @@
    per-user Office development registration tool. No elevation is required. #>
 [CmdletBinding()]
 param(
-  [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'hermes\excel-addin'),
+  [string] $InstallDir,
   [int] $Port = 8788,
-  [switch] $Unregister
+  [switch] $Unregister,
+  [switch] $RegisterExistingCatalog,
+  [string] $ProfileName,
+  [string] $HermesHome,
+  [string] $OwnerReceiptPath,
+  [string] $TransactionProof
 )
 
 $ErrorActionPreference = 'Stop'
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Import-Module (Join-Path $ScriptDir 'profile-ownership.psm1') -Force
+$ProfileContext = Resolve-HermesExcelProfileContext -ProfileName $ProfileName -HermesHome $HermesHome -OwnerReceiptPath $OwnerReceiptPath
+if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = $ProfileContext.InstallPath }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+if (-not [string]::Equals($InstallDir, $ProfileContext.InstallPath, [StringComparison]::OrdinalIgnoreCase)) {
+  throw 'InstallDir does not match the selected Hermes profile context.'
+}
+$OwnershipLock = $null
+
+if ($Unregister -and $RegisterExistingCatalog) {
+  throw 'Unregister and RegisterExistingCatalog are mutually exclusive.'
+}
+
+try {
+if ($TransactionProof) {
+  Assert-HermesExcelParentTransaction -Context $ProfileContext -Proof $TransactionProof
+} else {
+  $OwnershipLock = Enter-HermesExcelTransaction -Context $ProfileContext
+  $owner = Assert-HermesExcelOwnership -Context $ProfileContext -Operation Mutate
+  if (-not $owner) { throw 'Office sideload registration requires an existing owned install.' }
+}
 $CatalogDir = Join-Path $InstallDir 'OfficeAddinManifests'
 $CatalogPath = Join-Path $CatalogDir 'hermes-excel-addin.xml'
 $SourceManifest = Join-Path $InstallDir 'manifest.xml'
@@ -25,7 +52,13 @@ function Invoke-DevSettings([string[]] $Arguments) {
 
 function Remove-LegacyRegistration {
   if (Test-Path -LiteralPath $LegacyKey) {
-    Remove-ItemProperty -LiteralPath $LegacyKey -Name $LegacyValue -Force -ErrorAction SilentlyContinue
+    $legacy = Get-ItemProperty -LiteralPath $LegacyKey -Name $LegacyValue -ErrorAction SilentlyContinue
+    if ($null -ne $legacy) {
+      Remove-ItemProperty -LiteralPath $LegacyKey -Name $LegacyValue -Force -ErrorAction Stop
+    }
+    if ($null -ne (Get-ItemProperty -LiteralPath $LegacyKey -Name $LegacyValue -ErrorAction SilentlyContinue)) {
+      throw "Legacy Office development registration '$LegacyValue' survived removal."
+    }
   }
 }
 
@@ -33,10 +66,28 @@ try {
   if ($Unregister) {
     if (Test-Path -LiteralPath $CatalogPath) {
       Invoke-DevSettings @('unregister', $CatalogPath)
-      Remove-Item -LiteralPath $CatalogPath -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath $CatalogPath -Force -ErrorAction Stop
     }
     Remove-LegacyRegistration
+    if (Test-Path -LiteralPath $CatalogPath) {
+      throw "Office development catalog manifest survived removal: '$CatalogPath'."
+    }
+    if ($null -ne (Get-ItemProperty -LiteralPath $LegacyKey -Name $LegacyValue -ErrorAction SilentlyContinue)) {
+      throw "Legacy Office development registration '$LegacyValue' survived removal."
+    }
     Write-Host '[register-sideload] Hermes development manifest unregistered.'
+    return
+  }
+
+  if ($RegisterExistingCatalog) {
+    if (-not (Test-Path -LiteralPath $CatalogPath -PathType Leaf)) {
+      throw "Existing Office development catalog manifest not found at '$CatalogPath'."
+    }
+    Invoke-DevSettings @('register', $CatalogPath)
+    if (-not (Test-Path -LiteralPath $CatalogPath -PathType Leaf)) {
+      throw "Office development catalog manifest disappeared during registration: '$CatalogPath'."
+    }
+    Write-Host "[register-sideload] Re-registered existing catalog '$CatalogPath' without rewriting legacy state."
     return
   }
 
@@ -55,4 +106,8 @@ try {
 catch {
   Write-Error "[register-sideload] FAILED: $($_.Exception.Message)"
   exit 1
+}
+}
+finally {
+  Exit-HermesExcelTransaction -Lock $OwnershipLock
 }

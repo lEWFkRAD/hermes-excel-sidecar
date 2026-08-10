@@ -8,6 +8,7 @@ __pycache__/
 node_modules/
 dist/
 .pytest_cache/
+.test-temp/
 
 # Per-machine launchers and generated supervisor shims.
 run-bridge.cmd

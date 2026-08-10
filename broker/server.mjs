@@ -21,6 +21,24 @@ const tlsCertPath = process.env.HERMES_EXCEL_TLS_CERT || path.join(process.env.U
 const tlsKeyPath = process.env.HERMES_EXCEL_TLS_KEY || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.key");
 const tlsEnabled = existsSync(tlsCertPath) && existsSync(tlsKeyPath);
 const allowInsecureHttp = process.env.HERMES_EXCEL_ALLOW_INSECURE_HTTP === "1";
+function normalizeOwnerIdentity(environ = {}) {
+  const profileName = String(environ.HERMES_EXCEL_PROFILE_NAME || "").trim().toLowerCase();
+  const ownerFingerprint = String(environ.HERMES_EXCEL_OWNER_FINGERPRINT || "").trim().toLowerCase();
+  return {
+    profile_name: /^[a-z0-9][a-z0-9_-]{0,63}$/.test(profileName) ? profileName : "",
+    owner_fingerprint: /^sha256:[0-9a-f]{64}$/.test(ownerFingerprint) ? ownerFingerprint : "",
+  };
+}
+function adapterOwnerContractMatches(detail, ownerIdentity, expectedPort) {
+  return Boolean(
+    ownerIdentity?.profile_name &&
+    ownerIdentity?.owner_fingerprint &&
+    detail?.profile_name === ownerIdentity.profile_name &&
+    detail?.owner_fingerprint === ownerIdentity.owner_fingerprint &&
+    detail?.bridge_port === expectedPort
+  );
+}
+const runtimeOwnerIdentity = normalizeOwnerIdentity(process.env);
 // Enforced at server startup (requireTransportSecurity), not at import: unit
 // tests import this module for its pure helpers and must not require certs.
 function requireTransportSecurity() {
@@ -258,11 +276,57 @@ function send(res, status, body, contentType = "application/json; charset=utf-8"
   res.end(typeof body === "string" ? body : JSON.stringify(body, null, 2));
 }
 
+function isProfileSensitiveApiRequest(method, apiPath) {
+  return method === "POST" && (apiPath === "/api/chat" || apiPath === "/api/export");
+}
+
+async function probeOwnedAdapter({
+  fetchImpl = globalThis.fetch,
+  adapterUrl = excelAdapterUrl,
+  adapterToken = excelAdapterToken,
+  ownerIdentity = runtimeOwnerIdentity,
+  expectedPort = port,
+  timeoutMs = 3000,
+} = {}) {
+  if (!/^[0-9a-f]{64}$/.test(adapterToken)) {
+    return { ok: false, error: "adapter credential unavailable" };
+  }
+  try {
+    const adapterHealth = new URL(adapterUrl);
+    adapterHealth.pathname = "/health";
+    const response = await fetchImpl(adapterHealth, {
+      headers: { "x-excel-token": adapterToken },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const detail = response.ok ? await response.json().catch(() => null) : null;
+    const contractOk = response.ok && detail?.ok === true && detail?.service === "hermes-excel-adapter" &&
+      detail?.protocol === 1 && detail?.capability === "typed-proposals" &&
+      adapterOwnerContractMatches(detail, ownerIdentity, expectedPort);
+    return { ok: contractOk, status: response.status, detail };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+async function dispatchProfileSensitiveApi(method, apiPath, {
+  probe = probeOwnedAdapter,
+  chatHandler,
+  exportHandler,
+} = {}) {
+  if (!isProfileSensitiveApiRequest(method, apiPath)) return { handled: false };
+  const adapterProbe = await probe();
+  if (!adapterProbe.ok) return { handled: true, authorized: false };
+  const handler = apiPath === "/api/chat" ? chatHandler : exportHandler;
+  return { handled: true, authorized: true, result: await handler() };
+}
+
 async function healthStatus() {
   const status = {
     ok: true,
     service: "hermes-excel-bridge",
     port,
+    profile_name: runtimeOwnerIdentity.profile_name,
+    owner_fingerprint: runtimeOwnerIdentity.owner_fingerprint,
     llmBaseUrl,
     llmModel,
     doclingBaseUrl,
@@ -275,21 +339,9 @@ async function healthStatus() {
     docling: { ok: false },
   };
 
-  try {
-    const adapterHealth = new URL(excelAdapterUrl);
-    adapterHealth.pathname = "/health";
-    const response = await fetch(adapterHealth, {
-      headers: excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {},
-      signal: AbortSignal.timeout(3000),
-    });
-    const detail = response.ok ? await response.json().catch(() => null) : null;
-    const contractOk = response.ok && detail?.ok === true && detail?.service === "hermes-excel-adapter" &&
-      detail?.protocol === 1 && detail?.capability === "typed-proposals";
-    status.hermes = { ok: contractOk, status: response.status, detail };
-    status.hermes_adapter_ready = contractOk;
-  } catch (error) {
-    status.hermes = { ok: false, error: error.message };
-  }
+  const adapterProbe = await probeOwnedAdapter();
+  status.hermes = adapterProbe;
+  status.hermes_adapter_ready = adapterProbe.ok;
 
   try {
     if (doclingApi === "local") {
@@ -2446,6 +2498,18 @@ if (isMainModule) {
         }
 
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
+        // `await` is load-bearing: rejections from the probe, chat uploads, or
+        // export handlers must stay inside this request's try/catch.
+        const profileDispatch = await dispatchProfileSensitiveApi(req.method, apiPath, {
+          chatHandler: () => handleChat(req, res),
+          exportHandler: () => handleExport(req, res),
+        });
+        if (profileDispatch.handled) {
+          if (!profileDispatch.authorized) {
+            return send(res, 503, { error: "adapter ownership unavailable" }, undefined, origin);
+          }
+          return profileDispatch.result;
+        }
         if (req.method === "GET" && apiPath === "/api/activity") {
           // Live agent-activity relay: the task pane polls this while a chat
           // request is in flight; we proxy to the Excel adapter's draft buffer.
@@ -2466,11 +2530,6 @@ if (isMainModule) {
             return send(res, 200, { ok: false }, undefined, origin);
           }
         }
-        // `await` is load-bearing: without it a rejection inside a handler
-        // (e.g. an aborted upload stream) escapes this try/catch and crashes
-        // the process as an unhandled rejection.
-        if (req.method === "POST" && apiPath === "/api/chat") return await handleChat(req, res);
-        if (req.method === "POST" && apiPath === "/api/export") return await handleExport(req, res);
         return await serveStatic(req, res);
       } catch (error) {
         return send(res, 500, { error: error.message }, undefined, origin);
@@ -2530,6 +2589,11 @@ export {
   healthStatus,
   readHermesApiServerKey,
   parseHermesApiServerKey,
+  normalizeOwnerIdentity,
+  adapterOwnerContractMatches,
+  isProfileSensitiveApiRequest,
+  probeOwnedAdapter,
+  dispatchProfileSensitiveApi,
   scanWrittenCells,
   matrixToCsv,
   safeExportName,

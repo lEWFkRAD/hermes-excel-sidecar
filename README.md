@@ -92,30 +92,62 @@ hermes excel-sidecar install
 hermes excel-sidecar status
 ```
 
+### Hermes profiles on Windows
+
+The lifecycle commands use the profile selected by Hermes at invocation time.
+For example, a named profile installs into its own home and must use the same
+profile for later status or rollback operations:
+
+```powershell
+hermes -p finance excel-sidecar install
+hermes -p finance excel-sidecar status
+hermes -p finance excel-sidecar rollback
+```
+
+The payload, configuration, tokens, uploads, exports, and logs are
+profile-scoped. Office sideload registration, the `Hermes_Excel_Bridge`
+Scheduled Task, and the localhost bridge remain Windows-user singletons, so
+exactly one profile may own them at a time. A strict receipt under
+`%LOCALAPPDATA%\hermes\shared\excel-sidecar` records that owner. Commands from
+another profile fail before reading credentials or changing singleton state;
+the running bridge also attests its profile and receipt fingerprint over its
+authenticated HTTPS health endpoint.
+
+An existing pre-receipt installation is never claimed implicitly. After
+verifying that every legacy artifact belongs to the selected profile, adopt it
+once with `hermes -p <profile> excel-sidecar install --adopt-legacy`. Automatic
+takeover between profiles is intentionally unsupported; roll back the current
+owner first.
+
 To remove the per-user Excel installation without uninstalling the plugin:
 
 ```powershell
 hermes excel-sidecar rollback
 ```
 
-For development without plugin installation:
-
-From this directory:
+For development, use a disposable Hermes profile that owns the Windows-user
+singleton, then reinstall from the working tree as you iterate:
 
 ```powershell
-node broker\server.mjs
+hermes -p excel-dev excel-sidecar install
+hermes -p excel-dev excel-sidecar status
 ```
+
+A bare `node broker\server.mjs` launch can still serve static assets for UI
+work, but chat and export APIs intentionally fail closed unless the process was
+launched with an installed profile's receipt identity and token files.
 
 Then sideload in Excel: **Home → Add-ins → More Add-ins → Upload My Add-in →
 `manifest.xml`**, and open the pane from the **Hermes** ribbon group.
 
-Configuration is environment-variable based (defaults shown):
+Runtime configuration uses launcher-managed identity/secrets plus these
+environment tunables (defaults shown):
 
 ```text
 PORT=8788
 HERMES_EXCEL_DATA_DIR=                     # uploads/exports/logs root, OUTSIDE the web root (default: per-user app-data)
-HERMES_EXCEL_BRIDGE_TOKEN=                 # when set, every /api/* call requires it (the installer sets one per box)
-HERMES_EXCEL_INGEST_TOKEN=                 # required shared secret for the typed Excel platform adapter
+HERMES_EXCEL_BRIDGE_TOKEN=                 # launcher-only: loaded from owning profile data/.bridge-token
+HERMES_EXCEL_INGEST_TOKEN=                 # launcher-only: loaded from owning profile data/.ingest-token
 HERMES_EXCEL_TRANSPORT=platform-only       # installed/certified default
 HERMES_EXCEL_ALLOW_RAW_FALLBACK=0          # explicit emergency compatibility escape hatch only
 HERMES_EXCEL_ALLOWED_ORIGINS=              # extra comma-separated CORS origins (loopback origins always allowed)

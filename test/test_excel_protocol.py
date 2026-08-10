@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import json
+import os
 import pathlib
 import sys
+import tempfile
 import threading
 import types
 import unittest
+from dataclasses import dataclass
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PKG = "excel_sidecar_testpkg"
@@ -25,13 +31,89 @@ def load(name: str):
     return module
 
 
+def install_gateway_stubs() -> None:
+    """Install the tiny public gateway surface this plugin imports in bare CI."""
+
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    config = types.ModuleType("gateway.config")
+    platforms = types.ModuleType("gateway.platforms")
+    platforms.__path__ = []
+    base = types.ModuleType("gateway.platforms.base")
+
+    class Platform(str):
+        pass
+
+    class PlatformConfig:
+        pass
+
+    class BasePlatformAdapter:
+        pass
+
+    class MessageEvent:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class MessageType:
+        TEXT = "text"
+
+    @dataclass
+    class SendResult:
+        success: bool
+        message_id: str | None = None
+        error: str | None = None
+
+    config.Platform = Platform
+    config.PlatformConfig = PlatformConfig
+    base.BasePlatformAdapter = BasePlatformAdapter
+    base.MessageEvent = MessageEvent
+    base.MessageType = MessageType
+    base.SendResult = SendResult
+    sys.modules.update({
+        "gateway": gateway,
+        "gateway.config": config,
+        "gateway.platforms": platforms,
+        "gateway.platforms.base": base,
+    })
+
+
+def install_aiohttp_stub() -> None:
+    """Provide json_response only when aiohttp is absent from a bare runner."""
+
+    aiohttp = types.ModuleType("aiohttp")
+    web = types.ModuleType("aiohttp.web")
+
+    @dataclass
+    class Response:
+        body: bytes
+        status: int
+
+    def json_response(payload, status=200):
+        return Response(json.dumps(payload).encode("utf-8"), status)
+
+    web.json_response = json_response
+    aiohttp.web = web
+    sys.modules.update({"aiohttp": aiohttp, "aiohttp.web": web})
+
+
 try:
     runtime = load("excel_runtime")
     tool = load("excel_tool")
+    ownership = load("profile_ownership")
     adapter_mod = load("adapter")
-except ModuleNotFoundError as error:  # pragma: no cover - bare checkout without the Hermes runtime
-    raise unittest.SkipTest(f"hermes gateway runtime not importable here: {error}")
+except ModuleNotFoundError as error:  # pragma: no cover - exercised on bare CI runners
+    if not (error.name or "").startswith("gateway"):
+        raise
+    install_gateway_stubs()
+    sys.modules.pop(f"{PKG}.adapter", None)
+    adapter_mod = load("adapter")
+
+try:
+    import aiohttp  # noqa: F401
+except ModuleNotFoundError:  # pragma: no cover - exercised on bare CI runners
+    install_aiohttp_stub()
 policy = load("excel_policy")
+plugin_entry = load("__init__")
 
 
 class PolicyTests(unittest.TestCase):
@@ -153,9 +235,10 @@ class ToolValidationTests(unittest.TestCase):
 
 
 class FakeRequest:
-    def __init__(self, body, token="secret-token"):
+    def __init__(self, body, token="secret-token", query=None):
         self._body = body
         self.headers = {"X-Excel-Token": token}
+        self.query = query or {}
 
     async def json(self):
         return self._body
@@ -164,13 +247,88 @@ class FakeRequest:
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
     def make_adapter(self, handler):
         adapter = object.__new__(adapter_mod.ExcelAdapter)
-        adapter._token = "secret-token"
+        owner = adapter_mod.AdapterOwnerIdentity(
+            profile_name="finance",
+            owner_fingerprint="sha256:" + "ab" * 32,
+            bridge_port=8788,
+        )
+        adapter._bound_owner = owner
+        adapter._load_active_owner_binding = lambda: (owner, "secret-token")
         adapter._timeout = 0.05
         adapter._background_tasks = set()
         adapter._request_tasks = {}
         adapter.build_source = lambda **kwargs: types.SimpleNamespace(**kwargs)
         adapter._message_handler = handler
         return adapter
+
+    async def test_every_http_endpoint_revalidates_owner_binding(self):
+        async def handler(_event): return None
+        adapter = self.make_adapter(handler)
+        original = adapter._load_active_owner_binding
+        calls = 0
+
+        def counted():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        adapter._load_active_owner_binding = counted
+        health = await adapter._handle_health(FakeRequest({}))
+        activity = await adapter._handle_activity(FakeRequest(
+            {}, query={"request_id": "request-activity-12345678"},
+        ))
+        cancel = await adapter._handle_cancel(FakeRequest({
+            "request_id": "request-cancel-missing",
+            "workbook_id": "workbook-cancel-missing",
+        }))
+        ingest = await adapter._handle_ingest(FakeRequest({}))
+        self.assertEqual((health.status, activity.status, cancel.status, ingest.status), (200, 200, 200, 400))
+        self.assertEqual(calls, 4)
+
+    async def test_health_attests_owner_and_fails_closed_after_receipt_change(self):
+        async def handler(_event): return None
+        adapter = self.make_adapter(handler)
+        healthy = await adapter._handle_health(FakeRequest({}))
+        payload = json.loads(healthy.body)
+        self.assertEqual(payload["profile_name"], "finance")
+        self.assertEqual(payload["owner_fingerprint"], "sha256:" + "ab" * 32)
+        self.assertEqual(payload["bridge_port"], 8788)
+
+        adapter._load_active_owner_binding = lambda: (
+            adapter_mod.AdapterOwnerIdentity(
+                profile_name="personal",
+                owner_fingerprint="sha256:" + "cd" * 32,
+                bridge_port=8788,
+            ),
+            "secret-token",
+        )
+        rejected = await adapter._handle_health(FakeRequest({}))
+        self.assertEqual(rejected.status, 503)
+        self.assertNotIn(b"personal", rejected.body)
+        self.assertNotIn(b"sha256", rejected.body)
+
+    async def test_missing_or_corrupt_live_binding_precedes_token_auth(self):
+        async def handler(_event): return None
+        adapter = self.make_adapter(handler)
+        adapter._load_active_owner_binding = mock.Mock(
+            side_effect=adapter_mod.OwnerBindingError("receipt details must not leak")
+        )
+        response = await adapter._handle_ingest(FakeRequest(self.body("owner"), "wrong"))
+        self.assertEqual(response.status, 503)
+        self.assertNotIn(b"receipt details", response.body)
+
+    async def test_connect_refuses_to_bind_without_current_owner(self):
+        adapter = object.__new__(adapter_mod.ExcelAdapter)
+        adapter._load_active_owner_binding = mock.Mock(
+            side_effect=adapter_mod.OwnerBindingError("missing")
+        )
+        adapter._set_fatal_error = mock.Mock()
+        self.assertFalse(await adapter.connect())
+        adapter._set_fatal_error.assert_called_once_with(
+            "excel_owner_binding_unavailable",
+            "Excel sidecar ownership is unavailable for the active profile",
+            retryable=False,
+        )
 
     @staticmethod
     def body(suffix="success"):
@@ -190,6 +348,23 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         response = await self.make_adapter(handler)._handle_ingest(FakeRequest(self.body()))
         self.assertEqual(response.status, 200)
         self.assertIn(b'"source": "hermes-platform"', response.body)
+
+    async def test_owner_swap_after_long_turn_withholds_proposal(self):
+        async def handler(event):
+            body = event.raw_message
+            runtime.capture_proposal({"request_id": body["request_id"], "workbook_id": body["workbook_id"],
+                "conversation_id": body["conversation_id"], "round": 0, "message": "ready", "actions": []})
+            return "final"
+
+        adapter = self.make_adapter(handler)
+        valid = adapter._load_active_owner_binding
+        adapter._load_active_owner_binding = mock.Mock(
+            side_effect=[valid(), adapter_mod.OwnerBindingError("owner changed")]
+        )
+        response = await adapter._handle_ingest(FakeRequest(self.body("owner-swap")))
+        self.assertEqual(response.status, 503)
+        self.assertNotIn(b'"proposal"', response.body)
+        self.assertEqual(adapter._load_active_owner_binding.call_count, 2)
 
     async def test_agent_finishes_without_protocol_is_immediate_error(self):
         async def handler(_event): return None
@@ -281,6 +456,162 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await adapter._handle_ingest(FakeRequest(second))).status, 200)
         self.assertEqual(seen[0][0], seen[1][0])
         self.assertNotEqual(seen[0][1], seen[1][1])
+
+
+class AdapterProfileBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.temp.name)
+        self.local_appdata = self.base / "Local"
+        self.profile_home = self.local_appdata / "hermes" / "profiles" / "finance"
+        self.environ = {
+            "LOCALAPPDATA": str(self.local_appdata),
+            "HERMES_HOME": str(self.profile_home),
+            # A stale User-scope value must never authorize the adapter.
+            "HERMES_EXCEL_INGEST_TOKEN": "f" * 64,
+        }
+        self.context = ownership.resolve_profile_context("finance", self.environ)
+        self.receipt = ownership.OwnerReceipt.from_context(
+            self.context,
+            bridge_port=8788,
+            plugin_version="0.2.0",
+        )
+        self.context.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        self.context.receipt_path.write_text(json.dumps(self.receipt.to_dict()), encoding="utf-8")
+        self.context.data_path.mkdir(parents=True, exist_ok=True)
+        self.file_token = "a" * 64
+        (self.context.data_path / ".ingest-token").write_bytes(self.file_token.encode("ascii"))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def runtime_scope(self, *, name="finance", home=None):
+        stack = contextlib.ExitStack()
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: home or self.profile_home
+        hermes_cli = types.ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+        profiles = types.ModuleType("hermes_cli.profiles")
+        profiles.get_active_profile_name = lambda: name
+        stack.enter_context(mock.patch.dict(os.environ, self.environ, clear=False))
+        stack.enter_context(mock.patch.dict(sys.modules, {
+            "hermes_constants": hermes_constants,
+            "hermes_cli": hermes_cli,
+            "hermes_cli.profiles": profiles,
+        }))
+        return stack
+
+    def test_call_time_official_profile_selects_file_token_and_ignores_user_env(self):
+        with self.runtime_scope():
+            owner, token = adapter_mod.load_active_owner_binding("finance")
+        self.assertEqual(token, self.file_token)
+        self.assertNotEqual(token, self.environ["HERMES_EXCEL_INGEST_TOKEN"])
+        self.assertEqual(owner.profile_name, "finance")
+        self.assertEqual(owner.bridge_port, 8788)
+        self.assertEqual(owner.owner_fingerprint, ownership.owner_fingerprint(self.receipt))
+
+    def test_token_file_is_exact_lowercase_hex_and_bounded(self):
+        token_path = self.context.data_path / ".ingest-token"
+        for value in (b"a" * 63, b"a" * 65, b"A" * 64, b"a" * 64 + b"\n"):
+            with self.subTest(length=len(value), prefix=value[:1]):
+                token_path.write_bytes(value)
+                with self.runtime_scope(), self.assertRaises(adapter_mod.OwnerBindingError):
+                    adapter_mod.load_active_owner_binding("finance")
+
+    def test_missing_corrupt_and_other_owner_receipts_fail_before_token_read(self):
+        receipt_path = self.context.receipt_path
+        cases = (None, b"{not-json", b"{}")
+        for raw in cases:
+            with self.subTest(raw=raw):
+                if raw is None:
+                    receipt_path.unlink(missing_ok=True)
+                else:
+                    receipt_path.write_bytes(raw)
+                with self.runtime_scope(), mock.patch.object(
+                    adapter_mod, "_read_ingest_token"
+                ) as read_token, self.assertRaises(adapter_mod.OwnerBindingError):
+                    adapter_mod.load_active_owner_binding("finance")
+                read_token.assert_not_called()
+
+        other_home = self.local_appdata / "hermes" / "profiles" / "personal"
+        other_env = dict(self.environ, HERMES_HOME=str(other_home))
+        other_context = ownership.resolve_profile_context("personal", other_env)
+        other_receipt = ownership.OwnerReceipt.from_context(
+            other_context, bridge_port=8788, plugin_version="0.2.0"
+        )
+        receipt_path.write_text(json.dumps(other_receipt.to_dict()), encoding="utf-8")
+        with self.runtime_scope(), mock.patch.object(
+            adapter_mod, "_read_ingest_token"
+        ) as read_token, self.assertRaises(adapter_mod.OwnerBindingError):
+            adapter_mod.load_active_owner_binding("finance")
+        read_token.assert_not_called()
+
+    def test_registration_hint_and_call_time_home_must_still_agree(self):
+        personal_home = self.local_appdata / "hermes" / "profiles" / "personal"
+        for name, home, hint in (
+            ("personal", personal_home, "finance"),
+            ("finance", personal_home, "finance"),
+        ):
+            with self.subTest(name=name, home=home), self.runtime_scope(name=name, home=home), self.assertRaises(
+                adapter_mod.OwnerBindingError
+            ):
+                adapter_mod.load_active_owner_binding(hint)
+
+    def test_receipt_swap_during_token_read_fails_closed(self):
+        changed = ownership.OwnerReceipt.from_context(
+            self.context, bridge_port=8789, plugin_version="0.2.0"
+        )
+        with self.runtime_scope(), mock.patch.object(
+            adapter_mod.profile_ownership,
+            "load_owner_receipt",
+            side_effect=[self.receipt, changed],
+        ), mock.patch.object(adapter_mod, "_read_ingest_token", return_value=self.file_token):
+            with self.assertRaises(adapter_mod.OwnerBindingError):
+                adapter_mod.load_active_owner_binding("finance")
+
+    def test_dependency_check_includes_the_bound_owner_probe(self):
+        owner = adapter_mod.AdapterOwnerIdentity(
+            profile_name="finance",
+            owner_fingerprint="sha256:" + "ab" * 32,
+            bridge_port=8788,
+        )
+        with mock.patch.object(
+            adapter_mod, "load_active_owner_binding", return_value=(owner, self.file_token)
+        ) as load_binding:
+            self.assertTrue(adapter_mod.check_excel_requirements(profile_name="finance"))
+        load_binding.assert_called_once_with("finance")
+
+        with mock.patch.object(
+            adapter_mod,
+            "load_active_owner_binding",
+            side_effect=adapter_mod.OwnerBindingError("other owner"),
+        ):
+            self.assertFalse(adapter_mod.check_excel_requirements(profile_name="finance"))
+
+    def test_plugin_registration_binds_one_profile_into_factory_and_check(self):
+        class Context:
+            def __init__(self):
+                self.profile_reads = 0
+                self.platform = None
+
+            @property
+            def profile_name(self):
+                self.profile_reads += 1
+                return "finance"
+
+            def register_cli_command(self, **_kwargs): pass
+            def register_middleware(self, *_args, **_kwargs): pass
+            def register_tool(self, **_kwargs): pass
+
+            def register_platform(self, **kwargs):
+                self.platform = kwargs
+
+        context = Context()
+        plugin_entry.register(context)
+        self.assertEqual(context.profile_reads, 1)
+        self.assertEqual(context.platform["adapter_factory"].keywords, {"profile_name": "finance"})
+        self.assertEqual(context.platform["check_fn"].keywords, {"profile_name": "finance"})
+        self.assertNotIn("required_env", context.platform)
 
 
 if __name__ == "__main__":

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from .cli import excel_sidecar_command, register_cli
 
 
 def register(ctx) -> None:
     """Register the operator-facing Excel sidecar CLI."""
+    profile_name = ctx.profile_name
     ctx.register_cli_command(
         name="excel-sidecar",
         help="Install and operate the Hermes Excel sidecar",
-        setup_fn=register_cli,
+        setup_fn=partial(register_cli, profile_name=profile_name),
         handler_fn=excel_sidecar_command,
         description=(
             "Install, validate, inspect, or roll back the local Office.js "
@@ -35,9 +38,8 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="excel",
         label="Microsoft Excel",
-        adapter_factory=build_excel_adapter,
-        check_fn=check_excel_requirements,
-        required_env=["HERMES_EXCEL_INGEST_TOKEN"],
+        adapter_factory=partial(build_excel_adapter, profile_name=profile_name),
+        check_fn=partial(check_excel_requirements, profile_name=profile_name),
         allowed_users_env="HERMES_EXCEL_ALLOWED_USERS",
         allow_all_env="HERMES_EXCEL_ALLOW_ALL_USERS",
         max_message_length=8000,

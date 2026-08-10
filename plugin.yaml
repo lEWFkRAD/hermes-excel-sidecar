@@ -10,16 +10,9 @@ platforms:
   - windows
 provides_tools:
   - excel_response
-requires_env:
-  - name: HERMES_EXCEL_INGEST_TOKEN
-    description: Shared secret between the bridge and Excel platform adapter
-    secret: true
 optional_env:
   - name: HERMES_EXCEL_ALLOW_ALL_USERS
     description: Allow token-authenticated dynamic workbook identities (must remain true for the local adapter)
-  - name: HERMES_EXCEL_BRIDGE_TOKEN
-    description: Per-install token required by the local Excel bridge API
-    secret: true
   - name: HERMES_EXCEL_LLM_BASE_URL
     description: Hermes api_server base URL (default http://127.0.0.1:8642/v1)
   - name: HERMES_EXCEL_DOCLING_URL

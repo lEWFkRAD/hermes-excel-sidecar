@@ -8,11 +8,14 @@ import hmac
 import json
 import os
 import re
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
+from . import profile_ownership
 from .excel_runtime import (
     capture_final,
     capture_final_for_conversation,
@@ -26,6 +29,105 @@ from .excel_runtime import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8794
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+INGEST_TOKEN_RE = re.compile(rb"^[0-9a-f]{64}$")
+MAX_INGEST_TOKEN_BYTES = 64
+
+
+class OwnerBindingError(RuntimeError):
+    """Raised when the live adapter cannot prove ownership of the singleton."""
+
+
+@dataclass(frozen=True)
+class AdapterOwnerIdentity:
+    """Non-secret identity that the adapter attests to the local bridge."""
+
+    profile_name: str
+    owner_fingerprint: str
+    bridge_port: int
+
+
+def _active_profile_context(profile_hint: str | None = None) -> profile_ownership.ProfileContext:
+    """Resolve the active profile at call time through Hermes's public APIs."""
+
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.profiles import get_active_profile_name
+
+        active_name = get_active_profile_name()
+        active_home = Path(get_hermes_home()).expanduser().resolve(strict=False)
+    except Exception as error:
+        raise OwnerBindingError("Hermes profile identity is unavailable") from error
+
+    if not isinstance(active_name, str) or active_name != active_name.strip().lower():
+        raise OwnerBindingError("Hermes profile identity is invalid")
+    if profile_hint is not None and active_name != profile_hint:
+        raise OwnerBindingError("Hermes profile changed after plugin registration")
+
+    environ = dict(os.environ)
+    environ["HERMES_HOME"] = str(active_home)
+    try:
+        context = profile_ownership.resolve_profile_context(active_name, environ)
+    except (OSError, ValueError) as error:
+        raise OwnerBindingError("Hermes profile identity is invalid") from error
+    if context.profile_name != active_name or context.profile_home != active_home:
+        raise OwnerBindingError("Hermes profile identity is inconsistent")
+    return context
+
+
+def _read_ingest_token(context: profile_ownership.ProfileContext) -> str:
+    """Read the selected profile's exact, bounded ingest token."""
+
+    token_path = context.data_path / ".ingest-token"
+    try:
+        if token_path.is_symlink():
+            raise OwnerBindingError("Excel adapter token is unavailable")
+        with token_path.open("rb") as handle:
+            raw = handle.read(MAX_INGEST_TOKEN_BYTES + 1)
+    except OwnerBindingError:
+        raise
+    except (OSError, ValueError) as error:
+        raise OwnerBindingError("Excel adapter token is unavailable") from error
+    if not INGEST_TOKEN_RE.fullmatch(raw):
+        raise OwnerBindingError("Excel adapter token is invalid")
+    return raw.decode("ascii")
+
+
+def load_active_owner_binding(
+    profile_hint: str | None = None,
+) -> tuple[AdapterOwnerIdentity, str]:
+    """Load and double-check the active profile's receipt and ingest token."""
+
+    context = _active_profile_context(profile_hint)
+    try:
+        receipt = profile_ownership.load_owner_receipt(context.receipt_path)
+    except (OSError, ValueError) as error:
+        raise OwnerBindingError("Excel sidecar owner receipt is invalid") from error
+    if receipt is None or not profile_ownership.owner_matches(receipt, context):
+        raise OwnerBindingError("Excel sidecar is not owned by the active profile")
+
+    fingerprint = profile_ownership.owner_fingerprint(receipt)
+    token = _read_ingest_token(context)
+
+    # Do not authorize across a concurrent install/rollback receipt swap.
+    try:
+        confirmed = profile_ownership.load_owner_receipt(context.receipt_path)
+    except (OSError, ValueError) as error:
+        raise OwnerBindingError("Excel sidecar owner receipt changed") from error
+    if (
+        confirmed is None
+        or not profile_ownership.owner_matches(confirmed, context)
+        or profile_ownership.owner_fingerprint(confirmed) != fingerprint
+    ):
+        raise OwnerBindingError("Excel sidecar owner receipt changed")
+
+    return (
+        AdapterOwnerIdentity(
+            profile_name=context.profile_name,
+            owner_fingerprint=fingerprint,
+            bridge_port=receipt.bridge_port,
+        ),
+        token,
+    )
 
 
 class ExcelAdapter(BasePlatformAdapter):
@@ -33,51 +135,93 @@ class ExcelAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False
     supports_async_delivery = False
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, *, profile_name: str | None = None):
         super().__init__(config=config, platform=Platform("excel"))
         self._host = os.getenv("HERMES_EXCEL_INGEST_HOST", DEFAULT_HOST)
         self._port = int(os.getenv("HERMES_EXCEL_INGEST_PORT", str(DEFAULT_PORT)))
-        self._token = os.getenv("HERMES_EXCEL_INGEST_TOKEN", "").strip()
+        self._profile_hint = profile_name
+        self._bound_owner: AdapterOwnerIdentity | None = None
         self._timeout = float(os.getenv("HERMES_EXCEL_REPLY_TIMEOUT", "420"))
         self._runner = None
         self._request_tasks: dict[str, asyncio.Task] = {}
 
+    def _load_active_owner_binding(self) -> tuple[AdapterOwnerIdentity, str]:
+        return load_active_owner_binding(self._profile_hint)
+
+    def _authorize_request(self, request):
+        """Revalidate ownership and the profile token before an endpoint runs."""
+
+        from aiohttp import web
+
+        try:
+            owner, token = self._load_active_owner_binding()
+        except OwnerBindingError:
+            return None, web.json_response({"error": "adapter ownership unavailable"}, status=503)
+        if self._bound_owner is None or owner != self._bound_owner:
+            return None, web.json_response({"error": "adapter ownership unavailable"}, status=503)
+        if not hmac.compare_digest(request.headers.get("X-Excel-Token", ""), token):
+            return None, web.json_response({"error": "unauthorized"}, status=401)
+        return owner, None
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         from aiohttp import web
-        if not self._token:
-            self._set_fatal_error("excel_missing_token", "HERMES_EXCEL_INGEST_TOKEN is required", retryable=False)
+        try:
+            owner, _ = self._load_active_owner_binding()
+        except OwnerBindingError:
+            self._set_fatal_error(
+                "excel_owner_binding_unavailable",
+                "Excel sidecar ownership is unavailable for the active profile",
+                retryable=False,
+            )
             return False
+        self._bound_owner = owner
         app = web.Application(client_max_size=2 * 1024 * 1024)
         app.router.add_post("/ingest", self._handle_ingest)
         app.router.add_post("/cancel", self._handle_cancel)
-        async def activity(request):
-            if not hmac.compare_digest(request.headers.get("X-Excel-Token", ""), self._token):
-                return web.json_response({"error": "unauthorized"}, status=401)
-            request_id = str(request.query.get("request_id", ""))
-            if not ID_RE.fullmatch(request_id):
-                return web.json_response({"error": "invalid request_id"}, status=400)
-            entry = get_activity(request_id)
-            if entry is None:
-                return web.json_response({"ok": True, "active": get_request(request_id) is not None})
-            return web.json_response({"ok": True, "active": True,
-                                      "seq": entry.get("seq", 0), "text": entry.get("text", "")})
-        app.router.add_get("/activity", activity)
-        async def health(request):
-            if not hmac.compare_digest(request.headers.get("X-Excel-Token", ""), self._token):
-                return web.json_response({"error": "unauthorized"}, status=401)
-            return web.json_response({"ok": True, "service": "hermes-excel-adapter", "protocol": 1,
-                                      "capability": "typed-proposals"})
-        app.router.add_get("/health", health)
+        app.router.add_get("/activity", self._handle_activity)
+        app.router.add_get("/health", self._handle_health)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         await web.TCPSite(self._runner, self._host, self._port).start()
         self._running = True
         return True
 
+    async def _handle_activity(self, request):
+        from aiohttp import web
+
+        _, error = self._authorize_request(request)
+        if error is not None:
+            return error
+        request_id = str(request.query.get("request_id", ""))
+        if not ID_RE.fullmatch(request_id):
+            return web.json_response({"error": "invalid request_id"}, status=400)
+        entry = get_activity(request_id)
+        if entry is None:
+            return web.json_response({"ok": True, "active": get_request(request_id) is not None})
+        return web.json_response({"ok": True, "active": True,
+                                  "seq": entry.get("seq", 0), "text": entry.get("text", "")})
+
+    async def _handle_health(self, request):
+        from aiohttp import web
+
+        owner, error = self._authorize_request(request)
+        if error is not None:
+            return error
+        return web.json_response({
+            "ok": True,
+            "service": "hermes-excel-adapter",
+            "protocol": 1,
+            "capability": "typed-proposals",
+            "profile_name": owner.profile_name,
+            "owner_fingerprint": owner.owner_fingerprint,
+            "bridge_port": owner.bridge_port,
+        })
+
     async def _handle_cancel(self, request):
         from aiohttp import web
-        if not hmac.compare_digest(request.headers.get("X-Excel-Token", ""), self._token):
-            return web.json_response({"error": "unauthorized"}, status=401)
+        _, error = self._authorize_request(request)
+        if error is not None:
+            return error
         try:
             body = await request.json()
             request_id = str(body["request_id"])
@@ -110,6 +254,7 @@ class ExcelAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        self._bound_owner = None
         self._running = False
 
     def supports_draft_streaming(self, chat_type: Optional[str] = None,
@@ -137,8 +282,9 @@ class ExcelAdapter(BasePlatformAdapter):
 
     async def _handle_ingest(self, request):
         from aiohttp import web
-        if not hmac.compare_digest(request.headers.get("X-Excel-Token", ""), self._token):
-            return web.json_response({"error": "unauthorized"}, status=401)
+        _, error = self._authorize_request(request)
+        if error is not None:
+            return error
         try:
             body = await request.json()
             request_id = str(body["request_id"])
@@ -207,6 +353,13 @@ class ExcelAdapter(BasePlatformAdapter):
             proposal, final = protocol.result()
             if pending.protocol_error:
                 raise RuntimeError(pending.protocol_error)
+            # The model turn can be long. Re-read the receipt and selected
+            # profile token immediately before releasing workbook actions so
+            # an install/rollback/profile transition cannot authorize a stale
+            # proposal that the pane would then be able to apply.
+            _, ownership_error = self._authorize_request(request)
+            if ownership_error is not None:
+                return ownership_error
             return web.json_response({"proposal": proposal, "message": final, "source": "hermes-platform"})
         except asyncio.TimeoutError:
             return web.json_response({"error": "agent timed out"}, status=504)
@@ -228,13 +381,14 @@ class ExcelAdapter(BasePlatformAdapter):
             close_request(request_id)
 
 
-def check_excel_requirements() -> bool:
+def check_excel_requirements(*, profile_name: str | None = None) -> bool:
     try:
         import aiohttp  # noqa: F401
+        load_active_owner_binding(profile_name)
         return True
-    except ImportError:
+    except (ImportError, OwnerBindingError):
         return False
 
 
-def build_excel_adapter(config):
-    return ExcelAdapter(config)
+def build_excel_adapter(config, *, profile_name: str | None = None):
+    return ExcelAdapter(config, profile_name=profile_name)
