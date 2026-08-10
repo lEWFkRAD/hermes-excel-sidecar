@@ -17,8 +17,19 @@ The bridge is stateless: every request carries the full conversation context.
 
 ### GET /api/health
 
-Returns `{ok, service, port, llmBaseUrl, llmModel, doclingBaseUrl, time, hermes:{ok,status}, docling:{ok,status}}`.
-`ok` is true only when both upstreams answer.
+Returns `{ok, service, port, profile_name, owner_fingerprint, llmBaseUrl, llmModel, doclingBaseUrl, time, hermes:{ok,status}, docling:{ok,status}}`.
+`profile_name` is the canonical Hermes profile selected by the installer and
+`owner_fingerprint` is a non-secret SHA-256 binding to the strict shared owner
+receipt. Install and status certification require both values to match. `ok` is
+true only when both upstreams answer.
+
+The local typed Excel adapter independently loads the selected profile's strict
+owner receipt and ingest-token file. Its authenticated health response attests
+the same `profile_name`, `owner_fingerprint`, and bridge port. The bridge rejects
+an adapter whose identity or port differs from its own runtime ownership. Chat
+and export are owner-gated before deterministic or file-writing paths, and a
+long-running adapter turn revalidates ownership before returning a proposal for
+the task pane to apply.
 
 ### POST /api/chat
 

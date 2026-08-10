@@ -30,13 +30,43 @@
 #>
 [CmdletBinding()]
 param(
-  [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'hermes\excel-addin'),
-  [string] $DataDir    = (Join-Path $env:LOCALAPPDATA 'hermes\excel-addin\data'),
+  [string] $InstallDir,
+  [string] $DataDir,
   [int]    $Port       = 8788,
-  [switch] $Unregister
+  [switch] $Unregister,
+  [string] $ProfileName,
+  [string] $HermesHome,
+  [string] $OwnerReceiptPath,
+  [string] $TransactionProof,
+  [string] $OwnerFingerprint
 )
 
 $ErrorActionPreference = 'Stop'
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Import-Module (Join-Path $ScriptDir 'profile-ownership.psm1') -Force
+$ProfileContext = Resolve-HermesExcelProfileContext -ProfileName $ProfileName -HermesHome $HermesHome -OwnerReceiptPath $OwnerReceiptPath
+if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = $ProfileContext.InstallPath }
+if ([string]::IsNullOrWhiteSpace($DataDir)) { $DataDir = $ProfileContext.DataPath }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+$DataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
+if (-not [string]::Equals($InstallDir, $ProfileContext.InstallPath, [StringComparison]::OrdinalIgnoreCase) -or
+    -not [string]::Equals($DataDir, $ProfileContext.DataPath, [StringComparison]::OrdinalIgnoreCase)) {
+  throw 'InstallDir/DataDir do not match the selected Hermes profile context.'
+}
+$OwnershipLock = $null
+
+try {
+if ($TransactionProof) {
+  Assert-HermesExcelParentTransaction -Context $ProfileContext -Proof $TransactionProof
+} else {
+  $OwnershipLock = Enter-HermesExcelTransaction -Context $ProfileContext
+  $owner = Assert-HermesExcelOwnership -Context $ProfileContext -Operation Mutate
+  if (-not $owner) { throw 'Task registration requires an existing owned install.' }
+  if ([string]::IsNullOrWhiteSpace($OwnerFingerprint)) { $OwnerFingerprint = Get-HermesExcelOwnerFingerprint -Receipt $owner }
+}
+if (-not [string]::IsNullOrWhiteSpace($OwnerFingerprint) -and $OwnerFingerprint -notmatch '^sha256:[0-9a-f]{64}$') {
+  throw 'OwnerFingerprint must be a lowercase sha256 digest.'
+}
 
 # ---- Config block (retarget here) ------------------------------------------
 $TaskName     = 'Hermes_Excel_Bridge'
@@ -74,10 +104,22 @@ try {
 Option Explicit
 Dim shell
 Set shell = CreateObject("WScript.Shell")
+Dim processEnvironment
+Set processEnvironment = shell.Environment("Process")
+processEnvironment("INSTALL_DIR") = "$InstallDir"
+processEnvironment("HERMES_EXCEL_DATA_DIR") = "$DataDir"
+processEnvironment("HERMES_HOME") = "$($ProfileContext.ProfileHome)"
+processEnvironment("HERMES_CONFIG") = "$($ProfileContext.ConfigPath)"
+processEnvironment("HERMES_EXCEL_PROFILE_NAME") = "$($ProfileContext.ProfileName)"
+processEnvironment("HERMES_EXCEL_OWNER_RECEIPT") = "$($ProfileContext.ReceiptPath)"
+processEnvironment("HERMES_EXCEL_OWNER_FINGERPRINT") = "$OwnerFingerprint"
 shell.Run """$ServiceCmd""", 0, True
+Set processEnvironment = Nothing
 Set shell = Nothing
 "@
-  Set-Content -LiteralPath $ServiceVbs -Value $vbs -Encoding ASCII -Force
+  # WScript natively consumes UTF-16LE. Preserve non-ASCII selected-profile
+  # paths when this runs under Windows PowerShell 5.1.
+  Set-Content -LiteralPath $ServiceVbs -Value $vbs -Encoding Unicode -Force
 
   # Action: wscript runs the VBS shim (hidden). Pass env via the action env is
   # not supported; the supervisor defaults DATA_DIR/INSTALL_DIR itself, but we
@@ -124,4 +166,8 @@ catch {
   }
   Write-Error "[register-task] FAILED: $failureMessage"
   exit 1
+}
+}
+finally {
+  Exit-HermesExcelTransaction -Lock $OwnershipLock
 }

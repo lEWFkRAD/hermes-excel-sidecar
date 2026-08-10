@@ -39,6 +39,11 @@ import {
   buildSystemPrompt,
   fallbackResponse,
   diagnosticFallback,
+  normalizeOwnerIdentity,
+  adapterOwnerContractMatches,
+  isProfileSensitiveApiRequest,
+  probeOwnedAdapter,
+  dispatchProfileSensitiveApi,
   resolveContainedNativePath,
   scanWrittenCells,
   matrixToCsv,
@@ -55,6 +60,146 @@ import {
   translateFormula,
   translateMatrixFormulas,
 } from "./formula-rebase.mjs";
+
+test("owner identity health metadata is normalized and fail-closed", () => {
+  const fingerprint = `sha256:${"ab".repeat(32)}`;
+  assert.deepStrictEqual(
+    normalizeOwnerIdentity({
+      HERMES_EXCEL_PROFILE_NAME: " Finance ",
+      HERMES_EXCEL_OWNER_FINGERPRINT: fingerprint.toUpperCase(),
+    }),
+    { profile_name: "finance", owner_fingerprint: fingerprint },
+  );
+  assert.deepStrictEqual(
+    normalizeOwnerIdentity({
+      HERMES_EXCEL_PROFILE_NAME: "finance team",
+      HERMES_EXCEL_OWNER_FINGERPRINT: "sha256:not-a-digest",
+    }),
+    { profile_name: "", owner_fingerprint: "" },
+  );
+  assert.deepStrictEqual(normalizeOwnerIdentity({}), {
+    profile_name: "",
+    owner_fingerprint: "",
+  });
+});
+
+test("adapter health must attest the bridge's exact owner identity and port", () => {
+  const owner = {
+    profile_name: "finance",
+    owner_fingerprint: `sha256:${"ab".repeat(32)}`,
+  };
+  const detail = {
+    profile_name: owner.profile_name,
+    owner_fingerprint: owner.owner_fingerprint,
+    bridge_port: 8788,
+  };
+  assert.equal(adapterOwnerContractMatches(detail, owner, 8788), true);
+  assert.equal(adapterOwnerContractMatches({ ...detail, profile_name: "personal" }, owner, 8788), false);
+  assert.equal(adapterOwnerContractMatches({ ...detail, owner_fingerprint: `sha256:${"cd".repeat(32)}` }, owner, 8788), false);
+  assert.equal(adapterOwnerContractMatches({ ...detail, bridge_port: 8789 }, owner, 8788), false);
+  assert.equal(adapterOwnerContractMatches({ ...detail, bridge_port: "8788" }, owner, 8788), false);
+  assert.equal(adapterOwnerContractMatches(detail, { profile_name: "", owner_fingerprint: "" }, 8788), false);
+});
+
+test("profile-sensitive API classification protects chat and export but leaves health diagnostic", () => {
+  assert.equal(isProfileSensitiveApiRequest("POST", "/api/chat"), true);
+  assert.equal(isProfileSensitiveApiRequest("POST", "/api/export"), true);
+  assert.equal(isProfileSensitiveApiRequest("GET", "/api/health"), false);
+  assert.equal(isProfileSensitiveApiRequest("GET", "/api/activity"), false);
+  assert.equal(isProfileSensitiveApiRequest("GET", "/api/chat"), false);
+});
+
+test("owned-adapter probe authenticates and requires the exact runtime contract", async () => {
+  const token = "ab".repeat(32);
+  const owner = {
+    profile_name: "finance",
+    owner_fingerprint: `sha256:${"cd".repeat(32)}`,
+  };
+  const detail = {
+    ok: true,
+    service: "hermes-excel-adapter",
+    protocol: 1,
+    capability: "typed-proposals",
+    profile_name: owner.profile_name,
+    owner_fingerprint: owner.owner_fingerprint,
+    bridge_port: 8788,
+  };
+  let calls = 0;
+  const fetchImpl = async (url, options) => {
+    calls += 1;
+    assert.equal(url.href, "http://127.0.0.1:8794/health");
+    assert.deepEqual(options.headers, { "x-excel-token": token });
+    return { ok: true, status: 200, json: async () => detail };
+  };
+  const accepted = await probeOwnedAdapter({
+    fetchImpl,
+    adapterUrl: "http://127.0.0.1:8794/ingest",
+    adapterToken: token,
+    ownerIdentity: owner,
+    expectedPort: 8788,
+  });
+  assert.equal(accepted.ok, true);
+  assert.equal(calls, 1);
+
+  for (const mismatch of [
+    { ...detail, profile_name: "personal" },
+    { ...detail, owner_fingerprint: `sha256:${"ef".repeat(32)}` },
+    { ...detail, bridge_port: 8789 },
+    { ...detail, service: "other-adapter" },
+  ]) {
+    const rejected = await probeOwnedAdapter({
+      fetchImpl: async () => ({ ok: true, status: 200, json: async () => mismatch }),
+      adapterUrl: "http://127.0.0.1:8794/ingest",
+      adapterToken: token,
+      ownerIdentity: owner,
+      expectedPort: 8788,
+    });
+    assert.equal(rejected.ok, false);
+  }
+});
+
+test("owned-adapter probe fails before network when its file-backed credential is absent or malformed", async () => {
+  let calls = 0;
+  const fetchImpl = async () => { calls += 1; };
+  for (const adapterToken of ["", "a".repeat(63), "A".repeat(64), "not-a-token"]) {
+    const result = await probeOwnedAdapter({
+      fetchImpl,
+      adapterUrl: "http://127.0.0.1:8794/ingest",
+      adapterToken,
+      ownerIdentity: {
+        profile_name: "finance",
+        owner_fingerprint: `sha256:${"cd".repeat(32)}`,
+      },
+      expectedPort: 8788,
+    });
+    assert.equal(result.ok, false);
+  }
+  assert.equal(calls, 0);
+});
+
+test("profile-sensitive dispatch probes before chat/deterministic or export handlers", async () => {
+  const rejectedEvents = [];
+  const rejected = await dispatchProfileSensitiveApi("POST", "/api/export", {
+    probe: async () => { rejectedEvents.push("probe"); return { ok: false }; },
+    exportHandler: async () => { rejectedEvents.push("export"); },
+  });
+  assert.deepEqual(rejected, { handled: true, authorized: false });
+  assert.deepEqual(rejectedEvents, ["probe"]);
+
+  const acceptedEvents = [];
+  const accepted = await dispatchProfileSensitiveApi("POST", "/api/chat", {
+    probe: async () => { acceptedEvents.push("probe"); return { ok: true }; },
+    chatHandler: async () => { acceptedEvents.push("chat"); return "sent"; },
+  });
+  assert.deepEqual(accepted, { handled: true, authorized: true, result: "sent" });
+  assert.deepEqual(acceptedEvents, ["probe", "chat"]);
+
+  let healthProbes = 0;
+  assert.deepEqual(await dispatchProfileSensitiveApi("GET", "/api/health", {
+    probe: async () => { healthProbes += 1; return { ok: false }; },
+  }), { handled: false });
+  assert.equal(healthProbes, 0);
+});
 
 test("diagnosticFallback: certification failures never create workbook actions", () => {
   const body = { prompt: "Parse this PDF and make a workbook", files: [{ name: "bank.pdf", extracted_text: "Balance 123" }] };

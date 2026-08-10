@@ -7,14 +7,23 @@
 '  window style 0). Used by the Startup-folder shortcut and as a quiet entry
 '  point so the bridge does not flash a cmd window at logon.
 '
-'  TEMPLATE token substituted by addin-install.ps1:
-'      __INSTALL_DIR__   absolute install root (no trailing backslash)
+'  Written as UTF-16LE by addin-install.ps1 so exact profile paths survive
+'  Windows PowerShell 5.1 regardless of the active ANSI code page.
 ' ===========================================================================
 
 Option Explicit
 
-Dim shell, cmdPath
+Dim shell, cmdPath, processEnvironment
 Set shell = CreateObject("WScript.Shell")
+Set processEnvironment = shell.Environment("Process")
+
+processEnvironment("INSTALL_DIR") = "__INSTALL_DIR__"
+processEnvironment("HERMES_EXCEL_DATA_DIR") = "__DATA_DIR__"
+processEnvironment("HERMES_HOME") = "__HERMES_HOME__"
+processEnvironment("HERMES_CONFIG") = "__HERMES_CONFIG__"
+processEnvironment("HERMES_EXCEL_PROFILE_NAME") = "__PROFILE_NAME__"
+processEnvironment("HERMES_EXCEL_OWNER_RECEIPT") = "__OWNER_RECEIPT__"
+processEnvironment("HERMES_EXCEL_OWNER_FINGERPRINT") = "__OWNER_FINGERPRINT__"
 
 cmdPath = "__INSTALL_DIR__\run-bridge.cmd"
 
@@ -22,4 +31,5 @@ cmdPath = "__INSTALL_DIR__\run-bridge.cmd"
 ' Quote the path in case the install dir contains spaces.
 shell.Run """" & cmdPath & """", 0, False
 
+Set processEnvironment = Nothing
 Set shell = Nothing

@@ -17,6 +17,11 @@ test("repository is an installable Hermes standalone plugin", async () => {
   const entrypoint = await fs.readFile("__init__.py", "utf8");
   assert.match(entrypoint, /def register\(ctx\)/);
   assert.match(entrypoint, /register_cli_command/);
+  assert.doesNotMatch(
+    manifest,
+    /HERMES_EXCEL_(?:INGEST|BRIDGE)_TOKEN/,
+    "Generated bridge secrets are injected from profile-owned files, never declared as plugin env inputs",
+  );
   await fs.access("after-install.md");
 });
 
