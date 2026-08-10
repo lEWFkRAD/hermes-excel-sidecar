@@ -5,6 +5,16 @@ Versioning and uses GitHub Releases for distributable plugin archives.
 
 ## [Unreleased]
 
+### Added
+
+- Strict, non-secret profile ownership receipts and call-time profile path
+  resolution as the foundation for safe multi-profile Excel ownership.
+
+### Security
+
+- Archive validation now rejects tracked profile receipts, tokens, workbooks,
+  logs, TLS material, and generated runtime data.
+
 ## [0.2.0] - Unreleased
 
 ### Added

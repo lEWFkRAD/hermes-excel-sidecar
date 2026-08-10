@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from .cli import excel_sidecar_command, register_cli
 
 
@@ -10,7 +12,7 @@ def register(ctx) -> None:
     ctx.register_cli_command(
         name="excel-sidecar",
         help="Install and operate the Hermes Excel sidecar",
-        setup_fn=register_cli,
+        setup_fn=partial(register_cli, profile_name=ctx.profile_name),
         handler_fn=excel_sidecar_command,
         description=(
             "Install, validate, inspect, or roll back the local Office.js "

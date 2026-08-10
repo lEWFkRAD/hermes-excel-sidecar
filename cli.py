@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 
 
-def register_cli(parser: argparse.ArgumentParser) -> None:
+def register_cli(parser: argparse.ArgumentParser, *, profile_name: str) -> None:
     subs = parser.add_subparsers(dest="excel_sidecar_command")
     install = subs.add_parser("install", help="Install or update the add-in and bridge")
     install.add_argument("--port", type=int, default=None, help="Explicit bridge port")
@@ -22,7 +22,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     status = subs.add_parser("status", help="Check the running bridge identity")
     status.add_argument("--port", type=int, default=None)
     subs.add_parser("rollback", help="Remove the per-user add-in installation")
-    parser.set_defaults(func=excel_sidecar_command)
+    parser.set_defaults(func=excel_sidecar_command, excel_profile_name=profile_name)
 
 
 def _powershell(script: str, extra: list[str] | None = None) -> int:
