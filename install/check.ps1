@@ -58,9 +58,32 @@ if ($launcherTemplate -notmatch 'HERMES_EXCEL_INGEST_TOKEN=<"__DATA_DIR__\\\.ing
   $failures.Add('Installed launcher must share the ingest token and disable raw fallback.')
 }
 
+$deployScript = Join-Path $PSScriptRoot 'deploy.ps1'
+if (-not (Test-Path -LiteralPath $deployScript)) {
+  $failures.Add('Canonical deploy script is missing.')
+} else {
+  $deployText = Get-Content -LiteralPath $deployScript -Raw
+  if ($deployText -notmatch 'git.+ls-files' -or $deployText -notmatch 'npm\.cmd.+run.+verify') {
+    $failures.Add('Deploy must use the tracked-file manifest and run the verification gate.')
+  }
+}
+
+$smoke = Get-Content -LiteralPath (Join-Path $root 'broker\smoke.mjs') -Raw
+if ($smoke -notmatch 'https://localhost:8788') {
+  $failures.Add('Smoke test must default to the Excel bridge on port 8788.')
+}
+
+$supervisor = Get-Content -LiteralPath (Join-Path $root 'service\bridge-service.cmd') -Raw
+if ($supervisor -notmatch 'bridge-supervisor\.lock' -or $supervisor -notmatch 'SUPERVISOR_PID') {
+  $failures.Add('Bridge supervisor must enforce a single live restart loop.')
+}
+if ($deployText -notmatch 'Stop-Process.+ProcessId' -or $deployText -notmatch 'bridge-supervisor\.lock') {
+  $failures.Add('Deploy restart must retire orphan bridge processes and the old singleton lock.')
+}
+
 $pane = Get-Content -LiteralPath (Join-Path $root 'taskpane.html') -Raw
-if ($pane -notmatch '<input[^>]+id="reviewToggle"[^>]+checked') {
-  $failures.Add('Review-before-apply must be visibly enabled in the initial HTML.')
+if ($pane -match '<input[^>]+id="reviewToggle"[^>]+checked') {
+  $failures.Add('Review-before-apply must remain opt-in in the initial HTML.')
 }
 
 if ($failures.Count) {

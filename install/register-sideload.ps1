@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
   [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'hermes\excel-addin'),
-  [int] $Port = 8787,
+  [int] $Port = 8788,
   [switch] $Unregister
 )
 
@@ -45,7 +45,7 @@ try {
   }
   New-Item -ItemType Directory -Path $CatalogDir -Force | Out-Null
   $xml = Get-Content -LiteralPath $SourceManifest -Raw
-  $xml = $xml -replace 'localhost:8787', "localhost:$Port"
+  $xml = $xml -replace 'localhost:8788', "localhost:$Port"
   Set-Content -LiteralPath $CatalogPath -Value $xml -Encoding UTF8 -Force
 
   Remove-LegacyRegistration

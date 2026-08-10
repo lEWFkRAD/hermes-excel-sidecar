@@ -46,6 +46,14 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(second["tool_choice"], "none")
         self.assertNotIn("tool_choice", original)
 
+    def test_nous_qwen_uses_auto_but_remains_typed_and_fail_closed(self):
+        first = policy.excel_terminal_tool_policy(
+            request=self.request(), platform="excel", api_call_count=1,
+            provider="nous", model="qwen/qwen3.8-max",
+        )["request"]
+        self.assertEqual(first["tool_choice"], "auto")
+        self.assertEqual(first["tools"][0]["function"]["name"], "excel_response")
+
     def test_non_excel_unchanged_and_missing_tool_fails_closed(self):
         self.assertIsNone(policy.excel_terminal_tool_policy(request=self.request(), platform="kindle", api_call_count=1))
         result = policy.excel_terminal_tool_policy(request={"tools": []}, platform="excel", api_call_count=1)

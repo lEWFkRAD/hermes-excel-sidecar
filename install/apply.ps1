@@ -13,7 +13,7 @@
 
 .PARAMETER Port
   Bridge port (passed through). Default 0 selects the first available port
-  starting at 8787.
+  starting at 8788.
 
 .PARAMETER SkipExcelAddin
   Do not install the Excel add-in on this box (no-op success).
@@ -47,7 +47,7 @@ try {
   $passthru = @{ Port = $Port }
   if ($SkipSideload) { $passthru['SkipSideload'] = $true }
 
-  $portLabel = if ($Port -eq 0) { 'auto (starting at 8787)' } else { "$Port" }
+  $portLabel = if ($Port -eq 0) { 'auto (starting at 8788)' } else { "$Port" }
   Write-Host "[apply] Installing Hermes for Excel (port $portLabel)..."
   & powershell -NoProfile -ExecutionPolicy Bypass -File $installer @passthru
   $rc = $LASTEXITCODE

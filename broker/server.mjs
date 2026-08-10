@@ -4,7 +4,7 @@ import { readFile, writeFile, mkdir, readdir, stat, unlink, realpath } from "nod
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import zlib from "node:zlib";
@@ -16,7 +16,7 @@ import {
 } from "./formula-rebase.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const port = Number(process.env.PORT || 8787);
+const port = Number(process.env.PORT || 8788);
 const tlsCertPath = process.env.HERMES_EXCEL_TLS_CERT || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.crt");
 const tlsKeyPath = process.env.HERMES_EXCEL_TLS_KEY || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.key");
 const tlsEnabled = existsSync(tlsCertPath) && existsSync(tlsKeyPath);
@@ -62,6 +62,52 @@ const excelTransport = "platform-only";
 const maxPromptChars = Number(process.env.HERMES_EXCEL_MAX_PROMPT_CHARS || 180000);
 const doclingBaseUrl = (process.env.HERMES_EXCEL_DOCLING_URL || "http://127.0.0.1:8200").replace(/\/$/, "");
 const doclingTimeoutMs = Number(process.env.HERMES_EXCEL_DOCLING_TIMEOUT_MS || 300000);
+// Which parser API the docling endpoint speaks:
+//   docling-serve (default) — /v1/convert/source/async with inline base64 upload
+//   onyx-jobs — the fleet "Onyx Docling Parser" (/jobs): it reads sources from ITS
+//   OWN filesystem. When DOCLING_SSH is set, the bridge streams each upload over
+//   key-authenticated ssh into DOCLING_REMOTE_PREFIX/<name> on the parser host
+//   (no SMB mount or stored credentials needed); otherwise DOCLING_REMOTE_PREFIX
+//   is assumed to be a shared-filesystem view of DOCLING_STAGING_DIR.
+//   Results come back inline as markdown; no shared read-back path is needed.
+//   local — no parser service at all: spawn LOCAL_EXTRACT_CMD LOCAL_EXTRACT_SCRIPT
+//   <file> per attachment (PDF text layer / Tesseract OCR on this host) and read
+//   JSON {ok, text, method} from stdout. DOCLING_URL is unused in this mode.
+const doclingApi = (process.env.HERMES_EXCEL_DOCLING_API || "docling-serve").toLowerCase();
+const doclingStagingDir = process.env.HERMES_EXCEL_DOCLING_STAGING_DIR || "";
+const doclingRemotePrefix = (process.env.HERMES_EXCEL_DOCLING_REMOTE_PREFIX || "").replace(/\/$/, "");
+const doclingSsh = process.env.HERMES_EXCEL_DOCLING_SSH || "";
+const doclingSshPort = process.env.HERMES_EXCEL_DOCLING_SSH_PORT || "22";
+const doclingSshBin = process.env.HERMES_EXCEL_DOCLING_SSH_BIN || "ssh";
+const localExtractCmd = process.env.HERMES_EXCEL_LOCAL_EXTRACT_CMD || "";
+const localExtractScript = process.env.HERMES_EXCEL_LOCAL_EXTRACT_SCRIPT || "";
+
+// Run ssh with bytes piped to stdin; resolves on exit 0, rejects otherwise.
+function sshRun(remoteCommand, stdinBytes, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(doclingSshBin, [
+      "-p", doclingSshPort, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+      doclingSsh, remoteCommand,
+    ], { stdio: ["pipe", "ignore", "pipe"] });
+    let stderr = "";
+    const timer = setTimeout(() => { child.kill(); reject(new Error("ssh transfer to parser host timed out")); }, timeoutMs);
+    child.stderr.on("data", (d) => { stderr += d; });
+    // A failed spawn (or early exit) surfaces as stream errors on stdin; without a
+    // handler those are uncaught exceptions that kill the whole bridge process.
+    child.stdin.on("error", () => {});
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`ssh to parser host failed (exit ${code}): ${stderr.slice(0, 300)}`));
+    });
+    try {
+      if (stdinBytes) child.stdin.end(stdinBytes); else child.stdin.end();
+    } catch {
+      // rejection comes from the error/close handlers above
+    }
+  });
+}
 // How Docling shares files with this bridge: wsl (translate paths + read via wsl cat),
 // native (same filesystem), docker (same as native, mounted). Default wsl on Windows.
 const doclingMode = (process.env.HERMES_EXCEL_DOCLING_MODE || (process.platform === "win32" ? "wsl" : "native")).toLowerCase();
@@ -168,7 +214,15 @@ function corsHeaders(origin) {
 }
 
 // Reject a foreign Host header (DNS-rebinding): the bridge only answers to its own
-// loopback names on the configured port.
+// loopback names on the configured port, plus any explicitly allowed LAN names
+// (HERMES_EXCEL_ALLOWED_HOSTS, comma list, with or without :port).
+const extraAllowedHosts = new Set(
+  (process.env.HERMES_EXCEL_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .flatMap((h) => [h, `${h}:${port}`])
+);
 function hostOk(req) {
   const host = String(req.headers.host || "").toLowerCase();
   return (
@@ -177,7 +231,8 @@ function hostOk(req) {
     host === "localhost" ||
     host === "127.0.0.1" ||
     host === "[::1]" ||
-    host === `[::1]:${port}`
+    host === `[::1]:${port}` ||
+    extraAllowedHosts.has(host)
   );
 }
 
@@ -237,10 +292,21 @@ async function healthStatus() {
   }
 
   try {
-    const response = await fetch(`${doclingBaseUrl}/health`, { signal: AbortSignal.timeout(3000) });
-    status.docling = { ok: response.ok, status: response.status };
-    status.attachment_parser_ready = response.ok;
-    if (response.ok) status.docling.detail = await response.json().catch(() => null);
+    if (doclingApi === "local") {
+      // No parser service in local mode — probe the extractor CLI itself.
+      const { stdout } = await execFileAsync(localExtractCmd, [localExtractScript, "--health"], {
+        windowsHide: true,
+        timeout: 10000,
+      });
+      const detail = JSON.parse(stdout);
+      status.docling = { ok: detail?.ok === true, mode: "local", detail };
+      status.attachment_parser_ready = detail?.ok === true;
+    } else {
+      const response = await fetch(`${doclingBaseUrl}${doclingApi === "onyx-jobs" ? "/healthz" : "/health"}`, { signal: AbortSignal.timeout(3000) });
+      status.docling = { ok: response.ok, status: response.status };
+      status.attachment_parser_ready = response.ok;
+      if (response.ok) status.docling.detail = await response.json().catch(() => null);
+    }
   } catch (error) {
     status.docling = { ok: false, error: error.message };
   }
@@ -706,7 +772,91 @@ function doclingTextFromResponse(result) {
   return result?.markdown || result?.text || document.md_content || document.text_content || "";
 }
 
+// Onyx jobs API: stage the file where the parser host can read it, submit the
+// parser-side path, poll the job, take the markdown inline, clean up the stage.
+async function extractWithOnyxJobs(filePath, signal, fileName, bytes) {
+  if (!doclingRemotePrefix || (!doclingSsh && !doclingStagingDir)) {
+    throw new Error("onyx-jobs parser API requires HERMES_EXCEL_DOCLING_REMOTE_PREFIX plus HERMES_EXCEL_DOCLING_SSH or HERMES_EXCEL_DOCLING_STAGING_DIR");
+  }
+  const content = bytes || await readFile(filePath);
+  const safeName = String(fileName || path.basename(filePath)).replace(/[^a-zA-Z0-9._-]/g, "_").slice(-100);
+  const stagedName = `${randomUUID()}-${safeName}`;
+  const remotePath = `${doclingRemotePrefix}/${stagedName}`;
+  let stagedPath = "";
+  if (doclingSsh) {
+    // stagedName is sanitized to [A-Za-z0-9._-], safe to embed in the remote command.
+    await sshRun(`mkdir -p '${doclingRemotePrefix}' && cat > '${remotePath}'`, content);
+  } else {
+    stagedPath = path.join(doclingStagingDir, stagedName);
+    await mkdir(doclingStagingDir, { recursive: true });
+    await writeFile(stagedPath, content);
+  }
+  try {
+    const created = await fetchJsonWithTimeout(
+      `${doclingBaseUrl}/jobs`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ source_path: remotePath }),
+        signal,
+      },
+      30000,
+    );
+    const jobId = created?.id;
+    if (jobId === undefined || jobId === null) throw new Error("Onyx parser did not return a job id");
+    const started = Date.now();
+    let job = created;
+    while (Date.now() - started < doclingTimeoutMs) {
+      if (signal?.aborted) throw new Error("client disconnected during Docling parse");
+      await sleep(1500, signal);
+      job = await fetchJsonWithTimeout(`${doclingBaseUrl}/jobs/${encodeURIComponent(jobId)}`, { signal }, 30000);
+      if (job.status === "done") break;
+      if (job.status === "failed") {
+        const detail = String(job.error || "internal processing error").split("\n").slice(-3).join(" ").slice(0, 300);
+        throw new Error(`Docling conversion failed: ${detail}`);
+      }
+    }
+    if (job.status !== "done") {
+      throw new Error(`Docling timed out after ${Math.round(doclingTimeoutMs / 1000)}s`);
+    }
+    const result = await fetchJsonWithTimeout(
+      `${doclingBaseUrl}/jobs/${encodeURIComponent(jobId)}/result`, { signal }, 60000);
+    const text = doclingTextFromResponse(result);
+    if (!text) throw new Error("Docling conversion returned no markdown");
+    return truncateText(text);
+  } finally {
+    if (doclingSsh) await sshRun(`rm -f '${remotePath}'`, null, 30000).catch(() => {});
+    if (stagedPath) await unlink(stagedPath).catch(() => {});
+  }
+}
+
+// Local mode: no parser service. Spawn the extractor CLI (bearden-writer venv
+// python + local_extract.py) on the already-saved upload and take JSON from
+// stdout. The extractor never touches the Bearden intake DB or client roster.
+async function extractWithLocalCli(filePath, signal) {
+  if (!localExtractCmd || !localExtractScript) {
+    throw new Error("local parser API requires HERMES_EXCEL_LOCAL_EXTRACT_CMD and HERMES_EXCEL_LOCAL_EXTRACT_SCRIPT");
+  }
+  const { stdout } = await execFileAsync(localExtractCmd, [localExtractScript, path.resolve(filePath)], {
+    maxBuffer: maxExtractedCharsPerFile * 4,
+    windowsHide: true,
+    timeout: doclingTimeoutMs,
+    signal,
+  });
+  let result;
+  try {
+    result = JSON.parse(stdout);
+  } catch {
+    throw new Error(`local extractor returned non-JSON output: ${String(stdout).slice(0, 120)}`);
+  }
+  if (!result?.ok) throw new Error(`local extraction failed: ${result?.error || "unknown error"}`);
+  if (!result.text) throw new Error("local extraction returned no text");
+  return truncateText(result.text);
+}
+
 async function extractWithDocling(filePath, signal, fileName = path.basename(filePath), bytes = null) {
+  if (doclingApi === "local") return extractWithLocalCli(filePath, signal);
+  if (doclingApi === "onyx-jobs") return extractWithOnyxJobs(filePath, signal, fileName, bytes);
   const content = bytes || await readFile(filePath);
   const created = await fetchJsonWithTimeout(
     `${doclingBaseUrl}/v1/convert/source/async`,
@@ -832,7 +982,7 @@ async function prepareAttachedFiles(files = [], signal) {
       try {
         context.extracted_text = await extractWithDocling(out, signal, file.name || safeName, bytes);
         context.extraction_status = "parsed";
-        context.extraction_method = "docling";
+        context.extraction_method = doclingApi === "local" ? "local-ocr" : "docling";
       } catch (error) {
         const basicPdfText = extensionOf(file.name) === ".pdf" ? extractBasicPdfText(bytes) : null;
         if (basicPdfText) {
@@ -2296,6 +2446,26 @@ if (isMainModule) {
         }
 
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
+        if (req.method === "GET" && apiPath === "/api/activity") {
+          // Live agent-activity relay: the task pane polls this while a chat
+          // request is in flight; we proxy to the Excel adapter's draft buffer.
+          const requestId = String(new URL(req.url, "http://x").searchParams.get("request_id") || "");
+          if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(requestId)) {
+            return send(res, 400, { error: "invalid request_id" }, undefined, origin);
+          }
+          try {
+            const activityUrl = new URL(excelAdapterUrl.replace(/\/ingest$/, "/activity"));
+            activityUrl.searchParams.set("request_id", requestId);
+            const upstream = await fetch(activityUrl, {
+              headers: excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {},
+              signal: AbortSignal.timeout(3000),
+            });
+            if (!upstream.ok) throw new Error(`adapter HTTP ${upstream.status}`);
+            return send(res, 200, await upstream.json(), undefined, origin);
+          } catch {
+            return send(res, 200, { ok: false }, undefined, origin);
+          }
+        }
         // `await` is load-bearing: without it a rejection inside a handler
         // (e.g. an aborted upload stream) escapes this try/catch and crashes
         // the process as an unhandled rejection.
@@ -2310,7 +2480,9 @@ if (isMainModule) {
       ? https.createServer({ key: readFileSync(tlsKeyPath), cert: readFileSync(tlsCertPath) }, requestHandler)
       : http.createServer(requestHandler);
 
-    server.listen(port, "127.0.0.1", () => {
+    // Loopback-only by default; HERMES_EXCEL_BIND=0.0.0.0 opens the bridge to the
+    // LAN (host allowlist + origin checks + bridge token still apply).
+    server.listen(port, process.env.HERMES_EXCEL_BIND || "127.0.0.1", () => {
       console.log(`Hermes Excel add-in running at ${tlsEnabled ? "https" : "http"}://localhost:${port}`);
       console.log(`Manifest: ${path.join(root, "manifest.xml")}`);
       console.log(`Hermes backend endpoint: ${llmBaseUrl}`);
