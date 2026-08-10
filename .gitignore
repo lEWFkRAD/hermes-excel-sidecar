@@ -4,8 +4,9 @@ data/
 *.log
 
 __pycache__/
-*.pyc
+*.py[cod]
 node_modules/
+dist/
 .pytest_cache/
 
 # Per-machine launchers and generated supervisor shims.
@@ -21,4 +22,3 @@ service/bridge-service.vbs
 *.crt
 .bridge-token
 .ingest-token
-

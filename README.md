@@ -1,12 +1,15 @@
 # Hermes for Excel
 
 [![CI](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml)
+[![Release](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/release.yml/badge.svg)](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/release.yml)
 
 This is an independently installable Hermes plugin. It does not require an
 upstream Hermes PR to merge. The original integration lineage remains at
 [NousResearch/hermes-agent#44356](https://github.com/NousResearch/hermes-agent/pull/44356).
 Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and
-[SECURITY.md](SECURITY.md) before contributing or deploying.
+[SECURITY.md](SECURITY.md) before contributing or deploying. Release history and
+the maintainer procedure live in [CHANGELOG.md](CHANGELOG.md) and
+[RELEASING.md](RELEASING.md).
 
 This standalone repository is the release source of truth. The historical
 `apps/excel` copy inside a Hermes monorepo is not a packaging input and must
@@ -52,7 +55,7 @@ schema, the read loop, and the formula-anchoring contract.
 ## Requirements
 
 - Excel (desktop) on Windows or macOS with add-in sideloading allowed.
-- Node.js 18+ on PATH.
+- Node.js 20+ on PATH (matching `package.json` and the supported CI matrix).
 - A running Hermes gateway with the `api_server` platform enabled on
   `http://127.0.0.1:8642/v1` (`hermes gateway run`). The key is read automatically
   from the Hermes `config.yaml` for your platform (Windows `%LOCALAPPDATA%\hermes`,
@@ -182,7 +185,8 @@ node broker\smoke.mjs                  # live regression + security cases agains
 ```
 
 The root `package.json` supplies validation commands only; the bridge retains
-zero runtime npm dependencies.
+zero runtime npm dependencies. Run the same required checks as CI with
+`npm run validate`.
 
 ## Notes
 

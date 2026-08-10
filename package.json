@@ -9,9 +9,11 @@
     "test": "node --test broker/server.test.mjs",
     "smoke": "node broker/smoke.mjs",
     "check:install": "powershell -NoProfile -ExecutionPolicy Bypass -File install/check.ps1",
-    "check:syntax": "node --check broker/server.mjs && node --check broker/formula-rebase.mjs && node --check taskpane.js && python -m compileall -q __init__.py cli.py",
-    "check:plugin": "node --test test/plugin-package.test.mjs && python -m unittest discover -s test -p test_*.py",
-    "verify": "npm test && npm run check:syntax && npm run check:install && npm run check:plugin",
+    "check:syntax": "node --check broker/server.mjs && node --check broker/formula-rebase.mjs && node --check taskpane.js && node --check scripts/verify-release-ancestry.mjs && node --check scripts/verify-release-metadata.mjs && python -m compileall -q __init__.py adapter.py cli.py excel_policy.py excel_runtime.py excel_tool.py broker/local_extract.py scripts/check_dco.py",
+    "check:plugin": "node --test test/plugin-package.test.mjs test/release-ancestry.test.mjs && python -m unittest discover -s test -p test_*.py",
+    "check:release": "node scripts/verify-release-metadata.mjs",
+    "validate": "npm test && npm run check:syntax && npm run check:plugin && npm run check:install && npm run check:release",
+    "verify": "npm run validate",
     "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File install/deploy.ps1"
   },
   "engines": {

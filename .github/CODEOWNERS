@@ -1,0 +1,11 @@
+# Security-sensitive surfaces always request maintainer review.
+* @lEWFkRAD
+/.github/ @lEWFkRAD
+/broker/ @lEWFkRAD
+/install/ @lEWFkRAD
+/excel_policy.py @lEWFkRAD
+/excel_runtime.py @lEWFkRAD
+/excel_tool.py @lEWFkRAD
+/manifest.xml @lEWFkRAD
+/plugin.yaml @lEWFkRAD
+/SECURITY.md @lEWFkRAD
