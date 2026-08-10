@@ -24,7 +24,7 @@ and `HKCU`.
 powershell -ExecutionPolicy Bypass -File install\apply.ps1
 ```
 
-By default the installer selects the first free port starting at `8787` and
+By default the installer selects the first free port starting at `8788` and
 rewrites the installed manifest to match. Add `-Port 8790` to require a
 specific port (the install fails if it is occupied), or
 `-SkipSideload` to skip the Excel developer-catalog registration, or
@@ -50,7 +50,7 @@ group.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `PORT` | `8787` | Bridge port. |
+| `PORT` | `8788` | Bridge port. |
 | `HERMES_EXCEL_DATA_DIR` | `%LOCALAPPDATA%\hermes\excel-addin\data` | Writable per-user data root for uploads/exports/logs, **outside** the served web root. |
 | `HERMES_EXCEL_BRIDGE_TOKEN` | generated per install | Random session token the bridge requires on `/api/*` and the pane sends. Persisted to `data\.bridge-token` (user-only ACL) and the `User` env scope. |
 | `HERMES_EXCEL_INGEST_TOKEN` | generated per install | Separate 64-hex secret shared only by the bridge and Hermes Excel platform adapter. Persisted in `data\.ingest-token` with current-user/SYSTEM ACLs. |

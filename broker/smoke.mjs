@@ -1,8 +1,8 @@
 // Live smoke test for the Hermes for Excel bridge. Run after Hermes updates.
-//   node broker/smoke.mjs        (bridge must be running on :8787)
+//   node broker/smoke.mjs        (bridge must be running on :8788)
 // Exits non-zero if any assertion fails.
 
-const BASE_URL = process.env.HERMES_EXCEL_BRIDGE_URL || "https://localhost:8787";
+const BASE_URL = process.env.HERMES_EXCEL_BRIDGE_URL || "https://localhost:8788";
 const TOKEN = process.env.HERMES_EXCEL_BRIDGE_TOKEN || "";
 const TIMEOUT_MS = 120000;
 
@@ -84,7 +84,12 @@ async function testSimpleA1(hermesOk) {
     const res = await post("/api/chat", tableBody("Sheet1!A1"));
     if (!hermesOk) {
       assert("simple.fallback", res.source === "fallback" && res.actions.length === 0, JSON.stringify(res.actions));
-      return;
+      return false;
+    }
+    if (res.source !== "hermes-platform") {
+      assert("simple.model-ready", false, `source=${res.source}; adapter is reachable but its configured model/provider is unavailable`);
+      assert("simple.fail-closed", res.source === "fallback" && res.actions.length === 0, JSON.stringify(res.actions));
+      return false;
     }
     assert("simple.source", res.source === "hermes-platform", `got ${res.source}`);
     const action = res.actions.find((a) => a.type === "create_sheet" || a.type === "write_cells");
@@ -92,19 +97,18 @@ async function testSimpleA1(hermesOk) {
     const flat = res.actions.flatMap((a) => a.values || []).flat().map(String).join(" ");
     const ok = (flat.includes("2.5") || flat.includes("2.50")) && flat.includes("1.25") && (flat.includes("0.1") || flat.includes("0.10"));
     assert("simple.numbers", ok, `numbers missing in: ${flat.slice(0, 200)}`);
+    return true;
   } catch (error) {
     assert("simple.request", false, error.message);
+    return false;
   }
 }
 
 async function testAnchorH23(hermesOk) {
   console.log("\n--- 3. anchor H23 (formula-rebasing regression) ---");
+  if (!hermesOk) return skip("anchor.skip", "configured model/provider unavailable; fail-closed behavior was checked in the simple case");
   try {
     const res = await post("/api/chat", tableBody("Sheet1!H23"));
-    if (!hermesOk) {
-      assert("anchor.fallback", res.source === "fallback", `got ${res.source}`);
-      return;
-    }
     const action = res.actions.find((a) => a.type === "write_cells" || a.type === "create_sheet");
     if (!action) return assert("anchor.action", false, "no relevant action");
     if (action.type === "create_sheet") {
@@ -132,12 +136,9 @@ async function testAnchorH23(hermesOk) {
 
 async function testMultiturn(hermesOk) {
   console.log("\n--- 4. multi-turn history ---");
+  if (!hermesOk) return skip("mt.skip", "configured model/provider unavailable");
   try {
     const res1 = await post("/api/chat", tableBody("Sheet1!A1"));
-    if (!hermesOk) {
-      assert("mt.fallback", res1.source === "fallback", `got ${res1.source}`);
-      return;
-    }
     assert("mt.turn1", res1.source === "hermes-platform", `got ${res1.source}`);
     const res2 = await post("/api/chat", {
       prompt: "add a totals row with a SUM for the last column",
@@ -242,11 +243,11 @@ function testHonestyNote() {
 
 async function main() {
   console.log(`Hermes for Excel smoke test → ${BASE_URL}`);
-  const hermesOk = await testHealth();
-  await testSimpleA1(hermesOk);
-  await testAnchorH23(hermesOk);
-  await testMultiturn(hermesOk);
-  await testMediumBuild(hermesOk);
+  const adapterOk = await testHealth();
+  const modelOk = await testSimpleA1(adapterOk);
+  await testAnchorH23(modelOk);
+  await testMultiturn(modelOk);
+  await testMediumBuild(modelOk);
   await testExport();
   await testSecurity();
   testHonestyNote();

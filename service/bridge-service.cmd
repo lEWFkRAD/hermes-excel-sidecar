@@ -34,6 +34,42 @@ if not exist "%RUN_BRIDGE%" (
 )
 if not exist "%HERMES_EXCEL_DATA_DIR%" mkdir "%HERMES_EXCEL_DATA_DIR%" 2>nul
 
+REM --- Singleton guard -----------------------------------------------------
+REM Task Scheduler can leave an old cmd supervisor orphaned when its wscript
+REM parent is stopped. Two supervisors then alternate killing each other's
+REM node process. Own an atomic lock directory and record this cmd.exe PID;
+REM a new launch exits when the owner is alive, or reclaims a stale lock.
+set "SUPERVISOR_LOCK=%HERMES_EXCEL_DATA_DIR%\bridge-supervisor.lock"
+set "SUPERVISOR_PID="
+for /f "usebackq tokens=*" %%P in (`powershell -NoProfile -Command "$ps=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID); $forCmd=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $ps.ParentProcessId); $forCmd.ParentProcessId"`) do set "SUPERVISOR_PID=%%P"
+if not defined SUPERVISOR_PID (
+  echo [bridge-service] ERROR: could not determine supervisor PID
+  exit /b 1
+)
+
+2>nul mkdir "%SUPERVISOR_LOCK%"
+if not errorlevel 1 goto lock_acquired
+
+set "EXISTING_PID="
+if exist "%SUPERVISOR_LOCK%\owner.pid" set /p EXISTING_PID=<"%SUPERVISOR_LOCK%\owner.pid"
+if defined EXISTING_PID (
+  powershell -NoProfile -Command "$p=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $env:EXISTING_PID) -ErrorAction SilentlyContinue; if ($p -and $p.Name -eq 'cmd.exe' -and $p.CommandLine -like '*bridge-service.cmd*') { exit 0 }; exit 1"
+  if not errorlevel 1 (
+    echo [bridge-service] Supervisor PID !EXISTING_PID! already owns the lock; exiting duplicate.
+    exit /b 0
+  )
+)
+
+rmdir /s /q "%SUPERVISOR_LOCK%" 2>nul
+2>nul mkdir "%SUPERVISOR_LOCK%"
+if errorlevel 1 (
+  echo [bridge-service] ERROR: could not reclaim stale supervisor lock
+  exit /b 1
+)
+
+:lock_acquired
+>"%SUPERVISOR_LOCK%\owner.pid" echo !SUPERVISOR_PID!
+
 call :log "supervisor starting (install=%INSTALL_DIR%)"
 
 set "BACKOFF=%HEALTHY_BACKOFF_SECONDS%"

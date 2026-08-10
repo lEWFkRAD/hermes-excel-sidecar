@@ -32,7 +32,7 @@
 param(
   [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'hermes\excel-addin'),
   [string] $DataDir    = (Join-Path $env:LOCALAPPDATA 'hermes\excel-addin\data'),
-  [int]    $Port       = 8787,
+  [int]    $Port       = 8788,
   [switch] $Unregister
 )
 

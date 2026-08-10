@@ -32,7 +32,13 @@ const state = {
   // Default ON: workbook changes are held for explicit Apply unless the user
   // persistently opts out. Restored from localStorage in Office.onReady so the
   // safe state survives pane reloads.
-  reviewMode: true,
+  // Default off (2026-08-04, Jeff): apply immediately; the checkbox re-enables staging.
+  reviewMode: false,
+  // Live-activity relay: the in-flight request id and the freshest streamed
+  // draft line from Hermes, shown in place of the canned progress stages.
+  activeRequestId: null,
+  activityTimer: null,
+  liveActivity: null,
 };
 
 function randomId(prefix) {
@@ -53,12 +59,36 @@ function consumePendingProposal(proposalId) {
   return true;
 }
 
+// Formatting/layout actions that may ride through review mode without cell-level
+// preconditions: they cannot destroy cell contents, so the guarded write path
+// stays intact and these apply afterwards as announced non-undoable steps
+// (same contract review-off mode already gives them). Destructive or
+// cell-shifting actions (insert/delete/sort/clear/merge/delete_sheet) stay
+// blocked in review mode because they can move or erase data the preconditions
+// never captured.
+const REVIEW_PASSTHROUGH_ACTIONS = new Set([
+  "format_cells",
+  "conditional_format",
+  "set_column_width",
+  "set_row_height",
+  "freeze_panes",
+  "unfreeze_panes",
+  "autofit",
+  "unmerge_cells",
+  "rename_sheet",
+]);
+
 async function bindProposalToWorkbook(result) {
   const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
-  const unsupported = actions.filter((action) => action && !["write_cells", "create_sheet", "export"].includes(action.type));
+  const unsupported = actions.filter(
+    (action) =>
+      action &&
+      !["write_cells", "create_sheet", "export"].includes(action.type) &&
+      !REVIEW_PASSTHROUGH_ACTIONS.has(action.type),
+  );
   if (unsupported.length) {
     throw new Error(
-      `Safe review preconditions are not implemented yet for: ${unsupported.map((a) => a.type).join(", ")}. No changes were applied.`,
+      `Review mode can't safely apply: ${unsupported.map((a) => a.type).join(", ")}. No changes were applied. Uncheck "Review changes before applying" to run these, or ask Hermes to avoid them.`,
     );
   }
   return Excel.run(async (context) => {
@@ -69,7 +99,7 @@ async function bindProposalToWorkbook(result) {
     const requestedSheetNames = new Set();
     const writeBindings = [];
     for (const action of actions) {
-      if (!action || action.type === "export") {
+      if (!action || action.type === "export" || REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) {
         resolvedActions.push(action);
         continue;
       }
@@ -95,7 +125,7 @@ async function bindProposalToWorkbook(result) {
     await context.sync();
     const sheetIdentity = sheets.items.map((sheet) => ({ id: sheet.id, name: sheet.name }));
     for (const { action, target, actionIndex } of writeBindings) {
-      resolvedActions[actionIndex] = { ...action, start_cell: target.address, auto_format: false, review_bound: true };
+      resolvedActions[actionIndex] = { ...action, start_cell: target.address, auto_format: action.auto_format === true, review_bound: true };
       preconditions.push({
         type: "write_cells",
         address: target.address,
@@ -192,15 +222,25 @@ async function applyReviewedProposal(proposal) {
     const createdSheets = [];
     const statuses = [];
     const seenWriteAddresses = new Set();
+    // When the model styled the output itself (format_cells / conditional_format),
+    // respect its choices; otherwise default-style writes that land on previously
+    // empty cells so reviewed output matches review-off presentation quality.
+    const modelStyledProposal = (proposal.result.actions || []).some(
+      (action) => action && (action.type === "format_cells" || action.type === "conditional_format"),
+    );
     for (const action of proposal.result.actions || []) {
-      if (!action || action.type === "export") continue;
+      if (!action || action.type === "export" || REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) continue;
       const values = normalizeMatrix(action.values || action.table);
       if (action.type === "write_cells") {
         const match = writeChecks.find((item) => item.precondition.address === action.start_cell);
         if (!match) throw new Error(`Missing bound precondition for ${action.start_cell}.`);
         if (seenWriteAddresses.has(match.range.address)) throw new Error(`Overlapping duplicate reviewed write: ${match.range.address}.`);
         seenWriteAddresses.add(match.range.address);
+        const columnCount = Math.max(...values.map((row) => row.length));
+        const wasEmpty = (match.precondition.formulas || []).every((row) => row.every((cell) => cell === "" || cell == null));
+        const styleIt = action.auto_format === true || (!modelStyledProposal && wasEmpty && columnCount >= 2);
         undoWrites.push({ address: match.range.address, worksheetId: match.range.worksheet.id, range: match.range,
+          rows: values.length, cols: columnCount, wasEmpty, styleIt,
           before: { formulas: match.range.formulas, numberFormat: match.range.numberFormat } });
         match.range.values = values;
         statuses.push(`Wrote ${values.length} row(s) to ${match.range.address}.`);
@@ -209,7 +249,7 @@ async function applyReviewedProposal(proposal) {
         const target = sheet.getRange("A1").getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
         target.values = values;
         statuses.push(`Created ${action.name} and wrote ${values.length} row(s).`);
-        createdSheets.push(action.name);
+        createdSheets.push({ name: action.name, sheet, target, values });
       }
     }
     try {
@@ -220,7 +260,7 @@ async function applyReviewedProposal(proposal) {
           write.range.formulas = write.before.formulas;
           write.range.numberFormat = write.before.numberFormat;
         }
-        const created = createdSheets.map((name) => sheets.getItemOrNullObject(name));
+        const created = createdSheets.map((entry) => sheets.getItemOrNullObject(entry.name));
         for (const sheet of created) sheet.load("isNullObject");
         await context.sync();
         for (const sheet of created) if (!sheet.isNullObject) sheet.delete();
@@ -230,6 +270,31 @@ async function applyReviewedProposal(proposal) {
       }
       throw new Error(`Apply failed; the reviewed targets were restored (${commitError.message}).`);
     }
+    // Presentation pass — runs only after every reviewed write has committed, so
+    // a styling failure can never cost data. Parity with review-off mode: new
+    // sheets get the professional table format; in-place writes get borders +
+    // header styling when they landed on empty cells (or the model asked).
+    try {
+      for (const write of undoWrites) {
+        if (write.styleIt) {
+          styleRange(write.range, write.rows, write.cols, { borders: "thin", auto_fit: true });
+          if (write.wasEmpty && write.rows >= 1) {
+            const header = write.range.getCell(0, 0).getResizedRange(0, write.cols - 1);
+            styleRange(header, 1, write.cols, { style: "header", auto_fit: true });
+          }
+        } else {
+          write.range.format.autofitColumns();
+          write.range.format.autofitRows();
+        }
+      }
+      for (const created of createdSheets) {
+        applyProfessionalTableFormat(created.sheet, created.target, created.values);
+        created.sheet.activate();
+      }
+      if (undoWrites.length || createdSheets.length) await context.sync();
+    } catch (styleError) {
+      statuses.push(`Presentation formatting failed (${styleError.message}) — the written data itself is fine.`);
+    }
     for (const write of undoWrites) {
       write.range.load(["formulas", "numberFormat"]);
     }
@@ -237,18 +302,37 @@ async function applyReviewedProposal(proposal) {
       await context.sync();
       state.undoStack.push({ kind: "reviewed_change_set", writes: undoWrites.map((write) => ({
         address: write.address, worksheetId: write.worksheetId, before: write.before,
+        formatted: write.styleIt === true,
         after: { formulas: write.range.formulas, numberFormat: write.range.numberFormat },
       })) });
     }
-    for (const name of createdSheets) {
-      state.undoStack.push({ kind: "non_undoable", type: `created sheet ${name}; delete it manually if unwanted` });
+    for (const entry of createdSheets) {
+      state.undoStack.push({ kind: "non_undoable", type: `created sheet ${entry.name}; delete it manually if unwanted` });
     }
     while (state.undoStack.length > 10) state.undoStack.shift();
     return statuses;
   });
+  // Passthrough formatting/layout steps run only after every guarded write has
+  // committed, in proposal order. One failed step reports and moves on, matching
+  // review-off behavior — the reviewed writes above are already safely applied.
+  let passthroughApplied = false;
   for (const action of proposal.result.actions || []) {
-    if (action?.type === "export") statusLines.push(await exportAction(action));
+    if (!action) continue;
+    if (action.type === "export") {
+      statusLines.push(await exportAction(action));
+      continue;
+    }
+    if (!REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) continue;
+    try {
+      if (action.type === "format_cells") statusLines.push(await formatCellsAction(action));
+      else if (action.type === "conditional_format") statusLines.push(await conditionalFormatAction(action));
+      else if (STRUCTURAL_ACTIONS[action.type]) statusLines.push(await STRUCTURAL_ACTIONS[action.type](action));
+      passthroughApplied = true;
+    } catch (error) {
+      statusLines.push(`One step failed (${action.type}): ${error.message} — other changes were still applied.`);
+    }
   }
+  if (passthroughApplied) pushNonUndoable("formatting / layout change");
   return statusLines;
 }
 
@@ -375,20 +459,61 @@ function startWorkIndicator(filesToSend) {
   setWorkStage(stageForElapsed(0));
   clearInterval(state.workTimer);
   state.workTimer = setInterval(() => {
+    // Fresh streamed activity from Hermes beats the canned stage text; fall
+    // back to the elapsed-based stages when the stream goes quiet.
+    const live = state.liveActivity;
+    if (live && Date.now() - live.at < 8000) {
+      setWorkStage(live.text);
+      return;
+    }
     const elapsedSeconds = Math.floor((Date.now() - state.workStartedAt) / 1000);
     setWorkStage(stageForElapsed(elapsedSeconds));
   }, 1000);
+  clearInterval(state.activityTimer);
+  state.activityTimer = setInterval(pollActivity, 1500);
 }
 
 function stopWorkIndicator(finalStatus = "Ready") {
   clearInterval(state.workTimer);
   state.workTimer = null;
+  clearInterval(state.activityTimer);
+  state.activityTimer = null;
+  state.activeRequestId = null;
+  state.liveActivity = null;
   state.workStartedAt = 0;
   state.workStages = [];
   els.workIndicator.hidden = true;
   if (els.cancelButton) els.cancelButton.hidden = true;
   els.sendButton.disabled = false;
   setStatus(finalStatus);
+}
+
+let activityPollBusy = false;
+async function pollActivity() {
+  if (activityPollBusy || !state.activeRequestId) return;
+  activityPollBusy = true;
+  const requestId = state.activeRequestId;
+  try {
+    for (const brokerUrl of brokerUrls) {
+      try {
+        const response = await fetch(
+          `${brokerUrl}/api/activity?request_id=${encodeURIComponent(requestId)}`,
+          { headers: bridgeHeaders(), signal: AbortSignal.timeout(3000) },
+        );
+        if (!response.ok) return;
+        const data = await response.json();
+        // Ignore replies that raced past this request's completion.
+        if (!data?.ok || !data.text || state.activeRequestId !== requestId) return;
+        const line = String(data.text).split("\n").map((part) => part.trim()).filter(Boolean).pop() || "";
+        if (line) {
+          state.liveActivity = { text: line.length > 120 ? `${line.slice(0, 120)}…` : line, at: Date.now() };
+        }
+        return;
+      } catch {}
+    }
+  } finally {
+    activityPollBusy = false;
+  }
 }
 
 async function checkBridgeHealth(showStatus = false) {
@@ -573,10 +698,13 @@ async function askHermes(prompt, filesToSend) {
 
   // The model may ask to read ranges before answering; loop up to 5 read rounds.
   for (let loopCount = 0; loopCount < 6; loopCount += 1) {
+    const requestId = randomId("excel-request");
+    state.activeRequestId = requestId;
+    state.liveActivity = null;
     try {
       response = await postChat(
         {
-          request_id: randomId("excel-request"),
+          request_id: requestId,
           workbook_id: state.workbookId,
           conversation_id: state.conversationId,
           prompt,
@@ -960,6 +1088,9 @@ async function undoLast() {
               stableMatrix(range.numberFormat) !== stableMatrix(write.after.numberFormat)) return false;
         }
         for (const { write, range } of checks) {
+          // Strip the presentation pass's fills/fonts/borders before restoring
+          // the prior content, mirroring the plain write_cells undo path.
+          if (write.formatted) range.clear(Excel.ClearApplyTo.formats);
           range.formulas = write.before.formulas;
           range.numberFormat = write.before.numberFormat;
         }
