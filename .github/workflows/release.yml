@@ -28,6 +28,12 @@ jobs:
         with:
           node-version: 20.x
           cache: npm
+      - name: Require tagged commit on main
+        shell: pwsh
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch origin/main" }
+          node scripts/verify-release-ancestry.mjs --tag "${{ github.ref_name }}" --main-ref refs/remotes/origin/main
       - run: npm ci --ignore-scripts
       - run: npm run validate
       - name: Verify tag and version sources

@@ -2,8 +2,9 @@
 
 Releases are built from immutable tags by `.github/workflows/release.yml`. The
 workflow validates the repository, builds and re-tests the exact plugin archive,
-attests its provenance, and then creates the GitHub Release. Do not upload a
-locally built replacement asset to an existing version.
+requires the dereferenced tag commit to be reachable from `origin/main`, attests
+its provenance, and then creates the GitHub Release. Do not upload a locally
+built replacement asset to an existing version.
 
 ## Prepare
 
@@ -20,8 +21,8 @@ locally built replacement asset to an existing version.
    npm run validate
    ```
 
-6. Open a pull request and merge only after the stable `CI / Required PR checks`
-   status passes. Confirm the release commit is on `main`.
+6. Open a pull request and merge only after the stable `Required PR checks`
+   status from the `CI` workflow passes. Confirm the release commit is on `main`.
 
 ## Tag
 

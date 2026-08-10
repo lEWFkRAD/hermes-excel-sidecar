@@ -19,7 +19,9 @@ concurrency:
 
 jobs:
   validate:
-    name: Validation (Node ${{ matrix.node-version }})
+    # Preserve the established check names while the ruleset migrates to the
+    # aggregate Required PR checks context.
+    name: Node ${{ matrix.node-version }}
     runs-on: windows-latest
     timeout-minutes: 15
     strategy:
@@ -129,7 +131,8 @@ jobs:
       - run: npm audit --omit=dev --audit-level=high
 
   required:
-    name: Required PR checks
+    # A manual or post-merge run must never emit the protected PR context.
+    name: ${{ github.event_name == 'pull_request' && 'Required PR checks' || 'CI summary' }}
     if: always()
     needs: [validate, package, dco, audit]
     runs-on: windows-latest
@@ -138,6 +141,7 @@ jobs:
       - name: Require every CI lane
         shell: pwsh
         env:
+          EVENT_NAME: ${{ github.event_name }}
           VALIDATE_RESULT: ${{ needs.validate.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
           DCO_RESULT: ${{ needs.dco.result }}
@@ -149,9 +153,12 @@ jobs:
             dco = $env:DCO_RESULT
             audit = $env:AUDIT_RESULT
           }
-          $failed = $results.GetEnumerator() | Where-Object {
-            $_.Value -notin @("success", "skipped")
+          $accepted = if ($env:EVENT_NAME -eq "pull_request") {
+            @("success")
+          } else {
+            @("success", "skipped")
           }
+          $failed = $results.GetEnumerator() | Where-Object { $_.Value -notin $accepted }
           if ($failed) {
             $summary = ($failed | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ", "
             throw "Required CI lanes failed: $summary"
