@@ -132,7 +132,7 @@ jobs:
 
   required:
     # A manual or post-merge run must never emit the protected PR context.
-    name: ${{ github.event_name == 'pull_request' && 'Required PR checks' || 'CI summary' }}
+    name: "${{ github.event_name == 'pull_request' && 'Required PR checks' || 'CI summary' }}"
     if: always()
     needs: [validate, package, dco, audit]
     runs-on: windows-latest
