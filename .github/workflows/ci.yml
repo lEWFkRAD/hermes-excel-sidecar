@@ -1,25 +1,159 @@
 name: CI
+
 on:
   push:
-    branches: [main, "agent/**", "feat/**", "fix/**", "ci/**", "docs/**", "test/**"]
+    branches: [main]
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+# Fork pull requests run untrusted code. Keep the token read-only and never use
+# pull_request_target or repository secrets in this workflow.
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Node ${{ matrix.node-version }}
+  validate:
+    name: Validation (Node ${{ matrix.node-version }})
     runs-on: windows-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         node-version: [20.x, 22.x]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
-      - run: npm test
-      - run: npm run check:syntax
-      - run: npm run check:plugin
-      - run: npm run check:install
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run validate
+
+  package:
+    name: Build and smoke-test plugin archive
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Verify release metadata
+        id: metadata
+        shell: pwsh
+        run: |
+          $version = (& node scripts/verify-release-metadata.mjs).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Release metadata validation failed" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Build plugin archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $artifact = "hermes-excel-sidecar-v${{ steps.metadata.outputs.version }}.zip"
+          git archive --format=zip --output="dist/$artifact" HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Plugin archive build failed" }
+          $digest = (Get-FileHash -LiteralPath "dist/$artifact" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $artifact" | Set-Content -LiteralPath "dist/$artifact.sha256" -Encoding ascii
+      - name: Smoke-test packaged plugin
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem -LiteralPath dist -Filter '*.zip' | Select-Object -First 1
+          if (-not $archive) { throw "Plugin archive was not built" }
+          $checksum = Get-Content -LiteralPath "$($archive.FullName).sha256" -Raw
+          $expected = ($checksum -split '\s+')[0]
+          $actual = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Plugin archive checksum mismatch" }
+          $smoke = Join-Path $env:RUNNER_TEMP "excel-sidecar-package-smoke"
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $smoke
+          Push-Location $smoke
+          try {
+            npm ci --ignore-scripts
+            npm run validate
+          } finally {
+            Pop-Location
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hermes-excel-sidecar-v${{ steps.metadata.outputs.version }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Verify every pull-request commit is signed off
+        run: >-
+          python scripts/check_dco.py
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
+
+  audit:
+    name: Dependency audit
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit --omit=dev --audit-level=high
+
+  required:
+    name: Required PR checks
+    if: always()
+    needs: [validate, package, dco, audit]
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI lane
+        shell: pwsh
+        env:
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          DCO_RESULT: ${{ needs.dco.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
+        run: |
+          $results = @{
+            validate = $env:VALIDATE_RESULT
+            package = $env:PACKAGE_RESULT
+            dco = $env:DCO_RESULT
+            audit = $env:AUDIT_RESULT
+          }
+          $failed = $results.GetEnumerator() | Where-Object {
+            $_.Value -notin @("success", "skipped")
+          }
+          if ($failed) {
+            $summary = ($failed | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ", "
+            throw "Required CI lanes failed: $summary"
+          }
+          $results.GetEnumerator() | Sort-Object Key | Format-Table -AutoSize

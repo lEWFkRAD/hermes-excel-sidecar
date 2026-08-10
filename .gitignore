@@ -3,6 +3,6 @@ exports/
 *.log
 
 __pycache__/
-*.pyc
+*.py[cod]
 node_modules/
-
+dist/

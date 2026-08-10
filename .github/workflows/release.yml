@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, attest, and publish
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run validate
+      - name: Verify tag and version sources
+        shell: pwsh
+        run: |
+          $version = (& node scripts/verify-release-metadata.mjs --tag "${{ github.ref_name }}").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Release metadata validation failed" }
+          "PLUGIN_VERSION=$version" >> $env:GITHUB_ENV
+          "ARTIFACT_NAME=hermes-excel-sidecar-v$version.zip" >> $env:GITHUB_ENV
+      - name: Build plugin archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          git archive --format=zip --output="dist/$env:ARTIFACT_NAME" HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Plugin archive build failed" }
+          $digest = (Get-FileHash -LiteralPath "dist/$env:ARTIFACT_NAME" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $env:ARTIFACT_NAME" | Set-Content -LiteralPath "dist/$env:ARTIFACT_NAME.sha256" -Encoding ascii
+      - name: Smoke-test packaged plugin
+        shell: pwsh
+        run: |
+          $archive = Join-Path $PWD "dist/$env:ARTIFACT_NAME"
+          if (-not (Test-Path -LiteralPath $archive)) { throw "Plugin archive was not built" }
+          $checksum = Get-Content -LiteralPath "$archive.sha256" -Raw
+          $expected = ($checksum -split '\s+')[0]
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Plugin archive checksum mismatch" }
+          $smoke = Join-Path $env:RUNNER_TEMP "excel-sidecar-release-smoke"
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $smoke
+          Push-Location $smoke
+          try {
+            npm ci --ignore-scripts
+            npm run validate
+          } finally {
+            Pop-Location
+          }
+      - name: Attest plugin archive provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*.zip
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifact = Join-Path $PWD "dist/$env:ARTIFACT_NAME"
+          $checksum = "$artifact.sha256"
+          gh release create "${{ github.ref_name }}" $artifact $checksum --verify-tag --title "Hermes Excel Sidecar ${{ github.ref_name }}" --notes-from-tag
