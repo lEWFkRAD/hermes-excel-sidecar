@@ -24,7 +24,7 @@
 
 .PARAMETER Port
   Bridge port. Use 0 (the default) to select the first available port starting
-  at 8787. An explicitly selected occupied port fails instead of silently
+  at 8788. An explicitly selected occupied port fails instead of silently
   accepting an unrelated service.
 
 .PARAMETER SkipSideload
@@ -63,7 +63,7 @@ $PreviousTaskWasDisabled = $HadPreviousTask -and $PreviousTask.State -eq 'Disabl
 $WefDevKey = 'HKCU:\Software\Microsoft\Office\16.0\WEF\Developer'
 $PreviousWef = Get-ItemProperty -LiteralPath $WefDevKey -Name 'HermesExcelAddinCatalog' -ErrorAction SilentlyContinue
 $HadPreviousSideload = $null -ne $PreviousWef
-$PreviousPort = 8787
+$PreviousPort = 8788
 if (Test-Path -LiteralPath (Join-Path $InstallDir 'run-bridge.cmd')) {
   $priorLauncher = Get-Content -LiteralPath (Join-Path $InstallDir 'run-bridge.cmd') -Raw
   if ($priorLauncher -match 'set "PORT=(\d+)"') { $PreviousPort = [int]$Matches[1] }
@@ -88,7 +88,7 @@ try {
     $PreviousExcelEnabled = $Matches[1] -eq 'true'
   }
 } catch { }
-$PreferredPort = 8787
+$PreferredPort = 8788
 # Items copied; uploads/exports/logs are deliberately excluded.
 $ExcludeDirs  = @('uploads', 'exports', 'node_modules', '.git')
 $ExcludeFiles = @('*.log')

@@ -1,8 +1,24 @@
 uploads/
 exports/
+data/
 *.log
 
 __pycache__/
 *.py[cod]
 node_modules/
 dist/
+.pytest_cache/
+
+# Per-machine launchers and generated supervisor shims.
+run-bridge.cmd
+run-bridge.vbs
+service/bridge-service.vbs
+
+# Credentials and local TLS material never belong in source control.
+.env
+*.key
+*.pem
+*.pfx
+*.crt
+.bridge-token
+.ingest-token

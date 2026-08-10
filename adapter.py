@@ -13,7 +13,15 @@ from typing import Any, Dict, Optional
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
-from .excel_runtime import capture_final, capture_final_for_conversation, close_request, get_request, open_request
+from .excel_runtime import (
+    capture_final,
+    capture_final_for_conversation,
+    close_request,
+    get_activity,
+    get_request,
+    open_request,
+    record_activity_for_conversation,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8794
@@ -42,6 +50,18 @@ class ExcelAdapter(BasePlatformAdapter):
         app = web.Application(client_max_size=2 * 1024 * 1024)
         app.router.add_post("/ingest", self._handle_ingest)
         app.router.add_post("/cancel", self._handle_cancel)
+        async def activity(request):
+            if not hmac.compare_digest(request.headers.get("X-Excel-Token", ""), self._token):
+                return web.json_response({"error": "unauthorized"}, status=401)
+            request_id = str(request.query.get("request_id", ""))
+            if not ID_RE.fullmatch(request_id):
+                return web.json_response({"error": "invalid request_id"}, status=400)
+            entry = get_activity(request_id)
+            if entry is None:
+                return web.json_response({"ok": True, "active": get_request(request_id) is not None})
+            return web.json_response({"ok": True, "active": True,
+                                      "seq": entry.get("seq", 0), "text": entry.get("text", "")})
+        app.router.add_get("/activity", activity)
         async def health(request):
             if not hmac.compare_digest(request.headers.get("X-Excel-Token", ""), self._token):
                 return web.json_response({"error": "unauthorized"}, status=401)
@@ -92,6 +112,18 @@ class ExcelAdapter(BasePlatformAdapter):
             self._runner = None
         self._running = False
 
+    def supports_draft_streaming(self, chat_type: Optional[str] = None,
+                                 metadata: Optional[Dict[str, Any]] = None) -> bool:
+        # Drafts land in the per-request activity buffer that the task pane
+        # polls, giving Excel the same live-activity feel as regular chat.
+        return True
+
+    async def send_draft(self, chat_id: str, draft_id: int, content: str,
+                         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        conversation_id = chat_id.removeprefix("excel:")
+        record_activity_for_conversation(conversation_id, content)
+        return SendResult(success=True, message_id=f"draft:{draft_id}")
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not (metadata and metadata.get("notify") is True):
@@ -133,8 +165,14 @@ class ExcelAdapter(BasePlatformAdapter):
             "Finish by calling excel_response exactly once with the correlation fields unchanged."
         )
         stable_chat_id = f"excel:{conversation_id}"
+        # Keep each workbook conversation isolated by chat_id while giving all
+        # Excel sessions a stable parent route for platform-wide model/provider
+        # overrides.  Without this, every new conversation inherits the global
+        # model, even when that model cannot satisfy Excel's forced typed-tool
+        # contract.
         source = self.build_source(chat_id=stable_chat_id, chat_name="Microsoft Excel", chat_type="dm",
-                                   user_id=workbook_id, user_name="Excel workbook")
+                                   user_id=workbook_id, user_name="Excel workbook",
+                                   parent_chat_id="excel")
         event = MessageEvent(text=prompt + "\n\nEXCEL REQUEST ENVELOPE:\n" + json.dumps(envelope),
                              message_type=MessageType.TEXT, source=source, raw_message=body,
                              message_id=request_id)

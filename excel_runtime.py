@@ -24,6 +24,10 @@ class PendingExcelRequest:
 
 _pending: dict[str, PendingExcelRequest] = {}
 _active_workbooks: dict[str, str] = {}
+# Live streaming-draft text per request, for the task pane's activity poller.
+# Written by the adapter's send_draft, read by its /activity endpoint, dropped
+# on close_request. Presentation-only: never persisted, never part of history.
+_activity: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
 
 
@@ -106,9 +110,29 @@ def capture_final_for_conversation(conversation_id: str, message: str) -> bool:
     return len(matches) == 1 and capture_final(matches[0], message)
 
 
+def record_activity_for_conversation(conversation_id: str, text: str) -> bool:
+    """Store the latest streaming-draft text for the conversation's active request."""
+    with _lock:
+        matches = [item.request_id for item in _pending.values()
+                   if item.conversation_id == conversation_id]
+        if len(matches) != 1:
+            return False
+        entry = _activity.setdefault(matches[0], {"seq": 0})
+        entry["text"] = str(text)[-4000:]
+        entry["seq"] = int(entry["seq"]) + 1
+    return True
+
+
+def get_activity(request_id: str) -> dict[str, Any] | None:
+    with _lock:
+        entry = _activity.get(request_id)
+        return dict(entry) if entry else None
+
+
 def close_request(request_id: str) -> None:
     with _lock:
         item = _pending.pop(request_id, None)
+        _activity.pop(request_id, None)
         if item and _active_workbooks.get(item.workbook_id) == request_id:
             _active_workbooks.pop(item.workbook_id, None)
     if item:

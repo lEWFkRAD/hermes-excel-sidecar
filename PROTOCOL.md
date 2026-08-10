@@ -7,7 +7,7 @@ bridge binds 127.0.0.1 only.
 ## Components
 
 ```
-Excel task pane (Office.js)  →  bridge :8787 (node, zero deps)  →  Hermes API server :8642/v1
+Excel task pane (Office.js)  →  bridge :8788 (node, zero deps)  →  Hermes API server :8642/v1
                                         ↘  Docling :8200 (document parsing, optional)
 ```
 

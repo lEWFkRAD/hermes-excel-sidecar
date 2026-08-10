@@ -39,7 +39,7 @@ def _powershell(script: str, extra: list[str] | None = None) -> int:
 
 
 def _status(port: int | None) -> int:
-    resolved = port or int(os.environ.get("HERMES_EXCEL_PORT", "8787"))
+    resolved = port or int(os.environ.get("HERMES_EXCEL_PORT", "8788"))
     request = Request(f"http://127.0.0.1:{resolved}/api/health")
     token = os.environ.get("HERMES_EXCEL_BRIDGE_TOKEN", "").strip()
     if token:

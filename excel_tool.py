@@ -165,10 +165,62 @@ def excel_response_available() -> bool:
     return True
 
 
+def _tolerant_parse_array(candidate: str) -> Any:
+    """Best-effort parse of a JSON-ish array string a model emitted.
+
+    Local models intermittently hand `actions` over as one big string —
+    sometimes valid JSON, sometimes Python-repr quoting, sometimes with a
+    markdown fence or trailing commas. Each repair step is deterministic;
+    anything unparseable still fails validation downstream.
+    """
+    import ast
+    import re as _re
+
+    text = candidate.strip()
+    if text.startswith("```"):
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1:]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            return parser(text)
+        except (ValueError, SyntaxError):
+            pass
+    try:
+        return json.loads(_re.sub(r",\s*([\]}])", r"\1", text))
+    except ValueError:
+        return None
+
+
+def _repair_actions(args: dict[str, Any]) -> None:
+    """Unwrap actions delivered as a string (or a 1-element string list)."""
+    actions = args.get("actions")
+    candidate = None
+    if isinstance(actions, str):
+        candidate = actions
+    elif isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], str):
+        candidate = actions[0]
+    if candidate is None:
+        return
+    parsed = _tolerant_parse_array(candidate)
+    if isinstance(parsed, list):
+        args["actions"] = parsed
+
+
 def handle_excel_response(args: dict[str, Any], **_kwargs: Any) -> str:
     if not isinstance(args, dict):
         raise ValueError("excel_response arguments must be an object")
-    validate_schema(args, EXCEL_RESPONSE_SCHEMA["parameters"], "excel_response")
+    _repair_actions(args)
+    try:
+        validate_schema(args, EXCEL_RESPONSE_SCHEMA["parameters"], "excel_response")
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc}. Re-call excel_response once with `actions` as a native JSON array "
+            "of action objects (never a JSON-encoded string) and the correlation fields unchanged."
+        ) from exc
     encoded = json.dumps(args, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     if len(encoded) > MAX_PAYLOAD_BYTES:
         raise ValueError("Excel proposal exceeds the 512000-byte limit")

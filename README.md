@@ -22,7 +22,7 @@ data, writes tables and formulas, formats ranges, and parses attached
 documents — without ever touching your filesystem.
 
 ```
-Excel task pane (Office.js)  →  bridge :8787 (node, no deps)  →  Hermes api_server :8642/v1
+Excel task pane (Office.js)  →  bridge :8788 (node, no deps)  →  Hermes api_server :8642/v1
 ```
 
 See [PROTOCOL.md](./PROTOCOL.md) for the full bridge protocol, the actions
@@ -112,7 +112,7 @@ Then sideload in Excel: **Home → Add-ins → More Add-ins → Upload My Add-in
 Configuration is environment-variable based (defaults shown):
 
 ```text
-PORT=8787
+PORT=8788
 HERMES_EXCEL_DATA_DIR=                     # uploads/exports/logs root, OUTSIDE the web root (default: per-user app-data)
 HERMES_EXCEL_BRIDGE_TOKEN=                 # when set, every /api/* call requires it (the installer sets one per box)
 HERMES_EXCEL_INGEST_TOKEN=                 # required shared secret for the typed Excel platform adapter
@@ -154,9 +154,26 @@ supervisor, Office sideload registration, and a post-install health check — se
 powershell -ExecutionPolicy Bypass -File install\apply.ps1
 ```
 
-The installer selects the first available port starting at `8787`, rewrites the
+The installer selects the first available port starting at `8788`, rewrites the
 sideloaded manifest to match, and fails if an explicitly requested port belongs
 to another service. Autostart uses one tracked Scheduled Task supervisor.
+
+### Canonical source and deployment
+
+This plugin directory is the authoritative source. The per-user
+`%LOCALAPPDATA%\hermes\excel-addin` directory is a generated runtime copy; keep
+its `data` directory and machine-specific launchers out of source control.
+
+Run the full local gate and deploy tracked files with:
+
+```powershell
+npm run verify
+npm run deploy
+```
+
+The deploy script runs the gate again, copies only Git-tracked files, preserves
+runtime data and tokens, and verifies every copied hash. Service restarts are
+explicit opt-ins: `install\deploy.ps1 -RestartBridge -RestartGateway`.
 
 ## Tests
 
