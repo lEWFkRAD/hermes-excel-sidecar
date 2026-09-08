@@ -28,6 +28,7 @@ def register(ctx) -> None:
 
     ctx.register_tool(
         name="excel_response",
+        always_visible=True,
         toolset="hermes-excel-sidecar",
         schema=EXCEL_RESPONSE_SCHEMA,
         handler=handle_excel_response,

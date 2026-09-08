@@ -29,9 +29,6 @@ const state = {
   pendingProposal: null,
   workbookKey: "",
   controller: null,
-  // Default ON: workbook changes are held for explicit Apply unless the user
-  // persistently opts out. Restored from localStorage in Office.onReady so the
-  // safe state survives pane reloads.
   // Default off (2026-08-04, Jeff): apply immediately; the checkbox re-enables staging.
   reviewMode: false,
   // Live-activity relay: the in-flight request id and the freshest streamed
@@ -222,12 +219,6 @@ async function applyReviewedProposal(proposal) {
     const createdSheets = [];
     const statuses = [];
     const seenWriteAddresses = new Set();
-    // When the model styled the output itself (format_cells / conditional_format),
-    // respect its choices; otherwise default-style writes that land on previously
-    // empty cells so reviewed output matches review-off presentation quality.
-    const modelStyledProposal = (proposal.result.actions || []).some(
-      (action) => action && (action.type === "format_cells" || action.type === "conditional_format"),
-    );
     for (const action of proposal.result.actions || []) {
       if (!action || action.type === "export" || REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) continue;
       const values = normalizeMatrix(action.values || action.table);
@@ -236,13 +227,10 @@ async function applyReviewedProposal(proposal) {
         if (!match) throw new Error(`Missing bound precondition for ${action.start_cell}.`);
         if (seenWriteAddresses.has(match.range.address)) throw new Error(`Overlapping duplicate reviewed write: ${match.range.address}.`);
         seenWriteAddresses.add(match.range.address);
-        const columnCount = Math.max(...values.map((row) => row.length));
-        const wasEmpty = (match.precondition.formulas || []).every((row) => row.every((cell) => cell === "" || cell == null));
-        const styleIt = action.auto_format === true || (!modelStyledProposal && wasEmpty && columnCount >= 2);
         undoWrites.push({ address: match.range.address, worksheetId: match.range.worksheet.id, range: match.range,
-          rows: values.length, cols: columnCount, wasEmpty, styleIt,
           before: { formulas: match.range.formulas, numberFormat: match.range.numberFormat } });
         match.range.values = values;
+        match.range.numberFormat = match.precondition.numberFormat;
         statuses.push(`Wrote ${values.length} row(s) to ${match.range.address}.`);
       } else if (action.type === "create_sheet") {
         const sheet = sheets.add(action.name);
@@ -270,23 +258,8 @@ async function applyReviewedProposal(proposal) {
       }
       throw new Error(`Apply failed; the reviewed targets were restored (${commitError.message}).`);
     }
-    // Presentation pass — runs only after every reviewed write has committed, so
-    // a styling failure can never cost data. Parity with review-off mode: new
-    // sheets get the professional table format; in-place writes get borders +
-    // header styling when they landed on empty cells (or the model asked).
+    // Style only newly created sheets. In-place writes preserve all formatting.
     try {
-      for (const write of undoWrites) {
-        if (write.styleIt) {
-          styleRange(write.range, write.rows, write.cols, { borders: "thin", auto_fit: true });
-          if (write.wasEmpty && write.rows >= 1) {
-            const header = write.range.getCell(0, 0).getResizedRange(0, write.cols - 1);
-            styleRange(header, 1, write.cols, { style: "header", auto_fit: true });
-          }
-        } else {
-          write.range.format.autofitColumns();
-          write.range.format.autofitRows();
-        }
-      }
       for (const created of createdSheets) {
         applyProfessionalTableFormat(created.sheet, created.target, created.values);
         created.sheet.activate();
@@ -302,7 +275,7 @@ async function applyReviewedProposal(proposal) {
       await context.sync();
       state.undoStack.push({ kind: "reviewed_change_set", writes: undoWrites.map((write) => ({
         address: write.address, worksheetId: write.worksheetId, before: write.before,
-        formatted: write.styleIt === true,
+        formatted: false,
         after: { formulas: write.range.formulas, numberFormat: write.range.numberFormat },
       })) });
     }
@@ -605,8 +578,14 @@ async function readWorkbookContext() {
     const selected = workbook.getSelectedRange();
     sheets.load("items/name");
     active.load("name");
-    selected.load(["address", "values", "formulas", "rowCount", "columnCount"]);
+    selected.load(["address", "rowCount", "columnCount"]);
     await context.sync();
+
+    const selectionTruncated = selected.rowCount > 100 || selected.columnCount > 16;
+    const selectionSample = selectionTruncated
+      ? selected.getCell(0, 0).getResizedRange(Math.min(selected.rowCount, 100) - 1, Math.min(selected.columnCount, 16) - 1)
+      : selected;
+    selectionSample.load(["values", "formulas"]);
 
     const usedRanges = sheets.items.map((sheet) => {
       const usedRange = sheet.getUsedRangeOrNullObject();
@@ -630,8 +609,9 @@ async function readWorkbookContext() {
     };
     state.selection = {
       address: selected.address,
-      values: selected.values,
-      formulas: selected.formulas,
+      values: selectionSample.values,
+      formulas: selectionSample.formulas,
+      truncated: selectionTruncated,
       rowCount: selected.rowCount,
       columnCount: selected.columnCount,
     };
@@ -1016,32 +996,6 @@ function applyProfessionalTableFormat(sheet, target, values) {
   sheet.freezePanes.freezeRows(1);
 }
 
-async function beforeWriteCellsSnapshot(action, values) {
-  try {
-    await Excel.run(async (context) => {
-      const start = rangeFromRef(context, action.start_cell || action.startCell);
-      const target = start.getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
-      target.load(["address", "formulas", "numberFormat"]);
-      await context.sync();
-      state.undoStack.push({
-        kind: "write_cells",
-        address: target.address,
-        formulas: target.formulas,
-        numberFormat: target.numberFormat,
-        // When auto_format ran, undo must also strip the fills/fonts/borders it added.
-        formatted: !!action.auto_format,
-      });
-      if (state.undoStack.length > 10) state.undoStack.shift();
-    });
-    return true;
-  } catch {
-    // Preserve the ordering contract: Undo must not fall through to an older
-    // action when this write could not be snapshotted.
-    pushNonUndoable("write whose prior cells could not be captured");
-    return false;
-  }
-}
-
 // A change Hermes can't programmatically reverse (formatting, conditional format,
 // or model-authored Office.js). Sits on the stack so a later Undo announces it
 // instead of silently reverting an unrelated earlier write.
@@ -1051,10 +1005,12 @@ function pushNonUndoable(type) {
 }
 
 async function undoLast() {
+  if (state.sending || state.undoing) return;
   if (!state.undoStack.length) {
     addMessage("hermes", "Nothing to undo.", false);
     return;
   }
+  state.undoing = true;
   const record = state.undoStack.pop();
   try {
     if (record.kind === "non_undoable") {
@@ -1065,16 +1021,36 @@ async function undoLast() {
         `The last change (${record.type.replace(/_/g, " ")}) can't be undone by Hermes — use Excel's Undo (Ctrl+Z) for it.`,
       );
     } else if (record.kind === "write_cells") {
-      await Excel.run(async (context) => {
+      if (!record.after || !record.worksheetId) {
+        state.undoStack.push(record);
+        addMessage("hermes", "Undo refused: this older change has no worksheet identity or after-image. No cells were restored.");
+        return;
+      }
+      const restored = await Excel.run(async (context) => {
         const range = rangeFromRef(context, record.address);
-        // Strip any auto_format fills/fonts/borders before restoring the prior content.
-        if (record.formatted) range.clear(Excel.ClearApplyTo.formats);
-        range.formulas = record.formulas;
-        range.numberFormat = record.numberFormat;
+        range.load(["formulas", "numberFormat"]);
+        range.worksheet.load("id");
         await context.sync();
+        if (range.worksheet.id !== record.worksheetId ||
+            stableMatrix(range.formulas) !== stableMatrix(record.after.formulas) ||
+            stableMatrix(range.numberFormat) !== stableMatrix(record.after.numberFormat)) return false;
+        range.formulas = record.formulas;
+        range.numberFormat = record.after.numberFormat;
+        await context.sync();
+        return true;
       });
-      addMessage("hermes", `Undid the last write: restored ${record.address}.`);
+      if (!restored) {
+        state.undoStack.push(record);
+        addMessage("hermes", "Undo refused: the target was edited or replaced after Hermes wrote it. No cells were restored.");
+        return;
+      }
+      addMessage("hermes", `Undid the last write: restored ${record.address}. Existing formatting was preserved.`);
     } else if (record.kind === "reviewed_change_set") {
+      if (record.writes.some((write) => write.formatted)) {
+        state.undoStack.push(record);
+        addMessage("hermes", "Undo refused: this older styled change lacks a complete formatting snapshot. No cells were restored.");
+        return;
+      }
       const restored = await Excel.run(async (context) => {
         const checks = record.writes.map((write) => {
           const range = rangeFromRef(context, write.address);
@@ -1088,9 +1064,6 @@ async function undoLast() {
               stableMatrix(range.numberFormat) !== stableMatrix(write.after.numberFormat)) return false;
         }
         for (const { write, range } of checks) {
-          // Strip the presentation pass's fills/fonts/borders before restoring
-          // the prior content, mirroring the plain write_cells undo path.
-          if (write.formatted) range.clear(Excel.ClearApplyTo.formats);
           range.formulas = write.before.formulas;
           range.numberFormat = write.before.numberFormat;
         }
@@ -1108,37 +1081,15 @@ async function undoLast() {
       // prove that tables, charts, comments, formatting, or sheet settings are unchanged.
       addMessage("hermes", `Hermes will not auto-delete the created sheet "${record.name}". Delete it manually if you no longer want it.`);
       return;
-      await Excel.run(async (context) => {
-        const sheet = context.workbook.worksheets.getItemOrNullObject(record.name);
-        const used = sheet.getUsedRangeOrNullObject();
-        used.load(["rowCount", "columnCount", "formulas"]);
-        await context.sync();
-        if (sheet.isNullObject) {
-          addMessage("hermes", `The sheet "${record.name}" is already gone.`);
-          return;
-        }
-        // Don't delete a sheet the user kept working on after Hermes created it.
-        const unchanged =
-          !used.isNullObject &&
-          JSON.stringify(used.formulas) === JSON.stringify(record.formulas);
-        if (!unchanged) {
-          addMessage(
-            "hermes",
-            `"${record.name}" was edited after Hermes created it — leaving it in place. Delete the sheet yourself if you no longer want it.`,
-          );
-          return;
-        }
-        sheet.delete();
-        await context.sync();
-        addMessage("hermes", `Removed the sheet Hermes created: ${record.name}.`);
-      });
     }
     saveChatHistory();
   } catch (error) {
-    if (record.kind === "reviewed_change_set" && state.undoStack[state.undoStack.length - 1] !== record) {
+    if (["write_cells", "reviewed_change_set"].includes(record.kind) && state.undoStack[state.undoStack.length - 1] !== record) {
       state.undoStack.push(record);
     }
     addMessage("hermes", `Undo failed: ${error.message}`);
+  } finally {
+    state.undoing = false;
   }
 }
 
@@ -1146,19 +1097,30 @@ async function writeCellsAction(action) {
   const values = normalizeMatrix(action.values || action.table);
   if (!values.length) return null;
 
-  await beforeWriteCellsSnapshot(action, values);
   return Excel.run(async (context) => {
     const start = rangeFromRef(context, action.start_cell || action.startCell);
     const target = start.getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
-    target.values = values;
-    if (action.auto_format) styleRange(target, values.length, values[0].length, { borders: "thin", auto_fit: true });
-    else if (!action.review_bound) {
-      target.format.autofitColumns();
-      target.format.autofitRows();
-    }
-    target.load("address");
+    target.load(["address", "formulas", "numberFormat"]);
+    target.worksheet.load("id");
     await context.sync();
-    return { status: `Wrote ${values.length} row(s) to ${target.address}.`, address: target.address };
+    const record = { kind: "write_cells", address: target.address, worksheetId: target.worksheet.id,
+      formulas: target.formulas.map((row) => [...row]), numberFormat: target.numberFormat.map((row) => [...row]) };
+    // In-place writes change content only. Keep fonts, fills, borders and layout
+    // intact; explicit formatting actions remain separate non-undoable steps.
+    target.values = values;
+    target.numberFormat = record.numberFormat;
+    try {
+      await context.sync();
+      target.load(["formulas", "numberFormat"]);
+      await context.sync();
+      record.after = { formulas: target.formulas.map((row) => [...row]), numberFormat: target.numberFormat.map((row) => [...row]) };
+      state.undoStack.push(record);
+      if (state.undoStack.length > 10) state.undoStack.shift();
+    } catch (error) {
+      pushNonUndoable("write whose completion could not be verified");
+      throw error;
+    }
+    return { status: `Wrote ${values.length} row(s) to ${target.address}. Existing formatting was preserved.`, address: target.address };
   });
 }
 
@@ -1645,7 +1607,7 @@ function wireActions() {
 
   els.chatForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.sending) return;
+    if (state.sending || state.undoing) return;
     const prompt = els.prompt.value.trim();
     if (!prompt) return;
     const health = await checkBridgeHealth(false);

@@ -5,6 +5,25 @@ Versioning and uses GitHub Releases for distributable plugin archives.
 
 ## [Unreleased]
 
+### Fixed
+
+- Undo now refuses targets edited or replaced since application and preserves
+  existing formatting for in-place writes. Failed Undo records remain available.
+- Selection previews read at most 100 rows by 16 columns, including whole-sheet
+  selections, while retaining the original selection dimensions.
+- Typed Excel chat preserves request correlation across validation retries,
+  uses provider-appropriate tool choice, and gives precise action-schema errors.
+- Model instructions retain the selected destination and formula anchoring;
+  smoke scenarios use isolated request and conversation identities.
+- Rollback matches exact script paths, retains profile ownership safeguards,
+  and verifies the payload path and stopped supervisor before deletion.
+- Rollback process enumeration works with Windows PowerShell 5.1 generic lists.
+
+### Runtime requirement
+
+- `excel_response` requires Hermes `always_visible` tool registration and
+  discovery support. See `compat/README.md` for the companion patch and tests.
+
 ### Added
 
 - Strict, non-secret profile ownership receipts and call-time profile path

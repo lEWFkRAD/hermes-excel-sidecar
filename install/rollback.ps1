@@ -55,13 +55,13 @@ function Get-OwnedBridgeProcesses {
     $name = ([string]$process.Name).ToLowerInvariant()
     if (-not $targets.ContainsKey($name) -or [string]::IsNullOrWhiteSpace([string]$process.CommandLine)) { continue }
     foreach ($target in $targets[$name]) {
-      if ($process.CommandLine.IndexOf($target, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+      if ($process.CommandLine -match ('(?i)(?:^|["\s])' + [regex]::Escape($target) + '(?=["\s]|$)')) {
         $owned.Add($process)
         break
       }
     }
   }
-  return @($owned)
+  return $owned.ToArray()
 }
 
 function Stop-OwnedBridgeProcesses {
@@ -151,7 +151,7 @@ try {
   } else {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t) {
-      try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
+      Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
       Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
       Write-Host "    Removed task '$TaskName'."
     } else { Write-Host "    Task '$TaskName' not present." }
@@ -209,6 +209,13 @@ try {
   # 5. Delete install dir.
   Step "5. Delete install dir"
   if (Test-Path -LiteralPath $InstallDir) {
+    $resolvedInstall = [IO.Path]::GetFullPath($InstallDir)
+    $expectedInstall = [IO.Path]::GetFullPath((Join-Path $ProfileContext.ProfileHome 'excel-addin'))
+    if ($resolvedInstall -ne $expectedInstall -or $resolvedInstall -eq [IO.Path]::GetPathRoot($resolvedInstall)) {
+      throw "Refusing unsafe rollback target: $resolvedInstall"
+    }
+    Stop-OwnedBridgeProcesses
+    Assert-OwnedBridgeQuiescent -OwnedPort $OwnedBridgePort
     Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
     Write-Host "    Deleted '$InstallDir'."
   } else {
