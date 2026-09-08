@@ -56,6 +56,12 @@ schema, the read loop, and the formula-anchoring contract.
 
 ## Requirements
 
+Attachments support up to **100 MiB per file**, **150 MiB combined per message**,
+and 12 files. The chat request ceiling is 210 MiB to accommodate base64 encoding
+and workbook context; export requests retain their smaller limit. Large PDFs
+still require a working attachment parser, and extraction/context limits remain
+in effect. Upload acceptance does not mean every page is included in model context.
+
 - Excel (desktop) on Windows or macOS with add-in sideloading allowed.
 - Node.js 20+ on PATH (matching `package.json` and the supported CI matrix).
 - A running Hermes gateway with the `api_server` platform enabled on

@@ -133,7 +133,9 @@ const wslDistro = process.env.HERMES_EXCEL_WSL_DISTRO || "Ubuntu-24.04";
 const doclingOutputDir = process.env.HERMES_EXCEL_DOCLING_OUTPUT_DIR || "";
 const maxExtractedCharsPerFile = Number(process.env.HERMES_EXCEL_MAX_EXTRACTED_CHARS_PER_FILE || 32000);
 const maxExtractedCharsTotal = Number(process.env.HERMES_EXCEL_MAX_EXTRACTED_CHARS_TOTAL || 96000);
-const maxUploadBytesPerFile = Number(process.env.HERMES_EXCEL_MAX_UPLOAD_BYTES || 25 * 1024 * 1024);
+const maxUploadBytesPerFile = Number(process.env.HERMES_EXCEL_MAX_UPLOAD_BYTES || 100 * 1024 * 1024);
+const maxUploadBytesTotal = 150 * 1024 * 1024;
+const maxChatRequestBytes = 210 * 1024 * 1024; // base64 expansion plus workbook/context overhead
 const maxUploadFiles = Number(process.env.HERMES_EXCEL_MAX_UPLOAD_FILES || 12);
 // One source of truth for the workbook read-round budget (pane stops one round later).
 const MAX_READ_ROUNDS = 5;
@@ -367,15 +369,39 @@ async function healthStatus() {
   return status;
 }
 
-async function readJson(req) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > 50 * 1024 * 1024) throw new Error("request too large");
-    chunks.push(chunk);
+function readJson(req, limit = 50 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let chunks = [], size = 0;
+    const cleanup = () => { req.off('data', onData); req.off('end', onEnd); req.off('error', onError); req.off('aborted', onAborted); };
+    const fail = (error) => { cleanup(); chunks = []; req.once('error', () => {}); reject(error); req.resume(); };
+    const oversized = () => Object.assign(new Error(`Request exceeds the ${Math.round(limit / 1024 / 1024)} MB limit. Send fewer attachments.`), { statusCode: 413 });
+    const onError = (error) => fail(error);
+    const onAborted = () => fail(new Error('Upload canceled'));
+    const onData = (chunk) => {
+      size += chunk.length;
+      if (size > limit) return fail(oversized());
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
+      cleanup();
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+      catch (error) { reject(error); }
+      chunks = [];
+    };
+    if (Number(req.headers?.['content-length']) > limit) return fail(oversized());
+    req.on('data', onData); req.on('end', onEnd); req.on('error', onError); req.on('aborted', onAborted);
+  });
+}
+
+function validateUploadBatch(files = [], { perFile = maxUploadBytesPerFile, totalLimit = maxUploadBytesTotal } = {}) {
+  let total = 0;
+  for (const file of Array.isArray(files) ? files : []) {
+    const base64 = String(file.base64 || '');
+    const bytes = Math.floor(base64.length * 3 / 4) - (base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0);
+    if (bytes > perFile) throw Object.assign(new Error(`An attachment exceeds the ${Math.round(perFile / 1024 / 1024)} MB per-file limit.`), { statusCode: 413 });
+    total += bytes;
+    if (total > totalLimit) throw Object.assign(new Error('Attachments exceed the 150 MB total per-message limit. Send smaller batches.'), { statusCode: 413 });
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
 function compactSelection(selection) {
@@ -950,6 +976,7 @@ async function extractWithDocling(filePath, signal, fileName = path.basename(fil
 }
 
 async function prepareAttachedFiles(files = [], signal) {
+  validateUploadBatch(files);
   await mkdir(uploadsDir, { recursive: true });
   const contexts = [];
   let totalChars = 0;
@@ -2299,7 +2326,7 @@ async function handleChat(req, res) {
   const budget = setTimeout(() => { budgetExpired = true; controller.abort(); }, llmRequestBudgetMs);
   let body;
   try {
-    body = await readJson(req);
+    body = await readJson(req, maxChatRequestBytes);
     // Loop rounds echo parsed_files back so attachments are not re-uploaded or re-parsed.
     body.files =
       Array.isArray(body.parsed_files) && body.parsed_files.length
@@ -2318,6 +2345,7 @@ async function handleChat(req, res) {
 
     return send(res, 200, await callHermesPlatform(body, { signal: controller.signal }), undefined, origin);
   } catch (error) {
+    if (error.statusCode === 413 && !res.writableEnded) return send(res, 413, { error: error.message }, undefined, origin);
     if (controller.signal.aborted && body?.request_id && body?.workbook_id) {
       fetch(excelAdapterUrl.replace(/\/ingest$/, "/cancel"), {
         method: "POST",
@@ -2550,6 +2578,8 @@ if (isMainModule) {
 }
 
 export {
+  readJson,
+  validateUploadBatch,
   parseDelimitedText,
   markdownTableFromRows,
   decodeHtmlEntities,

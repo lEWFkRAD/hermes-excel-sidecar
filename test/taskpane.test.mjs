@@ -36,7 +36,7 @@ function pane({ rows = 1, columns = 1 } = {}) {
     document: { querySelector: () => null, getElementById: () => ({}) },
     Office: { onReady() {} },
     Excel: { run: async (fn) => fn(context) },
-    crypto: { getRandomValues: (bytes) => bytes.fill(1) }, Uint8Array,
+    crypto: { getRandomValues: (bytes) => bytes.fill(1) }, Uint8Array, Blob,
   };
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
   vm.runInContext('addMessage = (...args) => messages.push(args); saveChatHistory = () => {}; setStatus = () => {}; state.workbookId = "book-1";', Object.assign(sandbox, { messages }));
@@ -48,16 +48,33 @@ const action = { type: 'write_cells', start_cell: 'Sheet1!A1', values: [[20]], a
 
 test('oversized attachments are rejected before reading a workbook or encoding files', async () => {
   const p = pane();
-  await assert.rejects(p.sandbox.askHermes('test', [{ size: 29 * 1024 * 1024 }]), /25 MB per-file/);
+  await assert.rejects(p.sandbox.askHermes('test', [{ size: 101 * 1024 * 1024 }]), /100 MB per-file/);
   assert.equal(p.loads.length, 0);
 });
 
 test('attachment batches are bounded while ordinary files remain accepted', () => {
   const p = pane();
   const file = (mb) => ({ size: mb * 1024 * 1024 });
-  assert.throws(() => p.sandbox.validateAttachmentSizes([file(20), file(20)]), /32 MB total/);
+  assert.throws(() => p.sandbox.validateAttachmentSizes([file(80), file(80)]), /150 MB total/);
   assert.throws(() => p.sandbox.validateAttachmentSizes(Array(13).fill(file(0))), /12 files/);
-  assert.doesNotThrow(() => p.sandbox.validateAttachmentSizes([file(25), file(7)]));
+  assert.doesNotThrow(() => p.sandbox.validateAttachmentSizes([file(100), file(50)]));
+  assert.doesNotThrow(() => p.sandbox.validateAttachmentSizes([file(29), file(71), file(29)]));
+});
+
+test('HTTP upload rejection stays actionable and is not retried as a connection error', async () => {
+  const p = pane();
+  let calls = 0;
+  p.sandbox.fetch = async () => { calls++; return { ok: false, status: 413, json: async () => ({ error: 'Batch exceeds upload limit' }) }; };
+  await assert.rejects(p.sandbox.postChat({}), /Batch exceeds upload limit/);
+  assert.equal(calls, 1);
+});
+
+test('native file encoding preserves base64 payload without per-byte concatenation', async () => {
+  const p = pane();
+  p.sandbox.FileReader = class { readAsDataURL() { this.result = 'data:application/pdf;base64,AAEC/w=='; this.onload(); } };
+  const result = await p.sandbox.fileToPayload({ name: 'synthetic.pdf', size: 4, type: 'application/pdf' });
+  assert.equal(result.base64, 'AAEC/w==');
+  assert.equal(result.size, 4);
 });
 
 test('immediate write and Undo preserve all pre-existing formatting', async () => {
