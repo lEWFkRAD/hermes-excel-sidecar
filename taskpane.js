@@ -559,15 +559,31 @@ async function addFiles(fileList) {
 }
 
 async function fileToPayload(file) {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  // Native encoding avoids a per-byte JavaScript string for large PDFs.
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error('Could not read attachment. Please attach it again.'));
+    reader.onabort = () => reject(new Error('Attachment reading was canceled.'));
+    reader.readAsDataURL(file);
+  });
   return {
     name: file.name,
     type: file.type || "application/octet-stream",
     size: file.size,
-    base64: btoa(binary),
+    base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
   };
+}
+
+function validateAttachmentSizes(files) {
+  const mib = 1024 * 1024;
+  if (files.length > 12) throw new Error('Attach at most 12 files per message.');
+  if (files.some((file) => file.size > 100 * mib)) {
+    throw new Error('An attachment exceeds the 100 MB per-file limit. Split or compress the PDF, then remove the oversized attachment and attach the smaller files.');
+  }
+  if (files.reduce((sum, file) => sum + file.size, 0) > 150 * mib) {
+    throw new Error('Attachments exceed the 150 MB total per-message limit. Remove duplicate attachments or send smaller batches.');
+  }
 }
 
 async function readWorkbookContext() {
@@ -648,29 +664,39 @@ async function executeReadRange(rangeRef) {
 
 async function postChat(payload, options = {}) {
   const body = JSON.stringify(payload);
+  if (new Blob([body]).size > 210 * 1024 * 1024) {
+    throw new Error('This message exceeds the bridge request limit. Send fewer attachments or select a smaller worksheet range.');
+  }
   const errors = [];
   for (const brokerUrl of brokerUrls) {
+    let response;
     try {
-      const response = await fetch(`${brokerUrl}/api/chat`, {
+      response = await fetch(`${brokerUrl}/api/chat`, {
         method: "POST",
         headers: bridgeHeaders({ "content-type": "application/json" }),
         body,
         signal: options.signal,
       });
-      if (!response.ok) throw new Error(await response.text());
-      return response.json();
     } catch (error) {
       if (error.name === "AbortError") throw error;
       errors.push(`${brokerUrl}: ${error.message}`);
+      continue;
     }
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.error || `Hermes bridge rejected the request (HTTP ${response.status}).`);
+    }
+    return response.json();
   }
   throw new Error(`Could not reach the local Hermes bridge. Tried ${errors.join(" | ")}`);
 }
 
 async function askHermes(prompt, filesToSend) {
+  validateAttachmentSizes(filesToSend);
   state.controller = new AbortController();
   const context = await readWorkbookContext();
-  const files = await Promise.all(filesToSend.map(fileToPayload));
+  const files = [];
+  for (const file of filesToSend) files.push(await fileToPayload(file));
 
   let toolResults = [];
   let parsedFiles = null;

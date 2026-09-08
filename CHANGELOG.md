@@ -7,6 +7,10 @@ Versioning and uses GitHub Releases for distributable plugin archives.
 
 ### Fixed
 
+- Large attachments now support 100 MiB per file and 150 MiB per message with a
+  210 MiB chat envelope. Native file encoding avoids per-byte string assembly;
+  bounded uploads return actionable HTTP 413 errors instead of connection drops.
+
 - Undo now refuses targets edited or replaced since application and preserves
   existing formatting for in-place writes. Failed Undo records remain available.
 - Selection previews read at most 100 rows by 16 columns, including whole-sheet
