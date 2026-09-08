@@ -117,6 +117,11 @@ plugin_entry = load("__init__")
 
 
 class PolicyTests(unittest.TestCase):
+    def test_action_validation_explains_the_selected_schema_failure(self):
+        with self.assertRaisesRegex(ValueError, "missing name"):
+            tool.validate_schema({"type":"create_sheet", "values":[[1]]},
+                                 {"oneOf":tool.ACTION_SCHEMAS}, "actions[0]")
+
     def request(self):
         return {"messages": [], "tools": [{"type": "function", "function": {"name": "excel_response"}}]}
 
@@ -136,6 +141,21 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(first["tool_choice"], "auto")
         self.assertEqual(first["tools"][0]["function"]["name"], "excel_response")
 
+    def test_responses_named_choice_uses_flat_transport_shape(self):
+        request = {"input": [], "tools": [{"type": "function", "name": "excel_response"}]}
+        result = policy.excel_terminal_tool_policy(request=request, platform="excel", api_call_count=1,
+                                                  api_mode="codex_responses")["request"]
+        self.assertEqual(result["tool_choice"], {"type": "function", "name": "excel_response"})
+        self.assertNotIn("tool_choice", request)
+        second = policy.excel_terminal_tool_policy(request=request, platform="excel", api_call_count=2,
+                                                  api_mode="codex_responses")["request"]
+        self.assertEqual(second["tool_choice"], "none")
+
+    def test_missing_responses_terminal_tool_fails_closed_with_valid_shape(self):
+        result = policy.excel_terminal_tool_policy(request={"input": [], "tools": []},
+            platform="excel", api_call_count=1, api_mode="codex_responses")["request"]
+        self.assertEqual(result["tool_choice"], {"type": "function", "name": "__excel_response_unavailable__"})
+
     def test_non_excel_unchanged_and_missing_tool_fails_closed(self):
         self.assertIsNone(policy.excel_terminal_tool_policy(request=self.request(), platform="kindle", api_call_count=1))
         result = policy.excel_terminal_tool_policy(request={"tools": []}, platform="excel", api_call_count=1)
@@ -143,6 +163,40 @@ class PolicyTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_policy_retries_validation_failure_until_capture_or_budget(self):
+        item = runtime.open_request(request_id="request-retry-123", workbook_id="workbook-retry-123",
+                                    conversation_id="conversation-retry-123", round=0)
+        token = runtime.active_request_id.set(item.request_id)
+        request = {"tools": [{"type": "function", "function": {"name": "excel_response"}}]}
+        try:
+            with self.assertRaises(ValueError):
+                tool.handle_excel_response({"actions": [{"type": "invalid"}]})
+            for attempt in (1, 2, 3):
+                result = await asyncio.to_thread(policy.excel_terminal_tool_policy,
+                    request=request, platform="excel", api_call_count=attempt)
+                self.assertEqual(result["request"]["tool_choice"]["function"]["name"], "excel_response")
+            self.assertEqual(policy.excel_terminal_tool_policy(request=request, platform="excel",
+                api_call_count=4)["request"]["tool_choice"], "none")
+            runtime.capture_proposal({"request_id":item.request_id, "workbook_id":item.workbook_id,
+                "conversation_id":item.conversation_id, "round":0, "message":"Ready", "actions":[]})
+            self.assertEqual(policy.excel_terminal_tool_policy(request=request, platform="excel",
+                api_call_count=2)["request"]["tool_choice"], "none")
+        finally:
+            runtime.active_request_id.reset(token)
+
+    async def test_policy_does_not_retry_a_correlation_error(self):
+        item = runtime.open_request(request_id="request-retry-123", workbook_id="workbook-retry-123",
+                                    conversation_id="conversation-retry-123", round=0)
+        token = runtime.active_request_id.set(item.request_id)
+        try:
+            with self.assertRaises(ValueError):
+                runtime.capture_proposal({"request_id":item.request_id, "workbook_id":"wrong-id"})
+            result = policy.excel_terminal_tool_policy(request={"tools":[{"function":{"name":"excel_response"}}]},
+                platform="excel", api_call_count=2)
+            self.assertEqual(result["request"]["tool_choice"], "none")
+        finally:
+            runtime.active_request_id.reset(token)
+
     async def asyncTearDown(self):
         for request_id in list(runtime._pending):
             runtime.close_request(request_id)

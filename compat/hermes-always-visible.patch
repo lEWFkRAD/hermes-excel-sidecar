@@ -1,0 +1,71 @@
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index e6c3956b87..459c4aa209 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -449,9 +449,11 @@ class PluginContext:
+     def register_tool(
+         self, name: str, toolset: str, schema: dict, handler: Callable,
+         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
+-        description: str = "", emoji: str = "", override: bool = False,
++        description: str = "", emoji: str = "", override: bool = False, always_visible: bool = False,
+     ) -> Optional[PluginRegistration]:
+         """Register a tool in the global registry and track it as plugin-provided. ``override=True``
++        ``always_visible=True`` keeps an enabled protocol tool out of progressive disclosure;
++        it does not enable a disabled toolset or bypass availability checks. ``override=True``
+         replaces a same-named built-in (without it a name claimed by another toolset is rejected) and
+         needs operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override: true`` — otherwise
+         any enabled plugin could silently replace a privileged built-in like ``write_file``.
+@@ -476,7 +478,7 @@ class PluginContext:
+         registry.register(
+             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
+             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
+-            override=override, scope=scope,
++            override=override, scope=scope, always_visible=always_visible,
+         )
+         registered = registry.snapshot_registration(name, scope=scope)
+         handle = None
+diff --git a/tools/registry.py b/tools/registry.py
+index b82ae4aeea..4b2129cc3b 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -178,6 +178,8 @@ class ToolEntry:
+     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
+     # — for fields tracking runtime config (delegate_task's description reflects limits).
+     dynamic_schema_overrides: Optional[Callable] = None
++    # Terminal protocol tools must be available before discovery can run.
++    always_visible: bool = False
+ 
+ 
+ class _PluginOverridePolicy:
+@@ -598,7 +600,7 @@ class ToolRegistry:
+         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
+         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
+         dynamic_schema_overrides: Callable = None, override: bool = False,
+-        scope: Optional[str] = None):
++        scope: Optional[str] = None, always_visible: bool = False):
+         """Register a tool (called at import time by each tool file). ``override=True`` is an
+         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
+         browser backend); without it, cross-toolset shadowing is rejected."""
+@@ -651,7 +653,7 @@ class ToolRegistry:
+                 requires_env=requires_env or [], is_async=is_async,
+                 description=description or schema.get("description", ""), emoji=emoji,
+                 max_result_size_chars=max_result_size_chars,
+-                dynamic_schema_overrides=dynamic_schema_overrides)
++                dynamic_schema_overrides=dynamic_schema_overrides, always_visible=always_visible)
+             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
+             # longer gates a toolset; it still feeds get_toolset_requirements ->
+             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
+diff --git a/tools/tool_search.py b/tools/tool_search.py
+index ab2af9b0e6..37ac5e2162 100644
+--- a/tools/tool_search.py
++++ b/tools/tool_search.py
+@@ -138,6 +138,9 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None)
+     plugin tool). Bridge names never defer."""
+     if name in BRIDGE_TOOL_NAMES:
+         return False
++    entry = _registry_entry(name)
++    if entry is not None and getattr(entry, "always_visible", False):
++        return False
+     if defer_tools is not None and name in defer_tools:
+         return True
+     if name in _core_tool_names():

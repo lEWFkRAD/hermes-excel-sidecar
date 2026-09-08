@@ -3,8 +3,10 @@
 [![CI](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml)
 [![Release](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/release.yml/badge.svg)](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/release.yml)
 
-This is an independently installable Hermes plugin. It does not require an
-upstream Hermes PR to merge. The original integration lineage remains at
+This is an independently packaged Hermes plugin. Reliable typed Excel chat
+requires the Hermes runtime capability described in
+[Runtime compatibility](compat/README.md); older runtimes need the supplied
+companion patch before enabling this version. The original integration lineage remains at
 [NousResearch/hermes-agent#44356](https://github.com/NousResearch/hermes-agent/pull/44356).
 Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and
 [SECURITY.md](SECURITY.md) before contributing or deploying. Release history and
@@ -229,3 +231,11 @@ zero runtime npm dependencies. Run the same required checks as CI with
 - The default output style is tuned for accounting/finance tables (header
   rows, total rows, currency formats, formulas over hardcoded totals); see the
   system prompt in `broker/server.mjs` to adjust.
+
+## Workbook preservation and bounded selection reads
+
+In-place `write_cells` operations preserve existing cell formatting and layout, even when `auto_format` is requested. New-sheet output remains automatically styled; explicit formatting actions are still available separately. Hermes Undo checks the worksheet identity, formulas, and number formats against the applied result and refuses to overwrite subsequent edits. It does not clear existing formatting.
+
+Selection context keeps the original address and dimensions but reads at most 100 rows by 16 columns, with a `truncated` flag for larger selections. Rollback verifies task removal, stops the exact bridge supervisor and child process paths, and refuses further cleanup if those processes survive.
+
+`npm run verify` includes task-pane behavior regressions and simulated PowerShell process-cleanup tests. Python protocol tests require the Hermes gateway runtime; run with that runtime's Python and the Hermes repository on `PYTHONPATH` to avoid a skipped suite. Task-pane tests use mocked Office.js objects and do not certify live Excel behavior.

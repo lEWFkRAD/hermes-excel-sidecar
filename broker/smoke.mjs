@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 // Live smoke test for the Hermes for Excel bridge. Run after Hermes updates.
 //   node broker/smoke.mjs        (bridge must be running on :8788)
 // Exits non-zero if any assertion fails.
@@ -28,6 +29,11 @@ function skip(label, reason) {
 }
 
 async function post(path, body, opts = {}) {
+  if (path === "/api/chat") {
+    body = { ...body, request_id: `smoke-${randomUUID()}`,
+      workbook_id: body.workbook_id || `smoke-${randomUUID()}`,
+      conversation_id: body.conversation_id || `smoke-${randomUUID()}` };
+  }
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: authHeaders({ "content-type": "application/json" }),
@@ -138,9 +144,11 @@ async function testMultiturn(hermesOk) {
   console.log("\n--- 4. multi-turn history ---");
   if (!hermesOk) return skip("mt.skip", "configured model/provider unavailable");
   try {
-    const res1 = await post("/api/chat", tableBody("Sheet1!A1"));
+    const identity = { workbook_id: `smoke-${randomUUID()}`, conversation_id: `smoke-${randomUUID()}` };
+    const res1 = await post("/api/chat", { ...tableBody("Sheet1!A1"), ...identity });
     assert("mt.turn1", res1.source === "hermes-platform", `got ${res1.source}`);
     const res2 = await post("/api/chat", {
+      ...identity,
       prompt: "add a totals row with a SUM for the last column",
       workbook: { activeSheet: "Sheet1", sheets: [{ name: "Sheet1", usedRange: "A1:D4" }] },
       selection: { address: "Sheet1!A1", rowCount: 1, columnCount: 1, values: [[""]], formulas: [[""]] },

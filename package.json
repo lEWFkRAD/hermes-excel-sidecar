@@ -6,9 +6,9 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "node --test broker/server.test.mjs",
+    "test": "node --test broker/server.test.mjs test/taskpane.test.mjs",
     "smoke": "node broker/smoke.mjs",
-    "check:install": "powershell -NoProfile -ExecutionPolicy Bypass -File install/check.ps1",
+    "check:install": "powershell -NoProfile -ExecutionPolicy Bypass -File install/check.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/rollback-processes.ps1",
     "check:syntax": "node --check broker/server.mjs && node --check broker/formula-rebase.mjs && node --check taskpane.js && node --check scripts/verify-release-ancestry.mjs && node --check scripts/verify-release-metadata.mjs && python -m compileall -q __init__.py adapter.py cli.py excel_policy.py excel_runtime.py excel_tool.py profile_ownership.py broker/local_extract.py scripts/check_dco.py",
     "check:plugin": "node --test test/plugin-package.test.mjs test/release-ancestry.test.mjs && python -m unittest discover -s test -p test_*.py",
     "check:release": "node scripts/verify-release-metadata.mjs",
