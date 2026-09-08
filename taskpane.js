@@ -570,6 +570,17 @@ async function fileToPayload(file) {
   };
 }
 
+function validateAttachmentSizes(files) {
+  const mib = 1024 * 1024;
+  if (files.length > 12) throw new Error('Attach at most 12 files per message.');
+  if (files.some((file) => file.size > 25 * mib)) {
+    throw new Error('An attachment exceeds the 25 MB per-file limit. Split or compress the PDF, then remove the oversized attachment and attach the smaller files.');
+  }
+  if (files.reduce((sum, file) => sum + file.size, 0) > 32 * mib) {
+    throw new Error('Attachments exceed the 32 MB total per-message limit. Remove duplicate attachments or send smaller batches.');
+  }
+}
+
 async function readWorkbookContext() {
   return Excel.run(async (context) => {
     const workbook = context.workbook;
@@ -648,6 +659,9 @@ async function executeReadRange(rangeRef) {
 
 async function postChat(payload, options = {}) {
   const body = JSON.stringify(payload);
+  if (new TextEncoder().encode(body).byteLength > 50 * 1024 * 1024) {
+    throw new Error('This message exceeds the bridge request limit. Send fewer attachments or select a smaller worksheet range.');
+  }
   const errors = [];
   for (const brokerUrl of brokerUrls) {
     try {
@@ -668,6 +682,7 @@ async function postChat(payload, options = {}) {
 }
 
 async function askHermes(prompt, filesToSend) {
+  validateAttachmentSizes(filesToSend);
   state.controller = new AbortController();
   const context = await readWorkbookContext();
   const files = await Promise.all(filesToSend.map(fileToPayload));

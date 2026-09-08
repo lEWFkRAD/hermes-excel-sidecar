@@ -46,6 +46,20 @@ function pane({ rows = 1, columns = 1 } = {}) {
 }
 const action = { type: 'write_cells', start_cell: 'Sheet1!A1', values: [[20]], auto_format: true };
 
+test('oversized attachments are rejected before reading a workbook or encoding files', async () => {
+  const p = pane();
+  await assert.rejects(p.sandbox.askHermes('test', [{ size: 29 * 1024 * 1024 }]), /25 MB per-file/);
+  assert.equal(p.loads.length, 0);
+});
+
+test('attachment batches are bounded while ordinary files remain accepted', () => {
+  const p = pane();
+  const file = (mb) => ({ size: mb * 1024 * 1024 });
+  assert.throws(() => p.sandbox.validateAttachmentSizes([file(20), file(20)]), /32 MB total/);
+  assert.throws(() => p.sandbox.validateAttachmentSizes(Array(13).fill(file(0))), /12 files/);
+  assert.doesNotThrow(() => p.sandbox.validateAttachmentSizes([file(25), file(7)]));
+});
+
 test('immediate write and Undo preserve all pre-existing formatting', async () => {
   const p = pane();
   await p.sandbox.writeCellsAction(action);
