@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import zlib from "node:zlib";
+import { ExternalConnector } from "../external_connector.mjs";
 import {
   translateMatrixFormulas,
   anchorFromAddress,
@@ -18,6 +19,14 @@ import {
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const port = Number(process.env.PORT || 8788);
+const externalConnector = new ExternalConnector({
+  enabled: process.env.HERMES_EXCEL_EXTERNAL_ACCESS_ENABLED === "1",
+  allowedOrigins: String(process.env.HERMES_EXCEL_EXTERNAL_ALLOWED_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean),
+  credentialResolver: async (scope) => {
+    const key = `HERMES_EXCEL_CREDENTIAL_${scope.replace(/[^A-Za-z0-9]/g, "_").toUpperCase()}`;
+    return process.env[key] || null;
+  },
+});
 const tlsCertPath = process.env.HERMES_EXCEL_TLS_CERT || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.crt");
 const tlsKeyPath = process.env.HERMES_EXCEL_TLS_KEY || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.key");
 const tlsEnabled = existsSync(tlsCertPath) && existsSync(tlsKeyPath);
@@ -2660,6 +2669,14 @@ if (isMainModule) {
 
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
         if (req.method === "GET" && apiPath === "/api/capabilities") return send(res, 200, buildCapabilities(), undefined, origin);
+        if (req.method === "POST" && apiPath === "/api/external/request") {
+          const body = await readJson(req, 64 * 1024);
+          const result = await externalConnector.request(body, {
+            originApproved: req.headers["x-hermes-external-approval"] === "once" || req.headers["x-hermes-external-approval"] === "session",
+            credentialApproved: req.headers["x-hermes-credential-approval"] === "once" || req.headers["x-hermes-credential-approval"] === "session",
+          });
+          return send(res, result.ok ? 200 : result.status || 502, result, undefined, origin);
+        }
         // `await` is load-bearing: rejections from the probe, chat uploads, or
         // export handlers must stay inside this request's try/catch.
         const profileDispatch = await dispatchProfileSensitiveApi(req.method, apiPath, {

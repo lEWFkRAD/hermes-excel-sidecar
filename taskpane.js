@@ -380,6 +380,24 @@ function requestExternalAccessApproval(input = {}) {
   return approvalPrompt(request, "External access requested", `${request.origin} · ${request.operation}\nPurpose: ${request.purpose}${request.requires_secret_approval ? "\nA separate masked credential approval will follow." : ""}`, request).then((approved) => approved && request.requires_secret_approval ? requestSecretApproval(request) : approved);
 }
 
+function approvalLevel(request) {
+  const grant = state.externalApprovalGrants.get(externalApprovalKey(request));
+  return grant && grant.expiresAt > Date.now() ? grant.level : "";
+}
+
+async function performExternalRequest(request) {
+  const originApproval = approvalLevel(request);
+  const credentialApproval = request.requires_secret_approval ? approvalLevel({ ...request, credential_scope: `secret:${request.credential_scope}` }) : "";
+  const response = await fetch(`${brokerUrls[0]}/api/external/request`, {
+    method: "POST",
+    headers: bridgeHeaders({ "content-type": "application/json", "x-hermes-external-approval": originApproval, "x-hermes-credential-approval": credentialApproval }),
+    body: JSON.stringify(request),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `External connector failed (${response.status}).`);
+  return payload;
+}
+
 const els = {
   status: document.getElementById("status"),
   workbookLabel: document.getElementById("workbookLabel"),
@@ -1800,7 +1818,11 @@ function wireActions() {
       const accessActions = actions.filter((action) => action && action.type === "request_external_access");
       if (accessActions.length) {
         try {
-          for (const action of accessActions) await requestExternalAccessApproval(action);
+          for (const action of accessActions) {
+            await requestExternalAccessApproval(action);
+            const externalResult = await performExternalRequest(action);
+            addMessage("hermes", `External result (${externalResult.status}): ${JSON.stringify(externalResult.data).slice(0, 4000)}`);
+          }
         } catch (error) {
           addMessage("hermes", `External access was not performed: ${error.message}`);
         }
