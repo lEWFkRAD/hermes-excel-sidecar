@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import aiohttp
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
@@ -32,6 +33,18 @@ DEFAULT_PORT = 8794
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 INGEST_TOKEN_RE = re.compile(rb"^[0-9a-f]{64}$")
 MAX_INGEST_TOKEN_BYTES = 64
+
+
+def _sanitize_remote_data(value, depth=0):
+    if depth > 6:
+        return "[depth limited]"
+    if isinstance(value, str):
+        return re.sub(r"(?i)(token|access[_-]?token|refresh[_-]?token|secret|password|authorization|api[_-]?key)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", value)
+    if isinstance(value, list):
+        return [_sanitize_remote_data(item, depth + 1) for item in value[:500]]
+    if isinstance(value, dict):
+        return {key: "[REDACTED]" if re.search(r"(?i)token|secret|password|authorization|api[_-]?key", str(key)) else _sanitize_remote_data(item, depth + 1) for key, item in list(value.items())[:500]}
+    return value
 
 
 class OwnerBindingError(RuntimeError):
@@ -217,6 +230,7 @@ class ExcelAdapter(BasePlatformAdapter):
         app.router.add_post("/cancel", self._handle_cancel)
         app.router.add_get("/activity", self._handle_activity)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_post("/external/request", self._handle_external_request)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         await web.TCPSite(self._runner, self._host, self._port).start()
@@ -253,6 +267,43 @@ class ExcelAdapter(BasePlatformAdapter):
             "owner_fingerprint": owner.owner_fingerprint,
             "bridge_port": owner.bridge_port,
         })
+
+    async def _handle_external_request(self, request):
+        from aiohttp import web
+        _, error = self._authorize_request(request)
+        if error is not None:
+            return error
+        try:
+            body = await request.json(loads=json.loads)
+            url = str(body.get("url", ""))
+            parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(url)
+            if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                return web.json_response({"error": "remote connector requires a credential-free HTTPS URL"}, status=400)
+            allowed = {
+                "reformenginiring.cynteka.ru": os.getenv("CYNTEKA_REFORMENGINIRING_TOKEN"),
+                "partner.cynteka.ru": os.getenv("CYNTEKA_PARTNER_TOKEN"),
+            }
+            token = allowed.get(parsed.hostname.lower())
+            scope = str(body.get("credential_scope", ""))
+            if not token or not scope:
+                return web.json_response({"error": "approved credential is unavailable on the VPS"}, status=503)
+            if str(body.get("operation", "api_read")).lower() not in {"read", "browser_read", "api_read"}:
+                return web.json_response({"error": "only read-only operations are allowed"}, status=400)
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout, raise_for_status=False) as session:
+                async with session.get(url, headers={"Accept": "application/json", "ZakupayToken": token}, allow_redirects=False) as response:
+                    raw = await response.content.read(512 * 1024 + 1)
+                    if len(raw) > 512 * 1024:
+                        return web.json_response({"error": "remote response is too large"}, status=502)
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        data = raw.decode("utf-8", "replace")
+                    return web.json_response({"ok": 200 <= response.status < 300, "status": response.status, "content_type": response.headers.get("Content-Type", ""), "data": _sanitize_remote_data(data)})
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "remote connector timed out"}, status=504)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)[:240]}, status=502)
 
     async def _handle_cancel(self, request):
         from aiohttp import web

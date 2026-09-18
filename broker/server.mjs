@@ -2703,7 +2703,12 @@ if (isMainModule) {
           const request = normalizeExternalAccessRequest(body);
           if (!consumeExternalGrant(req.headers["x-hermes-external-grant"], request, "origin")) return send(res, 403, { error: "Valid external approval grant is required." }, undefined, origin);
           if (request.requires_secret_approval && !consumeExternalGrant(req.headers["x-hermes-credential-grant"], request, "credential")) return send(res, 403, { error: "Valid credential approval grant is required." }, undefined, origin);
-          const result = await externalConnector.request(request, { originApproved: true, credentialApproved: true });
+          const result = request.requires_secret_approval
+            ? await (async () => {
+                const upstream = await fetch(excelAdapterUrl.replace(/\/ingest$/, "/external/request"), { method: "POST", headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) }, body: JSON.stringify(request), signal: AbortSignal.timeout(20_000) });
+                return { ...(await upstream.json().catch(() => ({ error: `remote connector HTTP ${upstream.status}` }))), status: upstream.status, ok: upstream.ok };
+              })()
+            : await externalConnector.request(request, { originApproved: true, credentialApproved: true });
           return send(res, result.ok ? 200 : result.status || 502, result, undefined, origin);
         }
         // `await` is load-bearing: rejections from the probe, chat uploads, or
