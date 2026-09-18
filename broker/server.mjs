@@ -528,6 +528,7 @@ function normalizeExternalAccessRequest(input = {}) {
   if (parsed.toString().length > 2048) throw new Error("External access URL is too long.");
   if (isPrivateOrLocalHost(parsed.hostname)) throw new Error("External access to local or private hosts is blocked.");
   if (parsed.username || parsed.password) throw new Error("External access URL cannot contain credentials.");
+  if (parsed.search || parsed.hash) throw new Error("External access URL cannot contain query parameters or fragments.");
   const purpose = String(input.purpose || "").trim();
   if (!purpose) throw new Error("External access purpose is required.");
   if (purpose.length > 240) throw new Error("External access purpose is too long.");
@@ -2670,6 +2671,7 @@ if (isMainModule) {
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
         if (req.method === "GET" && apiPath === "/api/capabilities") return send(res, 200, buildCapabilities(), undefined, origin);
         if (req.method === "POST" && apiPath === "/api/external/request") {
+          if (!bridgeToken) return send(res, 503, { error: "External connector requires a configured bridge token." }, undefined, origin);
           const body = await readJson(req, 64 * 1024);
           const result = await externalConnector.request(body, {
             originApproved: req.headers["x-hermes-external-approval"] === "once" || req.headers["x-hermes-external-approval"] === "session",

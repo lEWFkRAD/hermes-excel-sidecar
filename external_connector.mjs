@@ -1,3 +1,4 @@
+import dns from "node:dns/promises";
 import net from "node:net";
 
 const MAX_RESPONSE_BYTES = 512 * 1024;
@@ -10,18 +11,26 @@ function isPrivateHost(hostname) {
   const ipVersion = net.isIP(host);
   if (!ipVersion) return false;
   if (ipVersion === 4) {
-    const [a, b] = host.split(".").map(Number);
-    return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a === 0 || a >= 224;
+    const octets = host.split(".").map(Number);
+    const n = (((octets[0] * 256 + octets[1]) * 256 + octets[2]) * 256 + octets[3]) >>> 0;
+    const inRange = (start, end) => n >= start && n <= end;
+    return inRange(0x00000000, 0x00ffffff) || inRange(0x0a000000, 0x0affffff) || inRange(0x64400000, 0x647fffff) || inRange(0x7f000000, 0x7fffffff) || inRange(0xa9fe0000, 0xa9feffff) || inRange(0xac100000, 0xac1fffff) || inRange(0xc0000000, 0xc00000ff) || inRange(0xc0a80000, 0xc0a8ffff) || inRange(0xc6120000, 0xc613ffff) || inRange(0xc6336400, 0xc63364ff) || inRange(0xcb007100, 0xcb0071ff) || n >= 0xe0000000;
   }
   const normalized = host.replace(/^::ffff:/, "");
   if (net.isIP(normalized) === 4) return isPrivateHost(normalized);
   return host === "::" || host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe8") || host.startsWith("fe9") || host.startsWith("fea") || host.startsWith("feb");
 }
 
+async function assertPublicResolution(hostname) {
+  if (isPrivateHost(hostname)) throw new Error("Connector refuses private or local hosts.");
+  const records = await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!records.length || records.some((record) => isPrivateHost(record.address))) throw new Error("Connector resolved to a private or local host.");
+}
+
 function sanitizeValue(value, depth = 0) {
   if (depth > 6) return "[depth limited]";
   if (typeof value === "string") {
-    return value.replace(/([?&](?:token|secret|password|api[_-]?key|authorization)=[^&#\s]*)/gi, "$1".replace(/=[^&#\s]*/, "=[REDACTED]"));
+    return value.replace(/([?&](?:token|secret|password|api[_-]?key|authorization)=[^&#\s]*)/gi, (_match, prefix) => `${prefix.split("=")[0]}=[REDACTED]`);
   }
   if (Array.isArray(value)) return value.slice(0, 500).map((item) => sanitizeValue(item, depth + 1));
   if (value && typeof value === "object") {
@@ -53,6 +62,7 @@ export class ExternalConnector {
   async request(input, { originApproved = false, credentialApproved = false } = {}) {
     const request = normalizeConnectorRequest(input);
     if (!this.enabled) throw new Error("External connector is disabled.");
+    await assertPublicResolution(new URL(request.url).hostname);
     if (!originApproved || !this.allowedOrigins.has(request.origin)) throw new Error("External origin approval is required.");
     if (request.credential_scope && !credentialApproved) throw new Error("Separate credential approval is required.");
     const controller = new AbortController();

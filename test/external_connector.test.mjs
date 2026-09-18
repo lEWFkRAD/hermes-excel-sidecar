@@ -8,6 +8,8 @@ test("connector rejects non-HTTPS, private hosts, and query credentials", () => 
   assert.throws(() => normalizeConnectorRequest({ url: "https://example.com/x?token=secret" }));
   assert.equal(isPrivateHost("10.0.0.1"), true);
   assert.equal(isPrivateHost("example.com"), false);
+  assert.equal(isPrivateHost("169.254.169.254"), true);
+  assert.equal(isPrivateHost("100.64.0.1"), true);
 });
 
 test("connector is disabled by default and approval is mandatory", async () => {
