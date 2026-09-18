@@ -31,7 +31,10 @@ async function assertPublicResolution(hostname) {
 function sanitizeValue(value, depth = 0) {
   if (depth > 6) return "[depth limited]";
   if (typeof value === "string") {
-    return value.replace(/([?&](?:token|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret|password|api[_-]?key|authorization)=[^&#\s]*)/gi, (_match, prefix) => `${prefix.split("=")[0]}=[REDACTED]`);
+    return value
+      .replace(/([?&#\s](?:token|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret|password|api[_-]?key)\s*[=:]\s*)[^&#\s,;]*/gi, "$1[REDACTED]")
+      .replace(/(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
+      .replace(/(^|[\s,{])((?:token|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret|password|api[_-]?key)\s*[=:]\s*)[^\s,;}]+/gi, "$1$2[REDACTED]");
   }
   if (Array.isArray(value)) return value.slice(0, 500).map((item) => sanitizeValue(item, depth + 1));
   if (value && typeof value === "object") {
@@ -55,6 +58,14 @@ export function normalizeConnectorRequest(input = {}) {
 function requestHttps(url, headers, timeoutMs) {
   const parsed = new URL(url);
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      if (error) reject(error); else resolve(value);
+    };
+    const deadline = setTimeout(() => { req.destroy(); finish(new Error("Connector request timed out.")); }, timeoutMs);
     const req = https.request(parsed, {
       method: "GET", headers, timeout: timeoutMs, servername: parsed.hostname,
       lookup: (hostname, _options, callback) => dns.lookup(hostname, { all: true, verbatim: true }).then((records) => {
@@ -65,11 +76,17 @@ function requestHttps(url, headers, timeoutMs) {
     }, (response) => {
       const chunks = [];
       let total = 0;
-      response.on("data", (chunk) => { total += chunk.length; if (total <= MAX_RESPONSE_BYTES) chunks.push(chunk); else req.destroy(new Error("Connector response is too large.")); });
-      response.on("end", () => resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode || 0, content_type: response.headers["content-type"] || "", body: Buffer.concat(chunks).toString("utf8") }));
+      response.on("data", (chunk) => {
+        total += chunk.length;
+        if (total > MAX_RESPONSE_BYTES) { req.destroy(); finish(new Error("Connector response is too large.")); return; }
+        chunks.push(chunk);
+      });
+      response.on("error", (error) => finish(error));
+      response.on("aborted", () => finish(new Error("Connector response was aborted.")));
+      response.on("end", () => finish(null, { ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode || 0, content_type: response.headers["content-type"] || "", body: Buffer.concat(chunks).toString("utf8") }));
     });
     req.on("timeout", () => req.destroy(new Error("Connector request timed out.")));
-    req.on("error", reject);
+    req.on("error", (error) => finish(error));
     req.end();
   });
 }

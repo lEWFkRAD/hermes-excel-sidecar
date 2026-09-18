@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ExternalConnector, normalizeConnectorRequest, isPrivateHost } from "../external_connector.mjs";
+import { ExternalConnector, normalizeConnectorRequest, isPrivateHost, sanitizeValue } from "../external_connector.mjs";
 
 test("connector rejects non-HTTPS, private hosts, and query credentials", () => {
   assert.throws(() => normalizeConnectorRequest({ url: "http://example.com" }));
@@ -17,6 +17,11 @@ test("connector is disabled by default and approval is mandatory", async () => {
   await assert.rejects(() => connector.request({ url: "https://example.com/catalog", purpose: "read", operation: "api_read" }), /disabled/);
   const enabled = new ExternalConnector({ enabled: true, allowedOrigins: ["https://example.com"] });
   await assert.rejects(() => enabled.request({ url: "https://example.com/catalog", purpose: "read" }), /approval/);
+});
+
+test("string response sanitization covers common credential forms", () => {
+  const value = sanitizeValue("token=abc password=def #access_token=ghi Authorization: Bearer jkl");
+  assert.doesNotMatch(value, /abc|def|ghi|jkl/);
 });
 
 test("credential approval is separate and token is resolved at request time", async () => {
