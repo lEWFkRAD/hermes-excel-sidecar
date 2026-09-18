@@ -39,7 +39,7 @@ const state = {
   uiScope: "workbook",
   externalApprovalGrants: new Map(),
   externalApprovalTokens: new Map(),
-  externalAccessEnabled: false,
+  externalAccessEnabled: true,
 };
 
 function randomId(prefix) {

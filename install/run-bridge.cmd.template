@@ -44,6 +44,8 @@ powershell -NoProfile -Command "if ($env:HERMES_EXCEL_BRIDGE_TOKEN -notmatch '^[
 if errorlevel 1 exit /b 1
 set "HERMES_EXCEL_TRANSPORT=platform-only"
 set "HERMES_EXCEL_ALLOW_RAW_FALLBACK=0"
+set "HERMES_EXCEL_EXTERNAL_ACCESS_ENABLED=1"
+set "HERMES_EXCEL_EXTERNAL_ALLOWED_ORIGINS=https://reformenginiring.cynteka.ru,https://partner.cynteka.ru"
 set "HERMES_EXCEL_DOCLING_MODE=__DOCLING_MODE__"
 set "HERMES_EXCEL_WSL_DISTRO=__WSL_DISTRO__"
 
