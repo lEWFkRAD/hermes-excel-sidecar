@@ -23,3 +23,6 @@ service/bridge-service.vbs
 *.crt
 .bridge-token
 .ingest-token
+
+# Hermes task plans and workspace metadata.
+.hermes/
