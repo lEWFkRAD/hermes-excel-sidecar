@@ -21,7 +21,7 @@ test("connector is disabled by default and approval is mandatory", async () => {
 
 test("credential approval is separate and token is resolved at request time", async () => {
   const calls = [];
-  const connector = new ExternalConnector({ enabled: true, allowedOrigins: ["https://example.com"], credentialResolver: async (scope) => { calls.push(scope); return "runtime-token"; } });
+  const connector = new ExternalConnector({ enabled: true, allowedOrigins: ["https://example.com"], credentialResolver: async (scope) => { calls.push(scope); return "runtime-token"; }, requester: async (_url, options) => ({ ok: true, status: 200, content_type: "application/json", body: JSON.stringify({ result: true, token: "should-not-leak", access_token: "also-secret" }), options }) });
   await assert.rejects(() => connector.request({ url: "https://example.com/catalog", purpose: "read", credential_scope: "catalog.read" }, { originApproved: true }), /credential approval/);
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, options) => ({ ok: true, status: 200, headers: new Headers({ "content-type": "application/json" }), text: async () => JSON.stringify({ result: true, token: "should-not-leak" }), options });
@@ -29,5 +29,6 @@ test("credential approval is separate and token is resolved at request time", as
     const result = await connector.request({ url: "https://example.com/catalog", purpose: "read", credential_scope: "catalog.read" }, { originApproved: true, credentialApproved: true });
     assert.deepEqual(calls, ["catalog.read"]);
     assert.equal(result.data.token, "[REDACTED]");
+    assert.equal(result.data.access_token, "[REDACTED]");
   } finally { globalThis.fetch = originalFetch; }
 });

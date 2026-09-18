@@ -1,9 +1,10 @@
 import dns from "node:dns/promises";
+import https from "node:https";
 import net from "node:net";
 
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const DEFAULT_TIMEOUT_MS = 15_000;
-const SECRET_KEYS = /token|secret|password|authorization|api[-_]?key|cookie/i;
+const SECRET_KEYS = /token|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret|password|authorization|cookie|api[-_]?key/i;
 
 function isPrivateHost(hostname) {
   const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
@@ -30,7 +31,7 @@ async function assertPublicResolution(hostname) {
 function sanitizeValue(value, depth = 0) {
   if (depth > 6) return "[depth limited]";
   if (typeof value === "string") {
-    return value.replace(/([?&](?:token|secret|password|api[_-]?key|authorization)=[^&#\s]*)/gi, (_match, prefix) => `${prefix.split("=")[0]}=[REDACTED]`);
+    return value.replace(/([?&](?:token|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret|password|api[_-]?key|authorization)=[^&#\s]*)/gi, (_match, prefix) => `${prefix.split("=")[0]}=[REDACTED]`);
   }
   if (Array.isArray(value)) return value.slice(0, 500).map((item) => sanitizeValue(item, depth + 1));
   if (value && typeof value === "object") {
@@ -51,11 +52,34 @@ export function normalizeConnectorRequest(input = {}) {
   return { url: parsed.toString(), origin: parsed.origin, operation, purpose: String(input.purpose || "").trim().slice(0, 240), credential_scope: credentialScope };
 }
 
+function requestHttps(url, headers, timeoutMs) {
+  const parsed = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = https.request(parsed, {
+      method: "GET", headers, timeout: timeoutMs, servername: parsed.hostname,
+      lookup: (hostname, _options, callback) => dns.lookup(hostname, { all: true, verbatim: true }).then((records) => {
+        const publicRecord = records.find((record) => !isPrivateHost(record.address));
+        if (!publicRecord || records.some((record) => isPrivateHost(record.address))) throw new Error("Connector resolved to a private or local host.");
+        callback(null, publicRecord.address, publicRecord.family);
+      }).catch((error) => callback(error)),
+    }, (response) => {
+      const chunks = [];
+      let total = 0;
+      response.on("data", (chunk) => { total += chunk.length; if (total <= MAX_RESPONSE_BYTES) chunks.push(chunk); else req.destroy(new Error("Connector response is too large.")); });
+      response.on("end", () => resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode || 0, content_type: response.headers["content-type"] || "", body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("timeout", () => req.destroy(new Error("Connector request timed out.")));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 export class ExternalConnector {
-  constructor({ enabled = false, allowedOrigins = [], credentialResolver = null, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  constructor({ enabled = false, allowedOrigins = [], credentialResolver = null, timeoutMs = DEFAULT_TIMEOUT_MS, requester = requestHttps } = {}) {
     this.enabled = enabled === true;
     this.allowedOrigins = new Set(allowedOrigins);
     this.credentialResolver = credentialResolver;
+    this.requester = requester;
     this.timeoutMs = Math.max(1000, Math.min(Number(timeoutMs) || DEFAULT_TIMEOUT_MS, 60_000));
   }
 
@@ -65,25 +89,17 @@ export class ExternalConnector {
     await assertPublicResolution(new URL(request.url).hostname);
     if (!originApproved || !this.allowedOrigins.has(request.origin)) throw new Error("External origin approval is required.");
     if (request.credential_scope && !credentialApproved) throw new Error("Separate credential approval is required.");
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const headers = { Accept: "application/json, text/plain;q=0.9" };
-      if (request.credential_scope) {
-        if (typeof this.credentialResolver !== "function") throw new Error("Credential resolver is unavailable.");
-        const token = await this.credentialResolver(request.credential_scope);
-        if (!token || typeof token !== "string") throw new Error("Credential is unavailable.");
-        headers.ZakupayToken = token;
-      }
-      const response = await fetch(request.url, { method: "GET", redirect: "manual", headers, signal: controller.signal });
-      const body = await response.text();
-      if (Buffer.byteLength(body, "utf8") > MAX_RESPONSE_BYTES) throw new Error("Connector response is too large.");
-      let data;
-      try { data = JSON.parse(body); } catch { data = body.slice(0, MAX_RESPONSE_BYTES); }
-      return { ok: response.ok, status: response.status, content_type: response.headers.get("content-type") || "", data: sanitizeValue(data) };
-    } finally {
-      clearTimeout(timer);
+    const headers = { Accept: "application/json, text/plain;q=0.9" };
+    if (request.credential_scope) {
+      if (typeof this.credentialResolver !== "function") throw new Error("Credential resolver is unavailable.");
+      const token = await this.credentialResolver(request.credential_scope);
+      if (!token || typeof token !== "string") throw new Error("Credential is unavailable.");
+      headers.ZakupayToken = token;
     }
+    const response = await this.requester(request.url, headers, this.timeoutMs);
+    let data;
+    try { data = JSON.parse(response.body); } catch { data = String(response.body).slice(0, MAX_RESPONSE_BYTES); }
+    return { ok: response.ok, status: response.status, content_type: response.content_type, data: sanitizeValue(data) };
   }
 }
 
