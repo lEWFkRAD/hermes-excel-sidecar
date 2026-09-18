@@ -14,7 +14,7 @@ const releaseIndex = args.indexOf("--release");
 const release = releaseIndex >= 0 ? args[releaseIndex + 1] : JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
 if (!output || !release) throw new Error("Usage: build-release-bundle.mjs --output PATH [--release VALUE]");
 
-const includedRoots = ["manifest.xml", "plugin.yaml", "package.json", "package-lock.json", "README.md", "PROTOCOL.md", "SECURITY.md", "RELEASING.md", "CHANGELOG.md", "LICENSE", "taskpane.html", "taskpane.css", "taskpane.js", "broker", "install", "scripts", "test", "jobs", "assets", "adapter.py", "excel_runtime.py", "excel_policy.py", "excel_tool.py", "profile_ownership.py", "remote_mode.py", "cli.py", "__init__.py"];
+const includedRoots = ["manifest.xml", "plugin.yaml", "package.json", "package-lock.json", "README.md", "PROTOCOL.md", "SECURITY.md", "RELEASING.md", "CHANGELOG.md", "LICENSE", "taskpane.html", "taskpane.css", "taskpane.js", "broker", "install", "scripts", "test", "jobs", "src", "assets", "adapter.py", "excel_runtime.py", "excel_policy.py", "excel_tool.py", "profile_ownership.py", "remote_mode.py", "cli.py", "__init__.py"];
 const forbidden = /(^|\/)(?:\.git|node_modules|data|uploads|exports|__pycache__|\.pytest_cache|dist)(?:\/|$)|(?:^|\/)(?:\.env|\.bridge-token|\.ingest-token|.*\.(?:key|pem|pfx|crt))$/i;
 function dosDateTime() { return { date: 0x0021, time: 0 }; }
 function u16(n) { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; }
