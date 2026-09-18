@@ -352,7 +352,7 @@ function buildCapabilities({ version = excelVersion, defaultModel = llmModel, mo
     context: { scopes: ["workbook", "sheet", "selection"], selection_is_target_hint: true },
     operations: ["read_range", "write_cells", "format_cells", "create_sheet", "verify", "undo"],
     approvals: { workbook_review: true, secret_approval: true, critical_tool_approval: true },
-    external_access: { enabled: false, scaffold: true, approval: "per-origin-session", secret_approval_separate: true, writes_default: false },
+    external_access: { enabled: process.env.HERMES_EXCEL_EXTERNAL_ACCESS_ENABLED === "1", scaffold: true, approval: "server-issued-expiring-grant", secret_approval_separate: true, writes_default: false },
   };
 }
 
@@ -2010,7 +2010,7 @@ function buildSystemPrompt(loopBudgetExhausted) {
       + '{"type":"delete_sheet","name":"Old"}, {"type":"sort_range","range":"A2:D20","column":1,"ascending":true,"has_header":false}, '
       + '{"type":"clear_range","range":"A1:D20","target":"contents"}.',
     'A read action is also available: {"type":"read_range","range":"Sheet Name!A1:D200","reason":"short why"}.',
-    'External site/API access is represented only by {"type":"request_external_access","url":"https://...","purpose":"short reason","operation":"read|browser_read|api_read","credential_scope":"optional"}; the task pane will require per-origin and separate credential approval. It is disabled until an approval-aware connector is deployed.',
+    'External site/API access is represented only by {"type":"request_external_access","url":"https://...","purpose":"short reason","operation":"read|browser_read|api_read","credential_scope":"optional"}; The task pane requires a server-issued expiring grant for each approved origin and a separate grant for credential use.',
     "COMPLETE THE ENTIRE TASK IN THIS ONE REPLY. You get no follow-up turn except to receive read_range results you explicitly request. Never say you will continue 'in a couple of actions', 'next', or 'then' — emit every action the task needs right now, in this single actions array.",
     "Each cell value must be short — a label, a number, or a formula. Formulas are encouraged (see the A1-relative formula rule below); the only limit is on prose, not on formulas or numbers. NEVER put a sentence, explanation, or multi-clause note (more than ~40 characters of prose) inside a cell, and never build a 'QA Notes' block out of long prose rows — that corrupts the output and makes the model stop mid-reply. If the user wants a QA note, keep it to a few short cells or put the explanation in the 'message' field instead of in the sheet.",
     "Use conditional_format (NOT execute_office_js) to highlight cells by value, e.g. Margin % below a threshold. operator is one of lessThan, lessThanOrEqual, greaterThan, greaterThanOrEqual, equalTo, notEqualTo, between, notBetween. For percentage columns the underlying cell value is a decimal, so 'below 25%' means value 0.25 (not 25). fill_color/font_color are hex; default is light-red fill #FFC7CE with dark-red font #9C0006.",
