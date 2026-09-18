@@ -38,6 +38,7 @@ const state = {
   liveActivity: null,
   uiScope: "workbook",
   externalApprovalGrants: new Map(),
+  externalApprovalTokens: new Map(),
   externalAccessEnabled: false,
 };
 
@@ -385,12 +386,24 @@ function approvalLevel(request) {
   return grant && grant.expiresAt > Date.now() ? grant.level : "";
 }
 
+async function obtainExternalGrant(request, kind) {
+  const response = await fetch(`${brokerUrls[0]}/api/external/grant`, {
+    method: "POST",
+    headers: bridgeHeaders({ "content-type": "application/json", "x-hermes-approval-kind": kind }),
+    body: JSON.stringify({ request, kind }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.grant) throw new Error(payload.error || "External approval grant could not be issued.");
+  state.externalApprovalTokens.set(`${kind}:${externalApprovalKey(request)}`, payload.grant);
+  return payload.grant;
+}
+
 async function performExternalRequest(request) {
-  const originApproval = approvalLevel(request);
-  const credentialApproval = request.requires_secret_approval ? approvalLevel({ ...request, credential_scope: `secret:${request.credential_scope}` }) : "";
+  const originGrant = state.externalApprovalTokens.get(`origin:${externalApprovalKey(request)}`);
+  const credentialGrant = request.requires_secret_approval ? state.externalApprovalTokens.get(`credential:${externalApprovalKey(request)}`) : "";
   const response = await fetch(`${brokerUrls[0]}/api/external/request`, {
     method: "POST",
-    headers: bridgeHeaders({ "content-type": "application/json", "x-hermes-external-approval": originApproval, "x-hermes-credential-approval": credentialApproval }),
+    headers: bridgeHeaders({ "content-type": "application/json", "x-hermes-external-grant": originGrant, "x-hermes-credential-grant": credentialGrant }),
     body: JSON.stringify(request),
   });
   const payload = await response.json().catch(() => ({}));
@@ -1820,6 +1833,8 @@ function wireActions() {
         try {
           for (const action of accessActions) {
             await requestExternalAccessApproval(action);
+            await obtainExternalGrant(action, "origin");
+            if (action.requires_secret_approval) await obtainExternalGrant(action, "credential");
             const externalResult = await performExternalRequest(action);
             addMessage("hermes", `External result (${externalResult.status}): ${JSON.stringify(externalResult.data).slice(0, 4000)}`);
           }

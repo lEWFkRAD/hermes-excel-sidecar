@@ -27,6 +27,8 @@ const externalConnector = new ExternalConnector({
     return process.env[key] || null;
   },
 });
+const externalApprovalGrants = new Map();
+const EXTERNAL_GRANT_TTL_MS = 12 * 60 * 60 * 1000;
 const tlsCertPath = process.env.HERMES_EXCEL_TLS_CERT || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.crt");
 const tlsKeyPath = process.env.HERMES_EXCEL_TLS_KEY || path.join(process.env.USERPROFILE || "", ".office-addin-dev-certs", "localhost.key");
 const tlsEnabled = existsSync(tlsCertPath) && existsSync(tlsKeyPath);
@@ -547,6 +549,23 @@ function normalizeExternalAccessRequest(input = {}) {
     requires_secret_approval: Boolean(credentialScope),
     approval_scope: "origin-operation-credential",
   };
+}
+
+function externalGrantKey(request, kind) {
+  return `${kind}:${JSON.stringify({ origin: request.origin, url: request.url, operation: request.operation, credential_scope: request.credential_scope || "" })}`;
+}
+
+function issueExternalGrant(request, kind) {
+  const grant = randomUUID();
+  externalApprovalGrants.set(grant, { key: externalGrantKey(request, kind), expiresAt: Date.now() + EXTERNAL_GRANT_TTL_MS });
+  return grant;
+}
+
+function consumeExternalGrant(grant, request, kind) {
+  const record = externalApprovalGrants.get(String(grant || ""));
+  if (!record || record.expiresAt <= Date.now() || record.key !== externalGrantKey(request, kind)) return false;
+  externalApprovalGrants.delete(grant);
+  return true;
 }
 
 function truncateText(text, maxChars = maxExtractedCharsPerFile) {
@@ -2670,13 +2689,21 @@ if (isMainModule) {
 
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
         if (req.method === "GET" && apiPath === "/api/capabilities") return send(res, 200, buildCapabilities(), undefined, origin);
+        if (req.method === "POST" && apiPath === "/api/external/grant") {
+          if (!bridgeToken) return send(res, 503, { error: "External connector requires a configured bridge token." }, undefined, origin);
+          const body = await readJson(req, 64 * 1024);
+          const request = normalizeExternalAccessRequest(body.request || body);
+          const kind = body.kind === "credential" ? "credential" : "origin";
+          if (req.headers["x-hermes-approval-kind"] !== kind) return send(res, 403, { error: "Approval kind mismatch." }, undefined, origin);
+          return send(res, 200, { grant: issueExternalGrant(request, kind), kind, expires_in_ms: EXTERNAL_GRANT_TTL_MS }, undefined, origin);
+        }
         if (req.method === "POST" && apiPath === "/api/external/request") {
           if (!bridgeToken) return send(res, 503, { error: "External connector requires a configured bridge token." }, undefined, origin);
           const body = await readJson(req, 64 * 1024);
-          const result = await externalConnector.request(body, {
-            originApproved: req.headers["x-hermes-external-approval"] === "once" || req.headers["x-hermes-external-approval"] === "session",
-            credentialApproved: req.headers["x-hermes-credential-approval"] === "once" || req.headers["x-hermes-credential-approval"] === "session",
-          });
+          const request = normalizeExternalAccessRequest(body);
+          if (!consumeExternalGrant(req.headers["x-hermes-external-grant"], request, "origin")) return send(res, 403, { error: "Valid external approval grant is required." }, undefined, origin);
+          if (request.requires_secret_approval && !consumeExternalGrant(req.headers["x-hermes-credential-grant"], request, "credential")) return send(res, 403, { error: "Valid credential approval grant is required." }, undefined, origin);
+          const result = await externalConnector.request(request, { originApproved: true, credentialApproved: true });
           return send(res, result.ok ? 200 : result.status || 502, result, undefined, origin);
         }
         // `await` is load-bearing: rejections from the probe, chat uploads, or
