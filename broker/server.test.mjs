@@ -52,6 +52,9 @@ import {
   claimsWorkbookChange,
   promptWantsWorkbookOutput,
   parseHermesApiServerKey,
+  buildCapabilities,
+  extractLinkCandidates,
+  normalizeExternalAccessRequest,
 } from "./server.mjs";
 import {
   columnLettersToNumber,
@@ -364,6 +367,11 @@ test("normalizeAction: all action types plus unknown", () => {
   assert.strictEqual(rrLong.reason.length, 200);
   assert.strictEqual(normalizeAction({ type: "read_range" }), null);
 
+  const ext = normalizeAction({ type: "request_external_access", url: "https://example.com/catalog/1", purpose: "Verify item", operation: "api_read", credential_scope: "catalog.read" });
+  assert.equal(ext.type, "request_external_access");
+  assert.equal(ext.origin, "https://example.com");
+  assert.equal(ext.requires_secret_approval, true);
+
   assert.strictEqual(normalizeAction({ type: "unknown" }), null);
 });
 
@@ -581,6 +589,55 @@ test("normalizeWorkbook: legacy string sheets, object sheets, 30-sheet cap", () 
   assert.deepStrictEqual(normalizeWorkbook(null), { activeSheet: "", sheets: [] });
 });
 
+test("extractLinkCandidates finds safe HTTPS links from read results without fetching them", () => {
+  const links = extractLinkCandidates([
+    { range: "Sheet1!Z2:Z3", values: [["https://reformenginiring.cynteka.ru/offer/1"], ["not a url"]] },
+    { range: "Sheet2!A1", values: [["http://insecure.example/a"]] },
+  ]);
+  assert.deepEqual(links, [{ range: "Sheet1!Z2:Z3", url: "https://reformenginiring.cynteka.ru/offer/1" }]);
+  assert.deepEqual(extractLinkCandidates([{ range: "S!A1", values: [["https://example.com/a?token=secret#access_token=secret"]] }]), [{ range: "S!A1", url: "https://example.com/a" }]);
+  assert.deepEqual(extractLinkCandidates([{ range: { secret: "RANGE_OBJECT_SECRET" }, values: [[{ toString: () => "https://example.com/object_secret" }], [["https://example.com/array_secret"]]] }]), []);
+});
+test("external access requests require per-origin session approval and separate secret scope", () => {
+  const request = normalizeExternalAccessRequest({
+    url: "https://reformenginiring.cynteka.ru/offer/1",
+    purpose: "verify material offer",
+    operation: "read",
+    credential_scope: "cynteka.reformenginiring.read",
+  });
+  assert.deepEqual(request, {
+    origin: "https://reformenginiring.cynteka.ru",
+    url: "https://reformenginiring.cynteka.ru/offer/1",
+    purpose: "verify material offer",
+    operation: "read",
+    credential_scope: "cynteka.reformenginiring.read",
+    requires_secret_approval: true,
+    approval_scope: "origin-operation-credential",
+  });
+  assert.throws(() => normalizeExternalAccessRequest({ url: "http://example.com/" }), /HTTPS/);
+  assert.throws(() => normalizeExternalAccessRequest({ url: "https://127.0.0.1/" }), /private/);
+  assert.throws(() => normalizeExternalAccessRequest({ url: "https://[fc00::1]/" }), /private/);
+  assert.throws(() => normalizeExternalAccessRequest({ url: "https://[::ffff:127.0.0.1]/" }), /private/);
+  assert.throws(() => normalizeExternalAccessRequest({ url: "https://[::]/" }), /private/);
+  assert.throws(() => normalizeExternalAccessRequest({ url: "https://[fec0::1]/" }), /private/);
+  assert.throws(() => normalizeExternalAccessRequest({ url: "https://localhost./" }), /private/);
+  assert.throws(() => normalizeExternalAccessRequest({ url: "https://example.com/" }), /purpose/);
+});
+test("capabilities expose safe protocol metadata without secrets", () => {
+  const capabilities = buildCapabilities({
+    version: "0.2.0-staging",
+    defaultModel: "hermes-agent",
+    models: [{ id: "gpt-test", provider: "test", capabilities: ["chat"] }],
+  });
+  assert.equal(capabilities.protocol, 1);
+  assert.equal(capabilities.version, "0.2.0-staging");
+  assert.equal(capabilities.default_model, "hermes-agent");
+  assert.deepEqual(capabilities.models, [{ id: "gpt-test", provider: "test", capabilities: ["chat"] }]);
+  assert.equal(Object.hasOwn(capabilities, "token"), false);
+  assert.equal(Object.hasOwn(capabilities, "api_key"), false);
+});
+
+
 test("buildChatMessages: system prompt, history cap and sanitizing, tool results, loop budget", () => {
   const base = buildChatMessages({ prompt: "hi" });
   assert.strictEqual(base[0].role, "system");
@@ -613,6 +670,29 @@ test("buildChatMessages: system prompt, history cap and sanitizing, tool results
   assert.ok(!notYet[0].content.includes("READ BUDGET EXHAUSTED"));
   const exhausted = buildChatMessages({ prompt: "hi", loop_count: 5 });
   assert.ok(exhausted[0].content.includes("READ BUDGET EXHAUSTED"));
+  const scoped = buildChatMessages({ prompt: "hi", scope: "selection", selected_target: "Sheet1!D906" });
+  const scopedRequest = JSON.parse(scoped[1].content);
+  assert.strictEqual(scopedRequest.context_scope, "selection");
+  assert.strictEqual(scopedRequest.selected_target, "Sheet1!D906");
+
+  const invalidScope = buildChatMessages({ prompt: "hi", scope: "not-a-scope" });
+  assert.strictEqual(JSON.parse(invalidScope[1].content).context_scope, "workbook");
+  const sanitizedMessages = buildChatMessages({ prompt: "verify", tool_results: [{ range: "https://range.example/a?RANGE_SECRET=1", values: [["https://example.com/a?token=secret#access_token=secret", 42, true, null]], error: "http://error.example/?ERROR_SECRET=1" }] });
+  const sanitizedText = sanitizedMessages.at(-1).content;
+  assert.equal(sanitizedText.includes("token=secret"), false);
+  assert.equal(sanitizedText.includes("RANGE_SECRET"), false);
+  assert.equal(sanitizedText.includes("ERROR_SECRET"), false);
+  assert.equal(sanitizedText.includes("https://example.com/a"), true);
+  assert.equal(sanitizedText.includes("42"), true);
+  assert.equal(sanitizedText.includes("true"), true);
+  const structured = buildChatMessages({ prompt: "structured", tool_results: [{ range: { secret: "RANGE_OBJECT_SECRET" }, values: [[{ secret: "OBJECT_SECRET" }, ["NESTED_SECRET"]]], error: ["ERROR_ARRAY_SECRET", { secret: "ERROR_OBJECT_SECRET" }] }] });
+  assert.equal(structured.at(-1).content.includes("OBJECT_SECRET"), false);
+  assert.equal(structured.at(-1).content.includes("NESTED_SECRET"), false);
+  const selectionSecret = buildChatMessages({ prompt: "selection", selection: { address: "S!A1", values: [["https://select.example/?SECRET=1", { secret: "SELECTION_OBJECT_SECRET" }]], formulas: [["https://formula.example/?SECRET=1"]] } });
+  assert.equal(selectionSecret[1].content.includes("SECRET=1"), false);
+  assert.equal(selectionSecret[1].content.includes("SELECTION_OBJECT_SECRET"), false);
+  assert.equal(structured.at(-1).content.includes("ERROR_ARRAY_SECRET"), false);
+  assert.equal(structured.at(-1).content.includes("ERROR_OBJECT_SECRET"), false);
 });
 
 test("buildSystemPrompt: read budget flag, honesty rule, A1-relative formula rule", () => {

@@ -41,6 +41,8 @@ Request body:
   "history": [{"role": "user|assistant", "content": "..."}],   // last 12 turns
   "workbook": {"activeSheet": "...", "sheets": [{"name": "...", "usedRange": "A1:F120", "rowCount": 120, "columnCount": 6}]},
   "selection": {"address": "Sheet1!H23", "values": [[...]], "formulas": [[...]], "rowCount": 1, "columnCount": 1},
+  "scope": "workbook|sheet|selection",                         // declared analysis preference
+  "selected_target": "Sheet1!H23",                              // explicit target hint
   "files": [{"name": "x.pdf", "type": "application/pdf", "size": 1234, "base64": "..."}],
   "tool_results": [{"range": "Bank Rec!A1:B6", "values": [[...]], "formulas": [[...]], "truncated": true, "error": "..."}],  // loop rounds only
   "parsed_files": [ /* echo of a previous response's parsed_files */ ],   // loop rounds only
@@ -63,6 +65,14 @@ Response body:
 The bridge always answers HTTP 200 with a structured body; failures surface in
 `source` and `message`, never as fabricated data.
 
+### GET /api/capabilities
+
+Returns non-secret protocol metadata for the task pane and future model/connector
+selectors. It may include protocol/version, default model identifier, curated
+model metadata, supported operations, context modes, and approval capabilities.
+It must never include API keys, bearer tokens, ingest tokens, cookies, or raw
+secret-bearing errors.
+
 ### POST /api/export
 
 `{"name": "report", "values": [["matrix"]]}` → writes RFC-4180 CSV under the
@@ -79,6 +89,7 @@ file-writing path and runs only on an explicit export action.
 | `conditional_format` | `range`, `operator`, `value`, `value2?`, `fill_color`, `font_color` | pane |
 | structural ops | `merge_cells`/`unmerge_cells` (`range`), `insert_rows`/`delete_rows`/`insert_columns`/`delete_columns` (`sheet?`,`at`,`count`), `set_column_width`/`set_row_height` (`range`,`width`/`height`), `freeze_panes` (`rows`,`columns`)/`unfreeze_panes`, `autofit` (`range`), `rename_sheet` (`from?`,`to`), `delete_sheet` (`name`), `sort_range` (`range`,`column`,`ascending`,`has_header`), `clear_range` (`range`,`target`) | pane |
 | `read_range` | `range`, `reason` | pane (loop) |
+| `request_external_access` | `url`, `purpose`, `operation`, optional `credential_scope` | pane approval gate (disabled until connector runtime) |
 | `export` | `name`, `values` | pane → POST /api/export |
 
 `conditional_format` applies a native Office.js cell-value rule so the model
@@ -92,6 +103,31 @@ underlying cell value is a decimal, so "below 25%" is `value: 0.25`.
 
 The legacy `write: {mode, name, values}` response shape is still accepted and
 converted to actions.
+
+### External access approval policy
+
+Any future external site/API access must create an approval request before the
+first call to an origin. Approval is stored only for the current Excel session
+and is keyed by origin + read operation + connector/credential scope; approval
+for one site never authorizes another site. The UI should offer `Approve once`,
+`Approve this session`, and `Deny`.
+
+Credential use is a separate masked approval. `Approve this session` for
+`https://example.com` does not grant access to any token, and approving a
+Cynteka token does not grant access to arbitrary websites. External writes,
+non-read operations, redirects to a new origin, and changed credential scopes
+always require a new approval. Session end, revoke, policy/Skill reload, or
+expiry clears grants.
+
+
+When a read result contains HTTPS text URLs, the bridge may expose sanitized
+`link_candidates` metadata to the model/adapter. This step only detects and
+records candidate URLs; it does **not** fetch them. Invoice/receipt verification
+must be implemented as an explicit, allowlisted connector operation (for
+example, a VPS-side Cynteka resolver) with source/domain validation, separate
+secret approval when credentials are needed, timeout/size limits, redaction,
+and a structured result containing matched material, price/VAT fields, source,
+and timestamp. Generic arbitrary URL fetching is not part of the Excel pane.
 
 ### The read loop
 

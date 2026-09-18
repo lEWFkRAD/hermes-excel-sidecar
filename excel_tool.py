@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from urllib.parse import urlparse
 from typing import Any
 
 from .excel_runtime import capture_proposal
@@ -50,6 +51,7 @@ ACTION_SCHEMAS = [
         "value": CELL, "value2": CELL, "fill_color": {"type": "string", "maxLength": 20},
         "font_color": {"type": "string", "maxLength": 20}}, ["range", "operator", "value"]),
     _action("read_range", {"range": RANGE, "reason": {"type": "string", "maxLength": 240}}, ["range"]),
+    _action("request_external_access", {"url": {"type": "string", "format": "uri", "maxLength": 2048}, "purpose": {"type": "string", "minLength": 1, "maxLength": 240}, "operation": {"type": "string", "enum": ["read", "browser_read", "api_read"]}, "credential_scope": {"type": "string", "maxLength": 160}}, ["url", "purpose"]),
     _action("export", {"name": {"type": "string", "minLength": 1, "maxLength": 120}, "values": MATRIX}, ["name", "values"]),
 ]
 ACTION_SCHEMAS.append(_action("merge_cells", {"range": RANGE, "across": {"type": "boolean"}}, ["range"]))
@@ -126,6 +128,9 @@ def validate_schema(value: Any, schema: dict[str, Any], path: str = "value") -> 
     if "enum" in schema and value not in schema["enum"]: raise ValueError(f"{path} is not an allowed value")
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", len(value)): raise ValueError(f"{path} has invalid length")
+        if schema.get("format") == "uri":
+            parsed = urlparse(value)
+            if not parsed.scheme or not parsed.netloc: raise ValueError(f"{path} has invalid URI format")
         if schema.get("pattern") and not re.fullmatch(schema["pattern"], value): raise ValueError(f"{path} has invalid format")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if (isinstance(value, float) and not math.isfinite(value)) or value < schema.get("minimum", value) or value > schema.get("maximum", value): raise ValueError(f"{path} is out of range")

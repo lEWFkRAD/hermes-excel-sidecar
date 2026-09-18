@@ -4,6 +4,8 @@ version: 0.2.0
 description: >
   Install and operate the local Office.js task pane and authenticated bridge
   that connects Microsoft Excel to Hermes through structured workbook actions.
+  Supports split remote-server (VPS adapter) and remote-client (Windows Office)
+  deployment over a localhost-bound SSH tunnel.
 author: Jeffrey Watts
 kind: standalone
 platforms:

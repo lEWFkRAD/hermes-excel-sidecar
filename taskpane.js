@@ -36,6 +36,9 @@ const state = {
   activeRequestId: null,
   activityTimer: null,
   liveActivity: null,
+  uiScope: "workbook",
+  externalApprovalGrants: new Map(),
+  externalAccessEnabled: false,
 };
 
 function randomId(prefix) {
@@ -309,8 +312,93 @@ async function applyReviewedProposal(proposal) {
   return statusLines;
 }
 
+function externalApprovalKey(request = {}) {
+  return [String(request.origin || ""), String(request.operation || "read"), String(request.credential_scope || "")].join("|");
+}
+
+function normalizeExternalAccessRequest(input = {}) {
+  let parsed;
+  try { parsed = new URL(String(input.url || "")); } catch { throw new Error("External access URL is invalid."); }
+  const hostname = parsed.hostname.toLowerCase().replace(/[\[\]]/g, "").replace(/\.+$/, "");
+  const octets = hostname.split(".").map((part) => Number(part));
+  const mappedV4 = hostname.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  const mappedOctets = mappedV4 ? mappedV4.split(".").map((part) => Number(part)) : [];
+  const privateIp = hostname.includes(":") || (octets.length === 4 && octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255) &&
+    (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0 || octets[0] === 10 || octets[0] === 127 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) || (octets[0] === 192 && octets[1] === 168) || (octets[0] === 169 && octets[1] === 254))) ||
+    (mappedOctets.length === 4 && (mappedOctets[0] === 10 || mappedOctets[0] === 127 || (mappedOctets[0] === 192 && mappedOctets[1] === 168))) || /^::ffff:/i.test(hostname) || /^(fc|fd|fe8|fe9|fea|feb|fec[0-9a-f])/i.test(hostname);
+  if (parsed.protocol !== "https:") throw new Error("External access requires HTTPS.");
+  if (parsed.toString().length > 2048) throw new Error("External access URL is too long.");
+  if (hostname === "localhost" || hostname.endsWith(".localhost") || privateIp || hostname === "::" || hostname === "::1") throw new Error("External access to local or private hosts is blocked.");
+  if (parsed.username || parsed.password) throw new Error("External access URL cannot contain credentials.");
+  const purpose = String(input.purpose || "").trim();
+  if (!purpose) throw new Error("External access purpose is required.");
+  if (purpose.length > 240) throw new Error("External access purpose is too long.");
+  const operation = String(input.operation || "read").trim().toLowerCase();
+  if (!["read", "browser_read", "api_read"].includes(operation)) throw new Error("External access operation must be read-only.");
+  const credential_scope = String(input.credential_scope || "").trim();
+  if (credential_scope.length > 160) throw new Error("External credential scope is too long.");
+  return { origin: parsed.origin, url: parsed.toString(), purpose, operation, credential_scope, requires_secret_approval: Boolean(credential_scope) };
+}
+
+function hasExternalApproval(request, level = "once") {
+  const grant = state.externalApprovalGrants.get(externalApprovalKey(request));
+  if (!grant) return false;
+  if (grant.expiresAt && grant.expiresAt <= Date.now()) {
+    state.externalApprovalGrants.delete(externalApprovalKey(request));
+    return false;
+  }
+  return level === "session" ? grant.level === "session" : true;
+}
+
+function approvalPrompt(request, title, details, grantRequest) {
+  if (!els.externalApproval || !els.approveOnceButton || !els.approveSessionButton || !els.denyExternalButton) return Promise.resolve(false);
+  els.externalApprovalTitle.textContent = title;
+  els.externalApprovalDetails.textContent = details;
+  els.externalApproval.hidden = false;
+  return new Promise((resolve) => {
+    const finish = (approved, level = "once") => {
+      if (approved) state.externalApprovalGrants.set(externalApprovalKey(grantRequest), { level, expiresAt: Date.now() + (level === "session" ? 12 * 60 * 60 * 1000 : 5 * 60 * 1000) });
+      els.externalApproval.hidden = true;
+      resolve(approved);
+    };
+    els.approveOnceButton.onclick = () => finish(true, "once");
+    els.approveSessionButton.onclick = () => finish(true, "session");
+    els.denyExternalButton.onclick = () => finish(false, "once");
+  });
+}
+
+function requestSecretApproval(request) {
+  const secretRequest = { ...request, credential_scope: `secret:${request.credential_scope}` };
+  if (hasExternalApproval(secretRequest)) return Promise.resolve(true);
+  return approvalPrompt(secretRequest, "Credential approval required", `${request.origin} · ${request.operation}\nPurpose: ${request.purpose}\nCredential scope: ${request.credential_scope}\nThe token remains masked and is not sent to Excel.`, secretRequest);
+}
+
+function requestExternalAccessApproval(input = {}) {
+  if (!state.externalAccessEnabled) return Promise.reject(new Error("External access is disabled until an approval-aware connector is deployed."));
+  const request = normalizeExternalAccessRequest(input);
+  if (hasExternalApproval(request)) return request.requires_secret_approval ? requestSecretApproval(request) : Promise.resolve(true);
+  return approvalPrompt(request, "External access requested", `${request.origin} · ${request.operation}\nPurpose: ${request.purpose}${request.requires_secret_approval ? "\nA separate masked credential approval will follow." : ""}`, request).then((approved) => approved && request.requires_secret_approval ? requestSecretApproval(request) : approved);
+}
+
 const els = {
   status: document.getElementById("status"),
+  workbookLabel: document.getElementById("workbookLabel"),
+  sheetLabel: document.getElementById("sheetLabel"),
+  scopeButton: document.getElementById("scopeButton"),
+  scopeMenu: document.getElementById("scopeMenu"),
+  overflowButton: document.getElementById("overflowButton"),
+  overflowMenu: document.getElementById("overflowMenu"),
+  jobStatus: document.getElementById("jobStatus"),
+  jobStatusText: document.getElementById("jobStatusText"),
+  externalApproval: document.getElementById("externalApproval"),
+  externalApprovalTitle: document.getElementById("externalApprovalTitle"),
+  externalApprovalDetails: document.getElementById("externalApprovalDetails"),
+  approveOnceButton: document.getElementById("approveOnceButton"),
+  approveSessionButton: document.getElementById("approveSessionButton"),
+  denyExternalButton: document.getElementById("denyExternalButton"),
+  attachButton: document.getElementById("attachButton"),
+  reloadSkillsButton: document.getElementById("reloadSkillsButton"),
+  settingsButton: document.getElementById("settingsButton"),
   dropzone: document.getElementById("dropzone"),
   dropLabel: document.getElementById("dropLabel"),
   fileInput: document.getElementById("fileInput"),
@@ -405,6 +493,8 @@ function setWorkStage(text) {
     els.workElapsed.textContent = `Elapsed ${formatElapsed(Date.now() - state.workStartedAt)}`;
   }
   setStatus(text);
+  if (els.jobStatusText) els.jobStatusText.textContent = text;
+  if (els.jobStatus) els.jobStatus.hidden = false;
 }
 
 function startWorkIndicator(filesToSend) {
@@ -459,6 +549,7 @@ function stopWorkIndicator(finalStatus = "Ready") {
   if (els.cancelButton) els.cancelButton.hidden = true;
   els.sendButton.disabled = false;
   setStatus(finalStatus);
+  if (els.jobStatusText) els.jobStatusText.textContent = finalStatus;
 }
 
 let activityPollBusy = false;
@@ -632,8 +723,15 @@ async function readWorkbookContext() {
       columnCount: selected.columnCount,
     };
 
+    if (els.workbookLabel) els.workbookLabel.textContent = `Workbook · ${state.workbookId.slice(-8)}`;
+    if (els.sheetLabel) els.sheetLabel.textContent = `Sheet: ${active.name} · Selected: ${selected.address}`;
     setStatus("Ready");
-    return { workbook: state.workbook, selection: state.selection };
+    return {
+      workbook: state.workbook,
+      selection: state.selection,
+      scope: state.uiScope,
+      selected_target: selected.address,
+    };
   });
 }
 
@@ -720,6 +818,8 @@ async function askHermes(prompt, filesToSend) {
           parsed_files: loopCount > 0 && parsedFiles ? parsedFiles : undefined,
           tool_results: toolResults.length ? toolResults : undefined,
           loop_count: loopCount,
+          scope: state.uiScope,
+          selected_target: context.selected_target,
         },
         { signal: state.controller.signal },
       );
@@ -1609,6 +1709,44 @@ function renderReviewButtons(proposal, filesToSend, fileLines) {
   applyBtn.focus();
 }
 
+function setMenuOpen(menu, button, open) {
+  if (!menu || !button) return;
+  menu.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
+}
+
+function setScope(scope) {
+  const labels = { workbook: "Workbook", sheet: "Active sheet", selection: "Selection" };
+  state.uiScope = labels[scope] ? scope : "workbook";
+  if (els.scopeButton) els.scopeButton.textContent = `Context: ${labels[state.uiScope]}`;
+  setMenuOpen(els.scopeMenu, els.scopeButton, false);
+  try { localStorage.setItem("hermes-scope", state.uiScope); } catch {}
+}
+
+function wireParityUi() {
+  els.attachButton?.addEventListener("click", () => els.fileInput?.click());
+  els.overflowButton?.addEventListener("click", () => {
+    const open = els.overflowMenu?.hidden;
+    setMenuOpen(els.overflowMenu, els.overflowButton, open);
+  });
+  els.scopeButton?.addEventListener("click", () => {
+    const open = els.scopeMenu?.hidden;
+    setMenuOpen(els.scopeMenu, els.scopeButton, open);
+  });
+  els.scopeMenu?.querySelectorAll("[data-scope]").forEach((button) => {
+    button.addEventListener("click", () => setScope(button.dataset.scope));
+  });
+  els.reloadSkillsButton?.addEventListener("click", () => {
+    setMenuOpen(els.overflowMenu, els.overflowButton, false);
+    addMessage("hermes", "Skill reload is available from the staged UI; the live gateway has not been changed.");
+  });
+  els.settingsButton?.addEventListener("click", () => {
+    setMenuOpen(els.overflowMenu, els.overflowButton, false);
+    addMessage("hermes", "Settings will be enabled in the staged parity rollout.");
+  });
+  try { setScope(localStorage.getItem("hermes-scope") || "workbook"); } catch { setScope("workbook"); }
+}
+
 function wireActions() {
   els.prompt.addEventListener("keydown", (event) => {
     // Don't submit mid-IME-composition (CJK/accented input commits with Enter).
@@ -1659,6 +1797,16 @@ function wireActions() {
       if (fileLines.length) addMessage("hermes", fileLines.join("\n"));
 
       const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
+      const accessActions = actions.filter((action) => action && action.type === "request_external_access");
+      if (accessActions.length) {
+        try {
+          for (const action of accessActions) await requestExternalAccessApproval(action);
+        } catch (error) {
+          addMessage("hermes", `External access was not performed: ${error.message}`);
+        }
+        stopWorkIndicator("External access approval required");
+        return;
+      }
       const applyable = actions.filter((action) => action && action.type !== "read_range");
 
       if (state.reviewMode && applyable.length) {
@@ -1711,6 +1859,7 @@ Office.onReady((info) => {
   loadChatHistory();
   loadReviewMode();
   wireDropzone();
+  wireParityUi();
   wireActions();
   startBridgeMonitor();
   setStatus("Ready");

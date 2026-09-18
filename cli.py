@@ -14,9 +14,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 if __package__:
-    from . import profile_ownership
+    from . import profile_ownership, remote_mode
 else:  # Support the repository's bare-file validation tests.
     import profile_ownership
+    import remote_mode
 
 ROOT = Path(__file__).resolve().parent
 _BRIDGE_TOKEN_RE = re.compile(rb"[0-9a-f]{64}")
@@ -31,6 +32,20 @@ def register_cli(parser: argparse.ArgumentParser, *, profile_name: str) -> None:
         action="store_true",
         help="Adopt an existing unreceipted installation owned by this profile",
     )
+    remote_server = subs.add_parser("remote-server", help="Configure the VPS-owned Excel adapter")
+    remote_server_subs = remote_server.add_subparsers(dest="remote_server_command", required=True)
+    remote_server_subs.add_parser("setup", help="Create profile-owned loopback adapter state")
+    remote_server_subs.add_parser("status", help="Inspect remote adapter configuration")
+    remote_server_subs.add_parser("rollback", help="Remove only remote adapter state")
+    remote_client = subs.add_parser("remote-client", help="Install the Windows Office client for a tunnel")
+    remote_client_subs = remote_client.add_subparsers(dest="remote_client_command", required=True)
+    client_setup = remote_client_subs.add_parser("setup", help="Install bridge/manifest without a local gateway")
+    client_setup.add_argument("--adapter-url", default="http://127.0.0.1:8794/ingest")
+    client_setup.add_argument("--token-file", required=True, help="Path to the securely provisioned adapter token")
+    client_setup.add_argument("--bridge-port", type=int, default=8788)
+    client_setup.add_argument("--ssh-host", required=True, help="Existing SSH host alias (not a password/key)")
+    remote_client_subs.add_parser("rollback", help="Remove only the Windows remote client resources")
+    remote_client_subs.add_parser("status", help="Inspect the Windows remote client")
     subs.add_parser("check", help="Validate the plugin and install package")
     status = subs.add_parser("status", help="Check the running bridge identity")
     status.add_argument("--port", type=int, default=None)
@@ -105,6 +120,57 @@ def _read_bridge_token(context: profile_ownership.ProfileContext) -> str:
     return raw.decode("ascii")
 
 
+def _remote_server_command(context: profile_ownership.ProfileContext, command: str) -> int:
+    state = remote_mode.server_state_dir(context.profile_home)
+    if command == "setup":
+        config, token_path, created = remote_mode.write_server_state(context.profile_home, context.profile_name)
+        print(json.dumps({"mode": "remote-server", "profile_name": config.profile_name,
+                          "bind": f"{config.host}:{config.port}", "token_file": str(token_path),
+                          "token_created": created, "gateway_restart_required": False}, indent=2))
+        return 0
+    if command == "status":
+        try:
+            config = remote_mode.load_server_config(context.profile_home)
+            if config is None:
+                print("Remote Excel server is not configured.", file=sys.stderr)
+                return 1
+            remote_mode.read_token(state / config.token_path)
+        except (OSError, ValueError) as error:
+            print(f"Remote Excel server configuration is invalid: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps({"mode": "remote-server", "profile_name": config.profile_name,
+                          "bind": f"{config.host}:{config.port}", "token": "<present>"}, indent=2))
+        return 0
+    if command == "rollback":
+        for name in ("remote-server.json", ".ingest-token"):
+            (state / name).unlink(missing_ok=True)
+        try:
+            state.rmdir()
+        except OSError:
+            pass
+        print("Remote Excel server state removed; Hermes gateway was not restarted.")
+        return 0
+    return 2
+
+
+def _remote_client_command(args: argparse.Namespace, context: profile_ownership.ProfileContext) -> int:
+    if args.remote_client_command == "setup":
+        if sys.platform != "win32":
+            print("Remote Excel client installation requires Windows.", file=sys.stderr)
+            return 2
+        if not Path(args.token_file).is_file():
+            print("Adapter token file does not exist; provision it securely first.", file=sys.stderr)
+            return 2
+        extra = ["-AdapterUrl", args.adapter_url, "-AdapterTokenFile", args.token_file,
+                 "-BridgePort", str(args.bridge_port), "-SshHost", args.ssh_host]
+        return _powershell("remote-client-install.ps1", context, extra)
+    if args.remote_client_command == "rollback":
+        return _powershell("remote-client-rollback.ps1", context)
+    if args.remote_client_command == "status":
+        return _powershell("remote-client-status.ps1", context)
+    return 2
+
+
 def _status(context: profile_ownership.ProfileContext, port: int | None) -> int:
     try:
         receipt = profile_ownership.load_owner_receipt(context.receipt_path)
@@ -171,7 +237,7 @@ def _status(context: profile_ownership.ProfileContext, port: int | None) -> int:
 
 def excel_sidecar_command(args: argparse.Namespace) -> int:
     command = getattr(args, "excel_sidecar_command", None)
-    if command not in {"install", "check", "rollback", "status"}:
+    if command not in {"install", "check", "rollback", "status", "remote-server", "remote-client"}:
         print("Choose install, check, status, or rollback.", file=sys.stderr)
         return 2
     try:
@@ -184,6 +250,10 @@ def excel_sidecar_command(args: argparse.Namespace) -> int:
         print(f"Invalid Hermes profile selection: {error}", file=sys.stderr)
         return 2
 
+    if command == "remote-server":
+        return _remote_server_command(context, args.remote_server_command)
+    if command == "remote-client":
+        return _remote_client_command(args, context)
     if command == "install":
         extra = ["-Port", str(args.port)] if args.port else []
         if getattr(args, "adopt_legacy", False):

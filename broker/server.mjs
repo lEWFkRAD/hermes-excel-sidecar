@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 import zlib from "node:zlib";
 import {
   translateMatrixFormulas,
@@ -67,6 +68,7 @@ const allowedOrigins = new Set([
 
 const llmBaseUrl = (process.env.HERMES_EXCEL_LLM_BASE_URL || "http://127.0.0.1:8642/v1").replace(/\/$/, "");
 const llmModel = process.env.HERMES_EXCEL_LLM_MODEL || "hermes-agent";
+const excelVersion = process.env.HERMES_EXCEL_VERSION || "0.2.0";
 const llmApiKey = process.env.HERMES_EXCEL_LLM_API_KEY || readHermesApiServerKey() || "local";
 const llmTimeoutMs = Number(process.env.HERMES_EXCEL_LLM_TIMEOUT_MS || 180000);
 const llmRequestBudgetMs = Number(process.env.HERMES_EXCEL_LLM_REQUEST_BUDGET_MS || 420000);
@@ -322,6 +324,27 @@ async function dispatchProfileSensitiveApi(method, apiPath, {
   return { handled: true, authorized: true, result: await handler() };
 }
 
+function buildCapabilities({ version = excelVersion, defaultModel = llmModel, models = [] } = {}) {
+  const safeModels = Array.isArray(models)
+    ? models.map((model) => ({
+        id: String(model?.id || "").slice(0, 160),
+        provider: String(model?.provider || "").slice(0, 80),
+        capabilities: Array.isArray(model?.capabilities) ? model.capabilities.map((item) => String(item).slice(0, 40)).slice(0, 20) : [],
+      })).filter((model) => model.id)
+    : [];
+  return {
+    protocol: 1,
+    version: String(version),
+    transport: excelTransport,
+    default_model: String(defaultModel),
+    models: safeModels,
+    context: { scopes: ["workbook", "sheet", "selection"], selection_is_target_hint: true },
+    operations: ["read_range", "write_cells", "format_cells", "create_sheet", "verify", "undo"],
+    approvals: { workbook_review: true, secret_approval: true, critical_tool_approval: true },
+    external_access: { enabled: false, scaffold: true, approval: "per-origin-session", secret_approval_separate: true, writes_default: false },
+  };
+}
+
 async function healthStatus() {
   const status = {
     ok: true,
@@ -410,10 +433,109 @@ function compactSelection(selection) {
     address: selection?.address || "",
     rowCount: selection?.rowCount || values.length,
     columnCount: selection?.columnCount || values[0]?.length || 0,
-    values: values.slice(0, 100).map((row) => row.slice(0, 16)),
+    values: values.slice(0, 100).map((row) => row.slice(0, 16).map(sanitizeWorkbookValue)),
     formulas: Array.isArray(selection?.formulas)
-      ? selection.formulas.slice(0, 100).map((row) => row.slice(0, 16))
+      ? selection.formulas.slice(0, 100).map((row) => row.slice(0, 16).map(sanitizeWorkbookValue))
       : [],
+  };
+}
+
+function sanitizeExternalText(value) {
+  if (typeof value !== "string") return value;
+  return value.replace(/https?:\/\/[^\s<>"'`]+/gi, (raw) => {
+    try {
+      const parsed = new URL(raw.replace(/[),.;]+$/, ""));
+      parsed.username = "";
+      parsed.password = "";
+      parsed.search = "";
+      parsed.hash = "";
+      return parsed.toString();
+    } catch { return "[redacted URL]"; }
+  });
+}
+
+function sanitizeWorkbookValue(value) {
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return sanitizeExternalText(value);
+  return "[unsupported structured value redacted]";
+}
+
+function sanitizeToolResults(toolResults = []) {
+  return (Array.isArray(toolResults) ? toolResults : []).map((result) => ({
+    range: typeof result?.range === "string" ? sanitizeExternalText(result.range) : "",
+    values: Array.isArray(result?.values) ? result.values.map((row) => Array.isArray(row) ? row.map(sanitizeWorkbookValue) : []) : [],
+    formulas: Array.isArray(result?.formulas) ? result.formulas.map((row) => Array.isArray(row) ? row.map(sanitizeWorkbookValue) : []) : [],
+    ...(result?.truncated ? { truncated: true } : {}),
+    ...(result?.error ? { error: sanitizeWorkbookValue(result.error) } : {}),
+  }));
+}
+
+function extractLinkCandidates(toolResults = [], limit = 100) {
+  const seen = new Set();
+  const links = [];
+  const urlPattern = /https:\/\/[^\s<>"'`]+/gi;
+  for (const result of Array.isArray(toolResults) ? toolResults : []) {
+    const range = typeof result?.range === "string" ? sanitizeExternalText(result.range) : "";
+    const values = Array.isArray(result?.values) ? result.values : [];
+    for (const row of values) {
+      for (const cell of Array.isArray(row) ? row : []) {
+        if (typeof cell !== "string") continue;
+        for (const raw of cell.match(urlPattern) || []) {
+          const url = raw.replace(/[),.;]+$/, "");
+          try {
+            const parsed = new URL(url);
+            if (parsed.protocol !== "https:" || seen.has(url)) continue;
+            parsed.username = "";
+            parsed.password = "";
+            parsed.search = "";
+            parsed.hash = "";
+            const safeUrl = parsed.toString();
+            if (seen.has(safeUrl)) continue;
+            seen.add(safeUrl);
+            links.push({ range, url: safeUrl });
+            if (links.length >= limit) return links;
+          } catch {}
+        }
+      }
+    }
+  }
+  return links;
+}
+
+function isPrivateOrLocalHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/[\[\]]/g, "").replace(/\.+$/, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host === "0.0.0.0" || host === "::" || host === "::1") return true;
+  const ipVersion = isIP(host);
+  if (ipVersion === 6) return true;
+  const octets = host.split(".").map((part) => Number(part));
+  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return octets[0] === 10 || octets[0] === 127 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) || (octets[0] === 192 && octets[1] === 168) || (octets[0] === 169 && octets[1] === 254);
+}
+
+function normalizeExternalAccessRequest(input = {}) {
+  let parsed;
+  try { parsed = new URL(String(input.url || "")); } catch { throw new Error("External access URL is invalid."); }
+  if (parsed.protocol !== "https:") throw new Error("External access requires HTTPS.");
+  if (parsed.toString().length > 2048) throw new Error("External access URL is too long.");
+  if (isPrivateOrLocalHost(parsed.hostname)) throw new Error("External access to local or private hosts is blocked.");
+  if (parsed.username || parsed.password) throw new Error("External access URL cannot contain credentials.");
+  const purpose = String(input.purpose || "").trim();
+  if (!purpose) throw new Error("External access purpose is required.");
+  if (purpose.length > 240) throw new Error("External access purpose is too long.");
+  const operation = String(input.operation || "read").trim().toLowerCase();
+  if (!new Set(["read", "browser_read", "api_read"]).has(operation)) {
+    throw new Error("External access operation must be read-only.");
+  }
+  const credentialScope = String(input.credential_scope || "").trim();
+  if (credentialScope.length > 160) throw new Error("External credential scope is too long.");
+  return {
+    origin: parsed.origin,
+    url: parsed.toString(),
+    purpose,
+    operation,
+    credential_scope: credentialScope,
+    requires_secret_approval: Boolean(credentialScope),
+    approval_scope: "origin-operation-credential",
   };
 }
 
@@ -1421,6 +1543,13 @@ function normalizeAction(action) {
     // running it; the pane renders a "not supported, use a structured op" note.
     return { type: "unsupported", explanation: String(action.explanation || "custom Office.js script").slice(0, 200) };
   }
+  if (type === "request_external_access") {
+    try {
+      return { type, ...normalizeExternalAccessRequest({ url: action.url, purpose: action.purpose, operation: action.operation, credential_scope: action.credential_scope }) };
+    } catch {
+      return null;
+    }
+  }
   if (type === "read_range") {
     if (!action.range) return null;
     return {
@@ -1852,12 +1981,14 @@ function buildSystemPrompt(loopBudgetExhausted) {
       + '{"type":"delete_sheet","name":"Old"}, {"type":"sort_range","range":"A2:D20","column":1,"ascending":true,"has_header":false}, '
       + '{"type":"clear_range","range":"A1:D20","target":"contents"}.',
     'A read action is also available: {"type":"read_range","range":"Sheet Name!A1:D200","reason":"short why"}.',
+    'External site/API access is represented only by {"type":"request_external_access","url":"https://...","purpose":"short reason","operation":"read|browser_read|api_read","credential_scope":"optional"}; the task pane will require per-origin and separate credential approval. It is disabled until an approval-aware connector is deployed.',
     "COMPLETE THE ENTIRE TASK IN THIS ONE REPLY. You get no follow-up turn except to receive read_range results you explicitly request. Never say you will continue 'in a couple of actions', 'next', or 'then' — emit every action the task needs right now, in this single actions array.",
     "Each cell value must be short — a label, a number, or a formula. Formulas are encouraged (see the A1-relative formula rule below); the only limit is on prose, not on formulas or numbers. NEVER put a sentence, explanation, or multi-clause note (more than ~40 characters of prose) inside a cell, and never build a 'QA Notes' block out of long prose rows — that corrupts the output and makes the model stop mid-reply. If the user wants a QA note, keep it to a few short cells or put the explanation in the 'message' field instead of in the sheet.",
     "Use conditional_format (NOT execute_office_js) to highlight cells by value, e.g. Margin % below a threshold. operator is one of lessThan, lessThanOrEqual, greaterThan, greaterThanOrEqual, equalTo, notEqualTo, between, notBetween. For percentage columns the underlying cell value is a decimal, so 'below 25%' means value 0.25 (not 25). fill_color/font_color are hex; default is light-red fill #FFC7CE with dark-red font #9C0006.",
     "There is NO arbitrary-code action. For any structural change (merge, insert/delete rows or columns, column width, row height, freeze panes, autofit, sort, clear, rename or delete a sheet) use the matching structured action above. If a request truly cannot be expressed with the available actions, say so plainly in the message and make no changes — never emit code.",
     "When you need cell data that was not provided (another worksheet, a wider range), return ONLY read_range actions (max 5) plus a one-line message; the add-in will run the reads and call you again with the data under TOOL RESULTS. Then give the final answer with write actions.",
     "The workbook context lists every sheet with its used range; you may read from any of them.",
+    "The request includes context_scope and selected_target. Treat context_scope as the user's declared analysis preference: workbook means broad workbook analysis, sheet means prefer the active sheet, and selection means focus analysis on the selected target. Selection is not a permission boundary unless the user explicitly says not to access anything else.",
     "Never invent, estimate, or placeholder financial numbers. If data is missing and cannot be read, state exactly what is missing.",
     "Never claim you created, populated, or wrote anything unless THIS reply includes the actions that do it. A success message with an empty actions array is a failure: the add-in writes nothing without actions.",
     "Formulas you put inside a values matrix must be written as if the table's top-left cell is A1 (header in row 1, first data row in row 2): e.g. a Total in the first data row is =B2*C2 and a column total is =SUM(D2:D4). The add-in automatically relocates these to wherever the table is placed. Do not try to guess the absolute anchor yourself.",
@@ -1922,6 +2053,9 @@ function buildChatMessages(body) {
       prompt: body.prompt,
       workbook: normalizeWorkbook(body.workbook),
       selection: compactSelection(body.selection),
+      context_scope: ["workbook", "sheet", "selection"].includes(body.scope) ? body.scope : "workbook",
+      selected_target: String(body.selected_target || body.selection?.address || ""),
+      link_candidates: extractLinkCandidates(body.tool_results),
       files: fileSummary,
     }),
   });
@@ -1932,14 +2066,7 @@ function buildChatMessages(body) {
   }
 
   if (Array.isArray(body.tool_results) && body.tool_results.length) {
-    const capped = body.tool_results.map((result) => {
-      const entry = { range: result.range };
-      if (result.error) entry.error = String(result.error).slice(0, 400);
-      if (result.values) entry.values = normalizeMatrix(result.values);
-      if (result.formulas) entry.formulas = normalizeMatrix(result.formulas);
-      if (result.truncated) entry.truncated = true;
-      return entry;
-    });
+    const capped = sanitizeToolResults(body.tool_results);
     messages.push({
       role: "user",
       content: `TOOL RESULTS (workbook reads you requested). Use these values as ground truth:\n${JSON.stringify(capped)}`,
@@ -1995,8 +2122,11 @@ async function callHermesPlatform(body, { signal } = {}) {
         workbook_id: String(body.workbook_id || "legacy-workbook"),
         conversation_id: String(body.conversation_id || body.workbook_id || "legacy-conversation"),
         round: Number(body.loop_count || body.round || 0), prompt: String(body.prompt || ""),
-        context: { workbook: body.workbook, selection: body.selection, history: body.history,
-          tool_results: body.tool_results, files: platformFiles } }), signal });
+        context: { workbook: body.workbook, selection: compactSelection(body.selection),
+          scope: ["workbook", "sheet", "selection"].includes(body.scope) ? body.scope : "workbook",
+          selected_target: String(body.selected_target || body.selection?.address || ""),
+          link_candidates: extractLinkCandidates(body.tool_results), history: body.history,
+          tool_results: sanitizeToolResults(body.tool_results), files: platformFiles } }), signal });
     if (!response.ok) throw new Error(`Excel adapter HTTP ${response.status}: ${await response.text().catch(() => "")}`);
     const captured = await response.json();
     if (!captured.proposal || typeof captured.proposal !== "object") throw new Error("Excel adapter returned no proposal");
@@ -2072,8 +2202,11 @@ async function callHermesModel(body, { signal, post: injectedPost } = {}) {
           conversation_id: conversationId,
           round,
           prompt: String(body.prompt || ""),
-          context: { workbook: body.workbook, selection: body.selection, history: body.history,
-            tool_results: body.tool_results, files: platformFiles },
+          context: { workbook: body.workbook, selection: compactSelection(body.selection),
+            scope: ["workbook", "sheet", "selection"].includes(body.scope) ? body.scope : "workbook",
+            selected_target: String(body.selected_target || body.selection?.address || ""),
+            link_candidates: extractLinkCandidates(body.tool_results), history: body.history,
+            tool_results: sanitizeToolResults(body.tool_results), files: platformFiles },
         }),
         signal,
       });
@@ -2526,6 +2659,7 @@ if (isMainModule) {
         }
 
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
+        if (req.method === "GET" && apiPath === "/api/capabilities") return send(res, 200, buildCapabilities(), undefined, origin);
         // `await` is load-bearing: rejections from the probe, chat uploads, or
         // export handlers must stay inside this request's try/catch.
         const profileDispatch = await dispatchProfileSensitiveApi(req.method, apiPath, {
@@ -2617,6 +2751,9 @@ export {
   resolveContainedNativePath,
   fetchJsonWithTimeout,
   healthStatus,
+  buildCapabilities,
+  extractLinkCandidates,
+  normalizeExternalAccessRequest,
   readHermesApiServerKey,
   parseHermesApiServerKey,
   normalizeOwnerIdentity,

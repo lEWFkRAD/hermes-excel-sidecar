@@ -16,6 +16,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 from . import profile_ownership
+from . import remote_mode
 from .excel_runtime import (
     capture_final,
     capture_final_for_conversation,
@@ -95,7 +96,31 @@ def _read_ingest_token(context: profile_ownership.ProfileContext) -> str:
 def load_active_owner_binding(
     profile_hint: str | None = None,
 ) -> tuple[AdapterOwnerIdentity, str]:
-    """Load and double-check the active profile's receipt and ingest token."""
+    """Load the active profile binding, including the VPS remote-server mode."""
+
+    # Remote-server mode deliberately has no Windows Office owner receipt.  Its
+    # profile-owned state is independent and loopback-only on the VPS.
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        hermes_home = None
+        remote_context = None
+    else:
+        hermes_home = get_hermes_home()
+        try:
+            remote_context = remote_mode.load_server_config(hermes_home)
+        except (OSError, ValueError) as error:
+            # A present-but-invalid remote config must not silently downgrade
+            # to local mode; that could bind the wrong owner after a partial
+            # deployment or rollback.
+            raise OwnerBindingError("remote Excel server configuration is invalid") from error
+    if remote_context is not None:
+        assert hermes_home is not None
+        if profile_hint is not None and profile_hint != remote_context.profile_name:
+            raise OwnerBindingError("Hermes profile changed after plugin registration")
+        token = remote_mode.read_token(remote_mode.server_state_dir(hermes_home) / remote_context.token_path)
+        return (AdapterOwnerIdentity(remote_context.profile_name, remote_mode.owner_fingerprint(remote_context),
+                                     remote_context.port), token)
 
     context = _active_profile_context(profile_hint)
     try:
@@ -167,6 +192,18 @@ class ExcelAdapter(BasePlatformAdapter):
         from aiohttp import web
         try:
             owner, _ = self._load_active_owner_binding()
+            # In remote-server mode the profile-owned config is authoritative;
+            # do not let process environment override its loopback endpoint.
+            try:
+                from hermes_constants import get_hermes_home
+                remote_config = remote_mode.load_server_config(get_hermes_home())
+            except ImportError:
+                remote_config = None
+            except (OSError, ValueError) as error:
+                raise OwnerBindingError("remote Excel server configuration is invalid") from error
+            if remote_config is not None:
+                self._host = remote_config.host
+                self._port = remote_config.port
         except OwnerBindingError:
             self._set_fatal_error(
                 "excel_owner_binding_unavailable",

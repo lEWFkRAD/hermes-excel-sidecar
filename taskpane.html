@@ -18,10 +18,45 @@
           </div>
         </div>
         <div class="topbar-actions">
-          <button id="undoButton" type="button" title="Undo the last workbook change Hermes made">Undo</button>
-          <button id="clearButton" type="button" title="Clear this chat">Clear</button>
+          <button id="overflowButton" type="button" class="icon-button" aria-label="Open Hermes menu" aria-expanded="false">⋯</button>
+          <div id="overflowMenu" class="overflow-menu" hidden>
+            <button id="undoButton" type="button" title="Undo the last workbook change Hermes made">Undo last change</button>
+            <button id="clearButton" type="button" title="Clear this chat">Clear chat</button>
+            <button id="reloadSkillsButton" type="button">Reload skills</button>
+            <button id="settingsButton" type="button">Settings</button>
+          </div>
         </div>
       </header>
+
+      <section class="scope-strip" aria-label="Workbook context">
+        <div class="scope-copy">
+          <strong id="workbookLabel">Workbook</strong>
+          <span id="sheetLabel">Active sheet</span>
+        </div>
+        <button id="scopeButton" type="button" class="scope-button" aria-haspopup="true" aria-expanded="false">Context: Workbook</button>
+        <div id="scopeMenu" class="scope-menu" hidden>
+          <button type="button" data-scope="workbook">Workbook</button>
+          <button type="button" data-scope="sheet">Active sheet</button>
+          <button type="button" data-scope="selection">Selection</button>
+        </div>
+      </section>
+
+      <section id="jobStatus" class="job-status" hidden aria-live="polite">
+        <span class="job-status-dot" aria-hidden="true"></span>
+        <span id="jobStatusText">Ready</span>
+      </section>
+
+      <section id="externalApproval" class="approval-card" hidden aria-live="assertive">
+        <div>
+          <strong id="externalApprovalTitle">External access requested</strong>
+          <p id="externalApprovalDetails">Hermes needs approval before contacting an external site.</p>
+        </div>
+        <div class="approval-actions">
+          <button id="approveOnceButton" type="button" class="ghost">Approve once</button>
+          <button id="approveSessionButton" type="button" class="primary">Approve this session</button>
+          <button id="denyExternalButton" type="button" class="ghost">Deny</button>
+        </div>
+      </section>
 
       <section id="messages" class="messages" aria-live="polite"></section>
 
@@ -34,15 +69,18 @@
           </div>
           <button id="cancelButton" type="button" class="ghost" hidden>Cancel</button>
         </section>
-        <label class="review"><input type="checkbox" id="reviewToggle" /> Review changes before applying</label>
-        <div id="dropzone" class="dropzone">
+        <div id="dropzone" class="dropzone dropzone-hidden" aria-hidden="true">
           <input id="fileInput" type="file" multiple accept=".pdf,.xlsx,.xls,.csv,.txt,.doc,.docx,.png,.jpg,.jpeg" aria-label="Attach files" />
-          <span id="dropLabel">Drop files here, into the message box, or click to attach</span>
+          <span id="dropLabel" hidden></span>
         </div>
         <ul id="fileList" class="file-list"></ul>
-        <textarea id="prompt" rows="3" placeholder="Ask Hermes to edit this workbook..."></textarea>
-        <div class="actions">
-          <button id="sendButton" type="submit" class="primary">Send</button>
+        <textarea id="prompt" rows="3" placeholder="Ask Hermes to edit this workbook... Drop files here to attach." aria-label="Message Hermes"></textarea>
+        <div class="composer-footer">
+          <label class="review"><input type="checkbox" id="reviewToggle" /> Review edits</label>
+          <div class="actions">
+            <button id="attachButton" type="button" class="icon-button" aria-label="Attach a file" title="Attach a file">＋</button>
+            <button id="sendButton" type="submit" class="primary">Send</button>
+          </div>
         </div>
       </form>
     </main>
