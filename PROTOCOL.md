@@ -106,6 +106,22 @@ converted to actions.
 
 ### External access approval policy
 
+### VPS Cynteka link resolution (read-only)
+
+The VPS-side resolver contract accepts a credential-free HTTPS link only after
+the bridge's origin grant and the separate credential grant have been consumed:
+
+```json
+{"material":{"name":"...","code":"optional","article":"optional","brand":"optional"},"url":"https://reformenginiring.cynteka.ru/...","source_cell":"Sheet1!Z10","credential_scope":"cynteka.reformenginiring.read"}
+```
+
+It returns `verified`, `needs_review`, or `failed` evidence with the source URL,
+source cell, matched material, price/VAT state, identifiers, evidence,
+retrieval time, and confidence. Only `verified` evidence may be converted into
+a reviewed workbook proposal; ambiguous or failed results carry no price and
+must leave workbook cells unchanged. The resolver is read-only and external
+writes are not part of this protocol.
+
 Any future external site/API access must create an approval request before the
 first call to an origin. Approval is stored only for the current Excel session
 and is keyed by origin + read operation + connector/credential scope; approval
