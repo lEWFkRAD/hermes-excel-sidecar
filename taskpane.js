@@ -425,6 +425,22 @@ async function performCyntekaSearch(action) {
   return payload;
 }
 
+async function performCyntekaQuery(action) {
+  const tenant = action.tenant === "partner" ? "partner" : "reformenginiring";
+  const host = `${tenant}.cynteka.ru`;
+  const queryType = String(action.query_type || "material");
+  const approvalRequest = { url: `https://${host}/api/v1/${queryType}`, purpose: `Read Cynteka ${queryType} data`, operation: "api_read", credential_scope: action.credential_scope || `cynteka.${tenant}.read` };
+  await requestExternalAccessApproval(approvalRequest);
+  await obtainExternalGrant(approvalRequest, "origin");
+  await obtainExternalGrant(approvalRequest, "credential");
+  const originGrant = state.externalApprovalTokens.get(`origin:${externalApprovalKey(approvalRequest)}`);
+  const credentialGrant = state.externalApprovalTokens.get(`credential:${externalApprovalKey(approvalRequest)}`);
+  const response = await fetch(`${brokerUrls[0]}/api/cynteka/query`, { method: "POST", headers: bridgeHeaders({ "content-type": "application/json", "x-hermes-external-grant": originGrant, "x-hermes-credential-grant": credentialGrant }), body: JSON.stringify(action) });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `Cynteka query failed (${response.status}).`);
+  return payload;
+}
+
 const els = {
   status: document.getElementById("status"),
   workbookLabel: document.getElementById("workbookLabel"),
@@ -1842,11 +1858,11 @@ function wireActions() {
       if (fileLines.length) addMessage("hermes", fileLines.join("\n"));
 
       const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
-      const resolverActions = actions.filter((action) => action && action.type === "cynteka_search");
+      const resolverActions = actions.filter((action) => action && ["cynteka_search", "cynteka_query"].includes(action.type));
       if (resolverActions.length) {
         try {
           for (const action of resolverActions) {
-            const result = await performCyntekaSearch(action);
+            const result = action.type === "cynteka_query" ? await performCyntekaQuery(action) : await performCyntekaSearch(action);
             addMessage("hermes", `Cynteka result: ${JSON.stringify(result).slice(0, 5000)}`);
           }
         } catch (error) {

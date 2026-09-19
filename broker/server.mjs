@@ -1586,6 +1586,12 @@ function normalizeAction(action) {
     const tenant = ["reformenginiring", "partner"].includes(String(action.tenant || "")) ? String(action.tenant) : "reformenginiring";
     return { type, material: material.slice(0, 240), source_cell: String(action.source_cell || "").slice(0, 160), tenant, credential_scope: String(action.credential_scope || `cynteka.${tenant}.read`).slice(0, 160) };
   }
+  if (type === "cynteka_query") {
+    const queryType = ["company", "project", "request", "offer", "invoice", "payment", "unpaid_invoice", "material"].includes(String(action.query_type || "")) ? String(action.query_type) : "material";
+    const tenant = ["reformenginiring", "partner"].includes(String(action.tenant || "")) ? String(action.tenant) : "reformenginiring";
+    const filters = action.filters && typeof action.filters === "object" && !Array.isArray(action.filters) ? action.filters : {};
+    return { type, query_type: queryType, filters, source_cell: String(action.source_cell || "").slice(0, 160), tenant, credential_scope: String(action.credential_scope || `cynteka.${tenant}.read`).slice(0, 160) };
+  }
   if (type === "read_range") {
     if (!action.range) return null;
     return {
@@ -2712,6 +2718,18 @@ if (isMainModule) {
           if (!consumeExternalGrant(req.headers["x-hermes-external-grant"], connectorRequest, "origin")) return send(res, 403, { error: "Valid external approval grant is required." }, undefined, origin);
           if (!consumeExternalGrant(req.headers["x-hermes-credential-grant"], connectorRequest, "credential")) return send(res, 403, { error: "Valid credential approval grant is required." }, undefined, origin);
           const upstream = await fetch(excelAdapterUrl.replace(/\/ingest$/, "/cynteka/search"), { method: "POST", headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(25_000) });
+          const result = await upstream.json().catch(() => ({ status: "failed", error: `Cynteka connector HTTP ${upstream.status}` }));
+          return send(res, upstream.ok ? 200 : upstream.status, result, undefined, origin);
+        }
+        if (req.method === "POST" && apiPath === "/api/cynteka/query") {
+          if (!bridgeToken) return send(res, 503, { error: "Cynteka connector requires a configured bridge token." }, undefined, origin);
+          const body = await readJson(req, 64 * 1024);
+          const tenant = body.tenant === "partner" ? "partner" : "reformenginiring";
+          const queryType = typeof body.query_type === "string" ? body.query_type : "material";
+          const connectorRequest = { origin: `https://${tenant}.cynteka.ru`, url: `https://${tenant}.cynteka.ru/api/v1/${queryType}`, operation: "api_read", credential_scope: String(body.credential_scope || `cynteka.${tenant}.read`) };
+          if (!consumeExternalGrant(req.headers["x-hermes-external-grant"], connectorRequest, "origin")) return send(res, 403, { error: "Valid external approval grant is required." }, undefined, origin);
+          if (!consumeExternalGrant(req.headers["x-hermes-credential-grant"], connectorRequest, "credential")) return send(res, 403, { error: "Valid credential approval grant is required." }, undefined, origin);
+          const upstream = await fetch(excelAdapterUrl.replace(/\/ingest$/, "/cynteka/query"), { method: "POST", headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(30_000) });
           const result = await upstream.json().catch(() => ({ status: "failed", error: `Cynteka connector HTTP ${upstream.status}` }));
           return send(res, upstream.ok ? 200 : upstream.status, result, undefined, origin);
         }

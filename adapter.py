@@ -9,6 +9,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -18,6 +19,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 
 from . import profile_ownership
 from . import remote_mode
+from .connectors.cynteka_resolver import build_query_url, classify_payment_state, normalize_query, payment_amounts
 from .excel_runtime import (
     capture_final,
     capture_final_for_conversation,
@@ -232,6 +234,7 @@ class ExcelAdapter(BasePlatformAdapter):
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/external/request", self._handle_external_request)
         app.router.add_post("/cynteka/search", self._handle_cynteka_search)
+        app.router.add_post("/cynteka/query", self._handle_cynteka_query)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         await web.TCPSite(self._runner, self._host, self._port).start()
@@ -305,6 +308,65 @@ class ExcelAdapter(BasePlatformAdapter):
             return web.json_response({"error": "remote connector timed out"}, status=504)
         except Exception as exc:
             return web.json_response({"error": str(exc)[:240]}, status=502)
+
+    async def _handle_cynteka_query(self, request):
+        from aiohttp import web
+        _, error = self._authorize_request(request)
+        if error is not None:
+            return error
+        try:
+            body = await request.json(loads=json.loads)
+            query = normalize_query(body)
+            tenant = query["tenant"]
+            scope = query["credential_scope"]
+            if scope != f"cynteka.{tenant}.read":
+                return web.json_response({"error": "invalid Cynteka credential scope"}, status=400)
+            token_name = "CYNTEKA_REFORMENGINIRING_TOKEN" if tenant == "reformenginiring" else "CYNTEKA_PARTNER_TOKEN"
+            base_name = "CYNTEKA_REFORMENGINIRING_BASE_URL" if tenant == "reformenginiring" else "CYNTEKA_PARTNER_BASE_URL"
+            token = os.getenv(token_name)
+            base = os.getenv(base_name, f"https://{tenant}.cynteka.ru").rstrip("/")
+            if not token:
+                return web.json_response({"error": "approved Cynteka credential is unavailable on the VPS"}, status=503)
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout, raise_for_status=False) as session:
+                async def fetch(kind, filters):
+                    child = normalize_query({"query_type": kind, "tenant": tenant, "filters": filters, "credential_scope": scope})
+                    url = build_query_url(base, child)
+                    async with session.get(url, headers={"Accept": "application/json", "ZakupayToken": token}, allow_redirects=False) as response:
+                        raw = await response.content.read(512 * 1024 + 1)
+                        if len(raw) > 512 * 1024:
+                            raise ValueError("Cynteka response is too large")
+                        data = json.loads(raw.decode("utf-8"))
+                        return response.status, url, data
+
+                if query["query_type"] == "unpaid_invoice":
+                    filters = {key: value for key, value in query["filters"].items() if key != "include_partial"}
+                    status, source_url, data = await fetch("invoice", filters)
+                    offers = data.get("offers", []) if isinstance(data, dict) else []
+                    unpaid = []
+                    for offer in offers[:100]:
+                        offer_id = offer.get("id") if isinstance(offer, dict) else None
+                        if offer_id is None:
+                            continue
+                        payment_status, _, payment_data = await fetch("payment", {"offerId": offer_id, "page": 1, "pageSize": 100})
+                        payments = payment_data.get("payments", []) if isinstance(payment_data, dict) else []
+                        total = offer.get("totalAmount", offer.get("amount", "0"))
+                        state = classify_payment_state(total, payments)
+                        if state == "UNPAID" or (state == "PARTIALLY_PAID" and query["filters"].get("include_partial", True)):
+                            total_decimal, paid_decimal = payment_amounts(total, payments)
+                            unpaid.append({"invoice": _sanitize_remote_data(offer), "payments": _sanitize_remote_data(payments), "payment_state": state, "remaining_amount": str(total_decimal - paid_decimal), "paid_amount": str(paid_decimal), "payment_http_status": payment_status})
+                    total_remaining = sum((Decimal(item["remaining_amount"]) for item in unpaid), Decimal("0"))
+                    result = {"query_type": "unpaid_invoice", "tenant": tenant, "source_url": source_url, "count": len(unpaid), "total_remaining_amount": str(total_remaining), "results": unpaid, "error": None if status == 200 else "Cynteka invoice query failed"}
+                    return web.json_response(_sanitize_remote_data(result), status=200 if status == 200 else status)
+
+                status, source_url, data = await fetch(query["query_type"], query["filters"])
+                return web.json_response({"query_type": query["query_type"], "tenant": tenant, "source_url": source_url, "data": _sanitize_remote_data(data)}, status=status)
+        except asyncio.TimeoutError:
+            return web.json_response({"status": "failed", "error": "Cynteka query timed out."}, status=504)
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            return web.json_response({"status": "failed", "error": str(exc)[:240]}, status=400)
+        except Exception as exc:
+            return web.json_response({"status": "failed", "error": str(exc)[:240]}, status=502)
 
     async def _handle_cynteka_search(self, request):
         from aiohttp import web

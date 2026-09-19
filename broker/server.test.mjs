@@ -372,6 +372,11 @@ test("normalizeAction: all action types plus unknown", () => {
   assert.strictEqual(rrLong.reason.length, 200);
   assert.strictEqual(normalizeAction({ type: "read_range" }), null);
 
+  const cq = normalizeAction({ type: "cynteka_query", query_type: "request", tenant: "reformenginiring", filters: { state: "ACTIVE", batchSize: 100 } });
+  assert.equal(cq.type, "cynteka_query");
+  assert.equal(cq.query_type, "request");
+  assert.equal(cq.filters.batchSize, 100);
+
   const ext = normalizeAction({ type: "request_external_access", url: "https://example.com/catalog/1", purpose: "Verify item", operation: "api_read", credential_scope: "catalog.read" });
   assert.equal(ext.type, "request_external_access");
   assert.equal(ext.origin, "https://example.com");

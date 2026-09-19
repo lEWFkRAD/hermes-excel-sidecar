@@ -1,6 +1,12 @@
 import unittest
 
-from connectors.cynteka_resolver import normalize_request, normalize_result
+from connectors.cynteka_resolver import (
+    build_query_url,
+    classify_payment_state,
+    normalize_query,
+    normalize_request,
+    normalize_result,
+)
 
 
 class CyntekaResolverContractTests(unittest.TestCase):
@@ -17,3 +23,22 @@ class CyntekaResolverContractTests(unittest.TestCase):
         self.assertIsNone(result["price"])
         with self.assertRaises(ValueError):
             normalize_result({"status": "verified", "confidence": 2})
+
+    def test_query_rejects_unknown_filters_and_builds_official_path(self):
+        query = normalize_query({"query_type": "request", "tenant": "reformenginiring", "filters": {"project": 42, "state": "ACTIVE", "page": 2, "batchSize": 100}})
+        self.assertEqual(query["path"], "/api/v1/orders")
+        self.assertEqual(query["filters"]["batchSize"], 100)
+        with self.assertRaises(ValueError):
+            normalize_query({"query_type": "request", "tenant": "reformenginiring", "filters": {"arbitraryUrl": "https://evil.example"}})
+
+    def test_query_url_uses_batch_size_for_requests_and_preserves_encoding(self):
+        url = build_query_url("https://reformenginiring.cynteka.ru", {"query_type": "request", "tenant": "reformenginiring", "filters": {"search": "Школа 1500", "batchSize": 100}})
+        self.assertIn("/api/v1/orders?", url)
+        self.assertIn("search=%D0%A8%D0%BA%D0%BE%D0%BB%D0%B0+1500", url)
+
+    def test_payment_state_distinguishes_unpaid_and_partial(self):
+        self.assertEqual(classify_payment_state("100.00", []), "UNPAID")
+        self.assertEqual(classify_payment_state("100.00", [{"amount": "25.00"}]), "PARTIALLY_PAID")
+        self.assertEqual(classify_payment_state("100.00", [{"amount": "100.00"}]), "PAID")
+        with self.assertRaises(ValueError):
+            classify_payment_state("bad", [])
