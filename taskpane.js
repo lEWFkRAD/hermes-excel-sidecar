@@ -29,8 +29,8 @@ const state = {
   pendingProposal: null,
   workbookKey: "",
   controller: null,
-  // Default off (2026-08-04, Jeff): apply immediately; the checkbox re-enables staging.
-  reviewMode: false,
+  // Review-before-apply is the safe default for workbook mutations.
+  reviewMode: true,
   // Live-activity relay: the in-flight request id and the freshest streamed
   // draft line from Hermes, shown in place of the canned progress stages.
   activeRequestId: null,
@@ -850,14 +850,14 @@ async function postChat(payload, options = {}) {
   throw new Error(`Could not reach the local Hermes bridge. Tried ${errors.join(" | ")}`);
 }
 
-async function askHermes(prompt, filesToSend) {
+async function askHermes(prompt, filesToSend, initialToolResults = []) {
   validateAttachmentSizes(filesToSend);
   state.controller = new AbortController();
   const context = await readWorkbookContext();
   const files = [];
   for (const file of filesToSend) files.push(await fileToPayload(file));
 
-  let toolResults = [];
+  let toolResults = [...initialToolResults];
   let parsedFiles = null;
   let response = null;
 
@@ -1852,24 +1852,36 @@ function wireActions() {
     state.sending = true;
     startWorkIndicator(filesToSend);
     try {
-      const result = await askHermes(prompt, filesToSend);
+      let result = await askHermes(prompt, filesToSend);
       addMessage("hermes", result.message || "Done.");
       const fileLines = fileStatusLines(result);
       if (fileLines.length) addMessage("hermes", fileLines.join("\n"));
 
-      const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
+      let actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
       const resolverActions = actions.filter((action) => action && ["cynteka_search", "cynteka_query"].includes(action.type));
       if (resolverActions.length) {
         try {
+          const resolverResults = [];
           for (const action of resolverActions) {
-            const result = action.type === "cynteka_query" ? await performCyntekaQuery(action) : await performCyntekaSearch(action);
-            addMessage("hermes", `Cynteka result: ${JSON.stringify(result).slice(0, 5000)}`);
+            const resolverResult = action.type === "cynteka_query" ? await performCyntekaQuery(action) : await performCyntekaSearch(action);
+            resolverResults.push({ type: action.type, action, result: resolverResult });
+            addMessage("hermes", `Cynteka result: ${JSON.stringify(resolverResult).slice(0, 5000)}`);
           }
+          // A search is an intermediate tool step, not a workbook proposal.
+          // Send the verified result back to Hermes so it can either produce
+          // literal Y/Z/AA write_cells actions or honestly return no-write.
+          result = await askHermes(
+            `${prompt}\n\nCynteka search has completed. Use the returned structured result as ground truth. If there is a verified unique offer, prepare a write_cells proposal for the requested Y/Z/AA cells with literal values. If there is no match or the result is ambiguous, return no workbook actions and explain why.`,
+            [],
+            resolverResults,
+          );
+          addMessage("hermes", result.message || "Cynteka search completed.");
+          actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
         } catch (error) {
           addMessage("hermes", `Cynteka search was not performed: ${error.message}`);
+          stopWorkIndicator("Cynteka search failed");
+          return;
         }
-        stopWorkIndicator("Cynteka search complete");
-        return;
       }
       const accessActions = actions.filter((action) => action && action.type === "request_external_access");
       if (accessActions.length) {
@@ -1948,7 +1960,11 @@ Office.onReady((info) => {
 function loadReviewMode() {
   try {
     const stored = localStorage.getItem(REVIEW_MODE_STORAGE_KEY);
-    if (stored !== null) state.reviewMode = stored === "1";
+    // Existing panes may have persisted the old unsafe default ("0").
+    // Migrate that value to review-before-apply so workbook proposals always
+    // expose an explicit Apply/Discard decision.
+    state.reviewMode = true;
+    if (stored !== "1") localStorage.setItem(REVIEW_MODE_STORAGE_KEY, "1");
   } catch {
     // Storage may be denied; keep the safe in-memory default (review ON).
   }
