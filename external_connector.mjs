@@ -103,8 +103,8 @@ export class ExternalConnector {
   async request(input, { originApproved = false, credentialApproved = false } = {}) {
     const request = normalizeConnectorRequest(input);
     if (!this.enabled) throw new Error("External connector is disabled.");
+    if (!originApproved || !this.allowedOrigins.has(request.origin)) throw new Error("External origin approval is required for this origin.");
     await assertPublicResolution(new URL(request.url).hostname);
-    if (!originApproved || !this.allowedOrigins.has(request.origin)) throw new Error("External origin approval is required.");
     if (request.credential_scope && !credentialApproved) throw new Error("Separate credential approval is required.");
     const headers = { Accept: "application/json, text/plain;q=0.9" };
     if (request.credential_scope) {
