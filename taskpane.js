@@ -1874,10 +1874,26 @@ function wireSettingsUi() {
   });
   els.closeSettingsButton?.addEventListener("click", () => { els.settingsPanel.hidden = true; });
   els.newSessionButton?.addEventListener("click", () => {
-    if (confirmSessionAction("new")) rotateExcelSession("New session started");
+    if (els.newSessionButton.dataset.confirm === "1") {
+      els.newSessionButton.dataset.confirm = "";
+      els.newSessionButton.textContent = "New session";
+      rotateExcelSession("New session started");
+      return;
+    }
+    els.newSessionButton.dataset.confirm = "1";
+    els.newSessionButton.textContent = "Confirm new session";
+    setTimeout(() => { els.newSessionButton.dataset.confirm = ""; els.newSessionButton.textContent = "New session"; }, 5000);
   });
   els.endSessionButton?.addEventListener("click", () => {
-    if (confirmSessionAction("end")) rotateExcelSession("Session ended and approvals cleared");
+    if (els.endSessionButton.dataset.confirm === "1") {
+      els.endSessionButton.dataset.confirm = "";
+      els.endSessionButton.textContent = "End session";
+      rotateExcelSession("Session ended and approvals cleared");
+      return;
+    }
+    els.endSessionButton.dataset.confirm = "1";
+    els.endSessionButton.textContent = "Confirm end session";
+    setTimeout(() => { els.endSessionButton.dataset.confirm = ""; els.endSessionButton.textContent = "End session"; }, 5000);
   });
   els.resetSettingsButton?.addEventListener("click", async () => {
     for (const input of els.settingsPanel.querySelectorAll("[data-setting]")) input.checked = ["review_before_apply", "verify_after_apply", "use_installed_skills", "show_activity"].includes(input.dataset.setting);
