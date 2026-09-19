@@ -1797,9 +1797,25 @@ function wireParityUi() {
   els.scopeMenu?.querySelectorAll("[data-scope]").forEach((button) => {
     button.addEventListener("click", () => setScope(button.dataset.scope));
   });
-  els.reloadSkillsButton?.addEventListener("click", () => {
+  els.reloadSkillsButton?.addEventListener("click", async () => {
     setMenuOpen(els.overflowMenu, els.overflowButton, false);
-    addMessage("hermes", "Skill reload is not enabled in this live deployment yet; no gateway change was attempted.");
+    els.reloadSkillsButton.disabled = true;
+    addMessage("hermes", "Reloading skills...");
+    try {
+      const response = await fetch(`${brokerUrls[0]}/api/reload-skills`, {
+        method: "POST",
+        headers: bridgeHeaders(),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || `Skill reload failed (${response.status}).`);
+      const added = Array.isArray(result.added) ? result.added.map((item) => item.name || item).join(", ") : "";
+      const removed = Array.isArray(result.removed) ? result.removed.map((item) => item.name || item).join(", ") : "";
+      addMessage("hermes", `Skills reloaded (${result.total ?? result.commands ?? 0} available).${added ? ` Added: ${added}.` : ""}${removed ? ` Removed: ${removed}.` : ""}`);
+    } catch (error) {
+      addMessage("hermes", `Skill reload failed: ${error.message}`);
+    } finally {
+      els.reloadSkillsButton.disabled = false;
+    }
   });
   els.settingsButton?.addEventListener("click", () => {
     setMenuOpen(els.overflowMenu, els.overflowButton, false);

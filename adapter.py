@@ -235,6 +235,7 @@ class ExcelAdapter(BasePlatformAdapter):
         app.router.add_post("/external/request", self._handle_external_request)
         app.router.add_post("/cynteka/search", self._handle_cynteka_search)
         app.router.add_post("/cynteka/query", self._handle_cynteka_query)
+        app.router.add_post("/reload-skills", self._handle_reload_skills)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         await web.TCPSite(self._runner, self._host, self._port).start()
@@ -255,6 +256,20 @@ class ExcelAdapter(BasePlatformAdapter):
             return web.json_response({"ok": True, "active": get_request(request_id) is not None})
         return web.json_response({"ok": True, "active": True,
                                   "seq": entry.get("seq", 0), "text": entry.get("text", "")})
+
+    async def _handle_reload_skills(self, request):
+        from aiohttp import web
+        _, error = self._authorize_request(request)
+        if error is not None:
+            return error
+        if any(not task.done() for task in self._request_tasks.values()):
+            return web.json_response({"ok": False, "error": "active Excel request; retry after it finishes"}, status=409)
+        try:
+            from agent.skill_commands import reload_skills
+            result = await asyncio.to_thread(reload_skills)
+            return web.json_response({"ok": True, **result})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)[:240]}, status=502)
 
     async def _handle_health(self, request):
         from aiohttp import web

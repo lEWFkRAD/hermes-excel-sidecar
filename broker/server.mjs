@@ -2702,6 +2702,15 @@ if (isMainModule) {
 
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
         if (req.method === "GET" && apiPath === "/api/capabilities") return send(res, 200, buildCapabilities(), undefined, origin);
+        if (req.method === "POST" && apiPath === "/api/reload-skills") {
+          const upstream = await fetch(excelAdapterUrl.replace(/\/ingest$/, "/reload-skills"), {
+            method: "POST",
+            headers: { ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) },
+            signal: AbortSignal.timeout(15_000),
+          });
+          const result = await upstream.json().catch(() => ({ ok: false, error: `reload HTTP ${upstream.status}` }));
+          return send(res, upstream.ok ? 200 : upstream.status, result, undefined, origin);
+        }
         if (req.method === "POST" && apiPath === "/api/external/grant") {
           if (!bridgeToken) return send(res, 503, { error: "External connector requires a configured bridge token." }, undefined, origin);
           const body = await readJson(req, 64 * 1024);
