@@ -52,6 +52,37 @@ function stableMatrix(value) {
   return JSON.stringify(value || []);
 }
 
+function compactMatrix(matrix, maxCells = 400, maxCellChars = 256) {
+  const rows = [];
+  let cells = 0;
+  for (const row of Array.isArray(matrix) ? matrix : []) {
+    if (cells >= maxCells) break;
+    const compactRow = [];
+    for (const cell of Array.isArray(row) ? row : []) {
+      if (cells >= maxCells) break;
+      const cellValue = cell === null || cell === undefined ? cell : cell;
+      const text = typeof cellValue === "string" ? cellValue : "";
+      compactRow.push(text && text.length > maxCellChars ? `${text.slice(0, maxCellChars)}…` : cellValue);
+      cells += 1;
+    }
+    rows.push(compactRow);
+  }
+  return rows;
+}
+
+function boundedHistory(limit = 12, maxChars = 24000) {
+  const result = [];
+  let chars = 0;
+  for (const item of [...state.history].reverse()) {
+    const content = String(item?.content || "");
+    if (chars + content.length > maxChars) break;
+    result.unshift({ role: item.role, content });
+    chars += content.length;
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
 function consumePendingProposal(proposalId) {
   if (!state.pendingProposal || state.pendingProposal.proposalId !== proposalId || state.pendingProposal.consumed) {
     return false;
@@ -784,8 +815,8 @@ async function readWorkbookContext() {
     };
     state.selection = {
       address: selected.address,
-      values: selectionSample.values,
-      formulas: selectionSample.formulas,
+      values: compactMatrix(selectionSample.values),
+      formulas: compactMatrix(selectionSample.formulas),
       truncated: selectionTruncated,
       rowCount: selected.rowCount,
       columnCount: selected.columnCount,
@@ -891,7 +922,7 @@ async function askHermes(prompt, filesToSend, initialToolResults = []) {
           workbook_id: state.workbookId,
           conversation_id: state.conversationId,
           prompt,
-          history: state.history.slice(-12),
+          history: boundedHistory(),
           ...context,
           files: loopCount === 0 ? files : [],
           parsed_files: loopCount > 0 && parsedFiles ? parsedFiles : undefined,
