@@ -443,6 +443,7 @@ async function performCyntekaQuery(action) {
 
 const els = {
   status: document.getElementById("status"),
+  sessionBadge: document.getElementById("sessionBadge"),
   workbookLabel: document.getElementById("workbookLabel"),
   sheetLabel: document.getElementById("sheetLabel"),
   scopeButton: document.getElementById("scopeButton"),
@@ -2007,6 +2008,7 @@ Office.onReady((info) => {
     state.workbookId = randomId("workbook");
   }
   state.conversationId = randomId("conversation");
+  if (els.sessionBadge) els.sessionBadge.textContent = state.conversationId.slice(-8);
   loadChatHistory();
   loadReviewMode();
   wireDropzone();
