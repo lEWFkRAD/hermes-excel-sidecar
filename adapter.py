@@ -508,9 +508,15 @@ class ExcelAdapter(BasePlatformAdapter):
         # overrides.  Without this, every new conversation inherits the global
         # model, even when that model cannot satisfy Excel's forced typed-tool
         # contract.
-        source = self.build_source(chat_id=stable_chat_id, chat_name="Microsoft Excel", chat_type="dm",
+        source = self.build_source(chat_id=stable_chat_id, chat_name="Hermes-Excel", chat_type="dm",
                                    user_id=workbook_id, user_name="Excel workbook",
                                    parent_chat_id="excel")
+        # Desktop project affinity is carried as a local-only source attribute and
+        # persisted into the session row by the gateway; it never enters the wire
+        # origin JSON or workbook content.
+        source.session_cwd = os.path.expanduser(
+            os.environ.get("HERMES_EXCEL_PROJECT_CWD", "~/Hermes-Excel")
+        )
         event = MessageEvent(text=prompt + "\n\nEXCEL REQUEST ENVELOPE:\n" + json.dumps(envelope),
                              message_type=MessageType.TEXT, source=source, raw_message=body,
                              message_id=request_id)
