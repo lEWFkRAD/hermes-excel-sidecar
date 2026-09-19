@@ -1799,11 +1799,11 @@ function wireParityUi() {
   });
   els.reloadSkillsButton?.addEventListener("click", () => {
     setMenuOpen(els.overflowMenu, els.overflowButton, false);
-    addMessage("hermes", "Skill reload is available from the staged UI; the live gateway has not been changed.");
+    addMessage("hermes", "Skill reload is not enabled in this live deployment yet; no gateway change was attempted.");
   });
   els.settingsButton?.addEventListener("click", () => {
     setMenuOpen(els.overflowMenu, els.overflowButton, false);
-    addMessage("hermes", "Settings will be enabled in the staged parity rollout.");
+    addMessage("hermes", "Settings are not enabled in this live deployment yet; no setting was changed.");
   });
   try { setScope(localStorage.getItem("hermes-scope") || "workbook"); } catch { setScope("workbook"); }
 }

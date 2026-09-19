@@ -8,7 +8,7 @@ import re
 from urllib.parse import urlparse
 from typing import Any
 
-from .excel_runtime import capture_proposal
+from .excel_runtime import capture_proposal, get_active_request
 
 MAX_ACTIONS = 50
 MAX_PAYLOAD_BYTES = 512_000
@@ -226,6 +226,13 @@ def handle_excel_response(args: dict[str, Any], **_kwargs: Any) -> str:
     if not isinstance(args, dict):
         raise ValueError("excel_response arguments must be an object")
     _repair_actions(args)
+    # The model can repeat a conversation id from an earlier Excel turn even
+    # though the tool call is executing inside the current authenticated request.
+    # Bind only this non-authoritative correlation field to the active request;
+    # request_id, workbook_id, and round remain strict protocol checks.
+    active = get_active_request()
+    if active is not None and str(args.get("conversation_id") or "") != active.conversation_id:
+        args["conversation_id"] = active.conversation_id
     try:
         validate_schema(args, EXCEL_RESPONSE_SCHEMA["parameters"], "excel_response")
     except ValueError as exc:

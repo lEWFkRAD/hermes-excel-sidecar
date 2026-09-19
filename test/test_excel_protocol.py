@@ -230,6 +230,24 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime.open_request(request_id="request-one-123", workbook_id="workbook-two-123",
                                  conversation_id="conversation-two-123", round=0)
 
+    async def test_conversation_id_is_bound_to_active_request(self):
+        item = runtime.open_request(request_id="request-bind-123", workbook_id="workbook-bind-123",
+                                    conversation_id="conversation-current-123", round=0)
+        token = runtime.active_request_id.set(item.request_id)
+        try:
+            result = tool.handle_excel_response({
+                "request_id": item.request_id,
+                "workbook_id": item.workbook_id,
+                "conversation_id": "conversation-stale-123",
+                "round": 0,
+                "message": "Ready",
+                "actions": [],
+            })
+            self.assertIn("Proposal captured", result)
+            self.assertTrue(item.proposal_captured)
+        finally:
+            runtime.active_request_id.reset(token)
+
     async def test_concurrent_double_capture_has_one_winner(self):
         item = runtime.open_request(request_id="request-race-123", workbook_id="workbook-race-123",
                                     conversation_id="conversation-race-123", round=0)
