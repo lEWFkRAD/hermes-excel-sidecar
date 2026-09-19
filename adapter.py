@@ -181,7 +181,7 @@ class ExcelAdapter(BasePlatformAdapter):
         self._port = int(os.getenv("HERMES_EXCEL_INGEST_PORT", str(DEFAULT_PORT)))
         self._profile_hint = profile_name
         self._bound_owner: AdapterOwnerIdentity | None = None
-        self._timeout = float(os.getenv("HERMES_EXCEL_REPLY_TIMEOUT", "420"))
+        self._timeout = float(os.getenv("HERMES_EXCEL_REPLY_TIMEOUT", "480"))
         self._runner = None
         self._request_tasks: dict[str, asyncio.Task] = {}
 
@@ -586,6 +586,7 @@ class ExcelAdapter(BasePlatformAdapter):
         self._request_tasks[request_id] = task
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        close_reason = None
         try:
             protocol = asyncio.gather(pending.proposal, pending.final_message)
             done, _ = await asyncio.wait({protocol, task}, timeout=self._timeout, return_when=asyncio.FIRST_COMPLETED)
@@ -609,11 +610,14 @@ class ExcelAdapter(BasePlatformAdapter):
                 return ownership_error
             return web.json_response({"proposal": proposal, "message": final, "source": "hermes-platform"})
         except asyncio.TimeoutError:
+            close_reason = "adapter timeout"
             return web.json_response({"error": "agent timed out"}, status=504)
         except asyncio.CancelledError:
+            close_reason = "request canceled"
             task.cancel()
             return web.json_response({"error": "request canceled"}, status=499)
         except RuntimeError as exc:
+            close_reason = str(exc)[:160] or "agent runtime error"
             return web.json_response({"error": str(exc)}, status=502)
         finally:
             protocol.cancel()
@@ -625,7 +629,7 @@ class ExcelAdapter(BasePlatformAdapter):
                 if task not in stopped:
                     task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
             self._request_tasks.pop(request_id, None)
-            close_request(request_id)
+            close_request(request_id, close_reason)
 
 
 def check_excel_requirements(*, profile_name: str | None = None) -> bool:

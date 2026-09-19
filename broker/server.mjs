@@ -2558,7 +2558,7 @@ async function handleChat(req, res) {
   } catch (error) {
     if (error.statusCode === 413 && !res.writableEnded) return send(res, 413, { error: error.message }, undefined, origin);
     if (controller.signal.aborted && body?.request_id && body?.workbook_id) {
-      fetch(excelAdapterUrl.replace(/\/ingest$/, "/cancel"), {
+      await fetch(excelAdapterUrl.replace(/\/ingest$/, "/cancel"), {
         method: "POST",
         headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) },
         body: JSON.stringify({ request_id: body.request_id, workbook_id: body.workbook_id }),

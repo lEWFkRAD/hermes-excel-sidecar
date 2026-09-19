@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,8 @@ _active_workbooks: dict[str, str] = {}
 # Written by the adapter's send_draft, read by its /activity endpoint, dropped
 # on close_request. Presentation-only: never persisted, never part of history.
 _activity: dict[str, dict[str, Any]] = {}
+_expired: dict[str, tuple[float, str]] = {}
+_expired_ttl_seconds = 120.0
 _lock = threading.RLock()
 
 # Gateway executor workers propagate ContextVars, preserving per-request ownership.
@@ -80,6 +83,9 @@ def capture_proposal(args: dict[str, Any]) -> None:
     with _lock:
         item = _pending.get(request_id)
         if item is None:
+            expired_at, reason = _expired.get(request_id, (0.0, ""))
+            if expired_at and time.monotonic() - expired_at < _expired_ttl_seconds:
+                raise ValueError(f"request expired; late typed response discarded ({reason or 'request closed'})")
             raise ValueError("unknown or expired request_id")
         if str(args.get("workbook_id") or "") != item.workbook_id:
             item.protocol_error = "workbook_id mismatch"
@@ -136,10 +142,16 @@ def get_activity(request_id: str) -> dict[str, Any] | None:
         return dict(entry) if entry else None
 
 
-def close_request(request_id: str) -> None:
+def close_request(request_id: str, reason: str | None = None) -> None:
     with _lock:
+        now = time.monotonic()
+        for expired_id, (expired_at, _) in list(_expired.items()):
+            if now - expired_at >= _expired_ttl_seconds:
+                _expired.pop(expired_id, None)
         item = _pending.pop(request_id, None)
         _activity.pop(request_id, None)
+        if reason and item is not None:
+            _expired[request_id] = (now, reason)
         if item and _active_workbooks.get(item.workbook_id) == request_id:
             _active_workbooks.pop(item.workbook_id, None)
     if item:
