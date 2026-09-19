@@ -43,6 +43,7 @@ import {
   adapterOwnerContractMatches,
   isProfileSensitiveApiRequest,
   probeOwnedAdapter,
+  excelAdapterExpectedPort,
   dispatchProfileSensitiveApi,
   resolveContainedNativePath,
   scanWrittenCells,
@@ -102,6 +103,10 @@ test("adapter health must attest the bridge's exact owner identity and port", ()
   assert.equal(adapterOwnerContractMatches({ ...detail, bridge_port: 8789 }, owner, 8788), false);
   assert.equal(adapterOwnerContractMatches({ ...detail, bridge_port: "8788" }, owner, 8788), false);
   assert.equal(adapterOwnerContractMatches(detail, { profile_name: "", owner_fingerprint: "" }, 8788), false);
+});
+
+test("remote adapter ownership uses the tunnel port, not the local bridge port", () => {
+  assert.equal(excelAdapterExpectedPort, 8794);
 });
 
 test("profile-sensitive API classification protects chat and export but leaves health diagnostic", () => {

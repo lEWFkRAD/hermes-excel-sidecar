@@ -85,6 +85,7 @@ const llmTimeoutMs = Number(process.env.HERMES_EXCEL_LLM_TIMEOUT_MS || 180000);
 const llmRequestBudgetMs = Number(process.env.HERMES_EXCEL_LLM_REQUEST_BUDGET_MS || 420000);
 const llmMaxTokens = Number(process.env.HERMES_EXCEL_LLM_MAX_TOKENS || 8000);
 const excelAdapterUrl = (process.env.HERMES_EXCEL_ADAPTER_URL || "http://127.0.0.1:8794/ingest").replace(/\/$/, "");
+const excelAdapterExpectedPort = Number(process.env.HERMES_EXCEL_ADAPTER_EXPECTED_PORT || new URL(excelAdapterUrl).port || 8794);
 const excelAdapterToken = process.env.HERMES_EXCEL_INGEST_TOKEN || "";
 // Certified releases have exactly one model boundary: the typed Excel adapter.
 // Legacy parser helpers remain temporarily for isolated regression tests only.
@@ -300,7 +301,7 @@ async function probeOwnedAdapter({
   adapterUrl = excelAdapterUrl,
   adapterToken = excelAdapterToken,
   ownerIdentity = runtimeOwnerIdentity,
-  expectedPort = port,
+  expectedPort = excelAdapterExpectedPort,
   timeoutMs = 3000,
 } = {}) {
   if (!/^[0-9a-f]{64}$/.test(adapterToken)) {
@@ -2811,6 +2812,7 @@ export {
   adapterOwnerContractMatches,
   isProfileSensitiveApiRequest,
   probeOwnedAdapter,
+  excelAdapterExpectedPort,
   dispatchProfileSensitiveApi,
   scanWrittenCells,
   matrixToCsv,
