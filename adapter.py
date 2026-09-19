@@ -231,6 +231,7 @@ class ExcelAdapter(BasePlatformAdapter):
         app.router.add_get("/activity", self._handle_activity)
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/external/request", self._handle_external_request)
+        app.router.add_post("/cynteka/search", self._handle_cynteka_search)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         await web.TCPSite(self._runner, self._host, self._port).start()
@@ -304,6 +305,39 @@ class ExcelAdapter(BasePlatformAdapter):
             return web.json_response({"error": "remote connector timed out"}, status=504)
         except Exception as exc:
             return web.json_response({"error": str(exc)[:240]}, status=502)
+
+    async def _handle_cynteka_search(self, request):
+        from aiohttp import web
+        _, error = self._authorize_request(request)
+        if error is not None:
+            return error
+        try:
+            body = await request.json(loads=json.loads)
+            material = str(body.get("material", "")).strip()
+            tenant = str(body.get("tenant", "reformenginiring"))
+            scope = str(body.get("credential_scope", f"cynteka.{tenant}.read"))
+            if not material or tenant not in {"reformenginiring", "partner"}:
+                return web.json_response({"error": "material and valid tenant are required"}, status=400)
+            token_name = "CYNTEKA_REFORMENGINIRING_TOKEN" if tenant == "reformenginiring" else "CYNTEKA_PARTNER_TOKEN"
+            base_name = "CYNTEKA_REFORMENGINIRING_BASE_URL" if tenant == "reformenginiring" else "CYNTEKA_PARTNER_BASE_URL"
+            token = os.getenv(token_name)
+            base = os.getenv(base_name, f"https://{tenant}.cynteka.ru").rstrip("/")
+            if not token or scope != f"cynteka.{tenant}.read":
+                return web.json_response({"error": "approved Cynteka credential is unavailable on the VPS"}, status=503)
+            from urllib.parse import quote
+            url = f"{base}/api/v1/offers?search={quote(material)}&page=1&pageSize=100&isoDate"
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), raise_for_status=False) as session:
+                async with session.get(url, headers={"Accept": "application/json", "ZakupayToken": token}, allow_redirects=False) as response:
+                    raw = await response.content.read(512 * 1024 + 1)
+                    if len(raw) > 512 * 1024:
+                        return web.json_response({"error": "Cynteka response is too large"}, status=502)
+                    data = json.loads(raw.decode("utf-8"))
+                    offers = data.get("offers", []) if isinstance(data, dict) else []
+                    return web.json_response({"status": "verified" if offers else "needs_review", "material": material, "tenant": tenant, "source_url": url.split("?")[0], "count": len(offers), "offers": _sanitize_remote_data(offers[:25]), "error": None if offers else "No matching offers returned."}, status=200 if response.status == 200 else response.status)
+        except asyncio.TimeoutError:
+            return web.json_response({"status": "failed", "error": "Cynteka search timed out."}, status=504)
+        except Exception as exc:
+            return web.json_response({"status": "failed", "error": str(exc)[:240]}, status=502)
 
     async def _handle_cancel(self, request):
         from aiohttp import web

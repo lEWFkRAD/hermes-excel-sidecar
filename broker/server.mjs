@@ -1580,6 +1580,12 @@ function normalizeAction(action) {
       return null;
     }
   }
+  if (type === "cynteka_search") {
+    const material = String(action.material || "").trim();
+    if (!material) return null;
+    const tenant = ["reformenginiring", "partner"].includes(String(action.tenant || "")) ? String(action.tenant) : "reformenginiring";
+    return { type, material: material.slice(0, 240), source_cell: String(action.source_cell || "").slice(0, 160), tenant, credential_scope: String(action.credential_scope || `cynteka.${tenant}.read`).slice(0, 160) };
+  }
   if (type === "read_range") {
     if (!action.range) return null;
     return {
@@ -2011,7 +2017,7 @@ function buildSystemPrompt(loopBudgetExhausted) {
       + '{"type":"delete_sheet","name":"Old"}, {"type":"sort_range","range":"A2:D20","column":1,"ascending":true,"has_header":false}, '
       + '{"type":"clear_range","range":"A1:D20","target":"contents"}.',
     'A read action is also available: {"type":"read_range","range":"Sheet Name!A1:D200","reason":"short why"}.',
-    'External site/API access is represented only by {"type":"request_external_access","url":"https://...","purpose":"short reason","operation":"read|browser_read|api_read","credential_scope":"optional"}; The task pane requires a server-issued expiring grant for each approved origin and a separate grant for credential use.',
+    'External site/API access is represented only by {"type":"request_external_access","url":"https://...","purpose":"short reason","operation":"read|browser_read|api_read","credential_scope":"optional"}; For a material lookup in Reform Sinteka, emit {"type":"cynteka_search","material":"exact material text","source_cell":"Sheet!D92","tenant":"reformenginiring","credential_scope":"cynteka.reformenginiring.read"} instead of claiming records are unavailable. The task pane requires a server-issued expiring grant for each approved origin and a separate grant for credential use.',
     "COMPLETE THE ENTIRE TASK IN THIS ONE REPLY. You get no follow-up turn except to receive read_range results you explicitly request. Never say you will continue 'in a couple of actions', 'next', or 'then' — emit every action the task needs right now, in this single actions array.",
     "Each cell value must be short — a label, a number, or a formula. Formulas are encouraged (see the A1-relative formula rule below); the only limit is on prose, not on formulas or numbers. NEVER put a sentence, explanation, or multi-clause note (more than ~40 characters of prose) inside a cell, and never build a 'QA Notes' block out of long prose rows — that corrupts the output and makes the model stop mid-reply. If the user wants a QA note, keep it to a few short cells or put the explanation in the 'message' field instead of in the sheet.",
     "Use conditional_format (NOT execute_office_js) to highlight cells by value, e.g. Margin % below a threshold. operator is one of lessThan, lessThanOrEqual, greaterThan, greaterThanOrEqual, equalTo, notEqualTo, between, notBetween. For percentage columns the underlying cell value is a decimal, so 'below 25%' means value 0.25 (not 25). fill_color/font_color are hex; default is light-red fill #FFC7CE with dark-red font #9C0006.",
@@ -2697,6 +2703,17 @@ if (isMainModule) {
           const kind = body.kind === "credential" ? "credential" : "origin";
           if (req.headers["x-hermes-approval-kind"] !== kind) return send(res, 403, { error: "Approval kind mismatch." }, undefined, origin);
           return send(res, 200, { grant: issueExternalGrant(request, kind), kind, expires_in_ms: EXTERNAL_GRANT_TTL_MS }, undefined, origin);
+        }
+        if (req.method === "POST" && apiPath === "/api/cynteka/search") {
+          if (!bridgeToken) return send(res, 503, { error: "Cynteka connector requires a configured bridge token." }, undefined, origin);
+          const body = await readJson(req, 64 * 1024);
+          const tenant = body.tenant === "partner" ? "partner" : "reformenginiring";
+          const connectorRequest = { origin: `https://${tenant === "partner" ? "partner" : "reformenginiring"}.cynteka.ru`, url: `https://${tenant === "partner" ? "partner" : "reformenginiring"}.cynteka.ru/api/v1/offers`, operation: "api_read", credential_scope: String(body.credential_scope || `cynteka.${tenant}.read`) };
+          if (!consumeExternalGrant(req.headers["x-hermes-external-grant"], connectorRequest, "origin")) return send(res, 403, { error: "Valid external approval grant is required." }, undefined, origin);
+          if (!consumeExternalGrant(req.headers["x-hermes-credential-grant"], connectorRequest, "credential")) return send(res, 403, { error: "Valid credential approval grant is required." }, undefined, origin);
+          const upstream = await fetch(excelAdapterUrl.replace(/\/ingest$/, "/cynteka/search"), { method: "POST", headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(25_000) });
+          const result = await upstream.json().catch(() => ({ status: "failed", error: `Cynteka connector HTTP ${upstream.status}` }));
+          return send(res, upstream.ok ? 200 : upstream.status, result, undefined, origin);
         }
         if (req.method === "POST" && apiPath === "/api/external/request") {
           if (!bridgeToken) return send(res, 503, { error: "External connector requires a configured bridge token." }, undefined, origin);

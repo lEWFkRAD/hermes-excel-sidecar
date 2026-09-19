@@ -52,6 +52,7 @@ ACTION_SCHEMAS = [
         "font_color": {"type": "string", "maxLength": 20}}, ["range", "operator", "value"]),
     _action("read_range", {"range": RANGE, "reason": {"type": "string", "maxLength": 240}}, ["range"]),
     _action("request_external_access", {"url": {"type": "string", "format": "uri", "maxLength": 2048}, "purpose": {"type": "string", "minLength": 1, "maxLength": 240}, "operation": {"type": "string", "enum": ["read", "browser_read", "api_read"]}, "credential_scope": {"type": "string", "maxLength": 160}}, ["url", "purpose"]),
+    _action("cynteka_search", {"material": {"type": "string", "minLength": 1, "maxLength": 240}, "source_cell": {"type": "string", "maxLength": 160}, "tenant": {"type": "string", "enum": ["reformenginiring", "partner"]}, "credential_scope": {"type": "string", "maxLength": 160}}, ["material"]),
     _action("export", {"name": {"type": "string", "minLength": 1, "maxLength": 120}, "values": MATRIX}, ["name", "values"]),
 ]
 ACTION_SCHEMAS.append(_action("merge_cells", {"range": RANGE, "across": {"type": "boolean"}}, ["range"]))
