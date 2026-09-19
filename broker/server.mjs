@@ -481,9 +481,9 @@ function compactSelection(selection) {
     address: selection?.address || "",
     rowCount: selection?.rowCount || values.length,
     columnCount: selection?.columnCount || values[0]?.length || 0,
-    values: values.slice(0, 100).map((row) => row.slice(0, 16).map(sanitizeWorkbookValue)),
+    values: values.slice(0, 100).map((row) => (Array.isArray(row) ? row.slice(0, 16).map(sanitizeWorkbookValue) : [sanitizeWorkbookValue(row)])),
     formulas: Array.isArray(selection?.formulas)
-      ? selection.formulas.slice(0, 100).map((row) => row.slice(0, 16).map(sanitizeWorkbookValue))
+      ? selection.formulas.slice(0, 100).map((row) => (Array.isArray(row) ? row.slice(0, 16).map(sanitizeWorkbookValue) : [sanitizeWorkbookValue(row)]))
       : [],
   };
 }
