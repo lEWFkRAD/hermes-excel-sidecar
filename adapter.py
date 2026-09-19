@@ -387,15 +387,44 @@ class ExcelAdapter(BasePlatformAdapter):
             if not token or scope != f"cynteka.{tenant}.read":
                 return web.json_response({"error": "approved Cynteka credential is unavailable on the VPS"}, status=503)
             from urllib.parse import quote
-            url = f"{base}/api/v1/offers?search={quote(material)}&page=1&pageSize=25&isoDate"
+            # Cynteka's offer search is a single-field filter. Sending the entire
+            # long product description can miss an embedded article/model code,
+            # so retry deterministic identifier tokens (for example SMALLT3A10H)
+            # when the full-name search returns nothing.
+            terms = [material]
+            identifiers = []
+            for candidate in re.findall(r"(?i)\\b[A-ZА-Я][A-ZА-Я0-9-]{4,}\\d[A-ZА-Я0-9-]*\\b", material):
+                normalized = candidate.strip()
+                if normalized.casefold() not in {term.casefold() for term in terms}:
+                    identifiers.append(normalized)
+                    terms.append(normalized)
+            offers = []
+            seen = set()
+            source_urls = []
+            statuses = []
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), raise_for_status=False) as session:
-                async with session.get(url, headers={"Accept": "application/json", "ZakupayToken": token}, allow_redirects=False) as response:
-                    raw = await response.content.read(512 * 1024 + 1)
-                    if len(raw) > 512 * 1024:
-                        return web.json_response({"error": "Cynteka response is too large"}, status=502)
-                    data = json.loads(raw.decode("utf-8"))
-                    offers = data.get("offers", []) if isinstance(data, dict) else []
-                    return web.json_response({"status": "verified" if offers else "needs_review", "material": material, "tenant": tenant, "source_url": url.split("?")[0], "count": len(offers), "offers": _sanitize_remote_data(offers[:25]), "error": None if offers else "No matching offers returned."}, status=200 if response.status == 200 else response.status)
+                for term in terms[:4]:
+                    url = f"{base}/api/v1/offers?search={quote(term)}&page=1&pageSize=25&isoDate"
+                    async with session.get(url, headers={"Accept":"application/json", "ZakupayToken":token}, allow_redirects=False) as response:
+                        statuses.append(response.status)
+                        raw = await response.content.read(512 * 1024 + 1)
+                        if len(raw) > 512 * 1024:
+                            return web.json_response({"error":"Cynteka response is too large"}, status=502)
+                        if response.status != 200:
+                            continue
+                        data = json.loads(raw.decode("utf-8"))
+                        source_urls.append(url.split("?")[0])
+                        for offer in (data.get("offers", []) if isinstance(data, dict) else []):
+                            key = str(offer.get("id")) if isinstance(offer, dict) and offer.get("id") is not None else json.dumps(offer, sort_keys=True, ensure_ascii=False)
+                            if key not in seen:
+                                seen.add(key)
+                                offers.append(offer)
+                        # An identifier hit is stronger than a broad description hit;
+                        # keep the first matching code result and do not create noise
+                        # from unrelated later terms.
+                        if offers and term in identifiers:
+                            break
+            return web.json_response({"status":"verified" if offers else "needs_review", "material":material, "tenant":tenant, "source_url": source_urls[0] if source_urls else f"{base}/api/v1/offers", "search_terms": terms, "matched_by": next((term for term in identifiers if any(str(term).casefold() in json.dumps(offer, ensure_ascii=False).casefold() for offer in offers)), None), "count":len(offers), "offers":_sanitize_remote_data(offers[:25]), "error":None if offers else "No matching offers returned."}, status=200 if any(code == 200 for code in statuses) else (statuses[0] if statuses else 502))
         except asyncio.TimeoutError:
             return web.json_response({"status": "failed", "error": "Cynteka search timed out."}, status=504)
         except Exception as exc:
