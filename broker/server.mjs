@@ -669,7 +669,7 @@ function parseDelimitedText(text, delimiter) {
 }
 
 function markdownTableFromRows(rows, limit = 80) {
-  const trimmed = rows.slice(0, limit).map((row) => row.slice(0, 20));
+  const trimmed = rows.slice(0, limit).map((row) => (Array.isArray(row) ? row.slice(0, 20) : [row]));
   if (!trimmed.length) return "";
   const width = Math.max(...trimmed.map((row) => row.length));
   const padded = trimmed.map((row) => {
