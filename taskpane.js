@@ -463,6 +463,8 @@ const els = {
   settingsButton: document.getElementById("settingsButton"),
   settingsPanel: document.getElementById("settingsPanel"),
   closeSettingsButton: document.getElementById("closeSettingsButton"),
+  newSessionButton: document.getElementById("newSessionButton"),
+  endSessionButton: document.getElementById("endSessionButton"),
   resetSettingsButton: document.getElementById("resetSettingsButton"),
   saveSettingsButton: document.getElementById("saveSettingsButton"),
   dropzone: document.getElementById("dropzone"),
@@ -1789,6 +1791,34 @@ function setScope(scope) {
   try { localStorage.setItem("hermes-scope", state.uiScope); } catch {}
 }
 
+function archiveCurrentSession(reason) {
+  try {
+    const key = `hermes-session-archive:${state.workbookKey || "default"}:${state.conversationId}`;
+    localStorage.setItem(key, JSON.stringify({ reason, archived_at: new Date().toISOString(), history: state.history.slice(-40), messages: renderedMessages.slice(-80) }));
+  } catch {}
+}
+
+function rotateExcelSession(reason) {
+  archiveCurrentSession(reason);
+  state.history = [];
+  state.undoStack = [];
+  state.pendingProposal = null;
+  state.externalApprovalGrants.clear();
+  state.externalApprovalTokens.clear();
+  renderedMessages.length = 0;
+  els.messages.replaceChildren();
+  state.conversationId = randomId("conversation");
+  if (els.sessionBadge) els.sessionBadge.textContent = state.conversationId.slice(-8);
+  saveChatHistory();
+  addMessage("hermes", `${reason}. New session: ${state.conversationId.slice(-8)}`, false);
+}
+
+function confirmSessionAction(kind) {
+  const label = kind === "new" ? "start a new session" : "end this session";
+  if (!window.confirm(`Are you sure you want to ${label}?`)) return false;
+  return window.confirm(`Confirm again: ${label}. The current chat will be archived and approvals will be cleared.`);
+}
+
 async function loadSettingsPanel() {
   const response = await fetch(`${brokerUrls[0]}/api/settings`, { headers: bridgeHeaders() });
   const payload = await response.json();
@@ -1821,6 +1851,12 @@ function wireSettingsUi() {
     try { await loadSettingsPanel(); } catch (error) { addMessage("hermes", `Settings could not be loaded: ${error.message}`); }
   });
   els.closeSettingsButton?.addEventListener("click", () => { els.settingsPanel.hidden = true; });
+  els.newSessionButton?.addEventListener("click", () => {
+    if (confirmSessionAction("new")) rotateExcelSession("New session started");
+  });
+  els.endSessionButton?.addEventListener("click", () => {
+    if (confirmSessionAction("end")) rotateExcelSession("Session ended and approvals cleared");
+  });
   els.resetSettingsButton?.addEventListener("click", async () => {
     for (const input of els.settingsPanel.querySelectorAll("[data-setting]")) input.checked = ["review_before_apply", "verify_after_apply", "use_installed_skills", "show_activity"].includes(input.dataset.setting);
     try { await saveSettingsPanel(); } catch (error) { addMessage("hermes", `Settings reset failed: ${error.message}`); }
