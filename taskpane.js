@@ -460,6 +460,10 @@ const els = {
   attachButton: document.getElementById("attachButton"),
   reloadSkillsButton: document.getElementById("reloadSkillsButton"),
   settingsButton: document.getElementById("settingsButton"),
+  settingsPanel: document.getElementById("settingsPanel"),
+  closeSettingsButton: document.getElementById("closeSettingsButton"),
+  resetSettingsButton: document.getElementById("resetSettingsButton"),
+  saveSettingsButton: document.getElementById("saveSettingsButton"),
   dropzone: document.getElementById("dropzone"),
   dropLabel: document.getElementById("dropLabel"),
   fileInput: document.getElementById("fileInput"),
@@ -1784,6 +1788,49 @@ function setScope(scope) {
   try { localStorage.setItem("hermes-scope", state.uiScope); } catch {}
 }
 
+async function loadSettingsPanel() {
+  const response = await fetch(`${brokerUrls[0]}/api/settings`, { headers: bridgeHeaders() });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || `Settings unavailable (${response.status}).`);
+  for (const input of els.settingsPanel.querySelectorAll("[data-setting]")) {
+    if (typeof payload.settings?.[input.dataset.setting] === "boolean") input.checked = payload.settings[input.dataset.setting];
+  }
+}
+
+async function saveSettingsPanel() {
+  const settings = {};
+  for (const input of els.settingsPanel.querySelectorAll("[data-setting]")) settings[input.dataset.setting] = input.checked;
+  const response = await fetch(`${brokerUrls[0]}/api/settings`, {
+    method: "PUT",
+    headers: bridgeHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ settings }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || `Settings save failed (${response.status}).`);
+  // Keep the workbook safety switch aligned with the server policy.
+  state.reviewMode = Boolean(payload.settings?.review_before_apply);
+  if (els.reviewToggle) els.reviewToggle.checked = state.reviewMode;
+  addMessage("hermes", "Settings saved. Credential approval and read-only memory remain enforced.");
+}
+
+function wireSettingsUi() {
+  els.settingsButton?.addEventListener("click", async () => {
+    setMenuOpen(els.overflowMenu, els.overflowButton, false);
+    els.settingsPanel.hidden = false;
+    try { await loadSettingsPanel(); } catch (error) { addMessage("hermes", `Settings could not be loaded: ${error.message}`); }
+  });
+  els.closeSettingsButton?.addEventListener("click", () => { els.settingsPanel.hidden = true; });
+  els.resetSettingsButton?.addEventListener("click", async () => {
+    for (const input of els.settingsPanel.querySelectorAll("[data-setting]")) input.checked = ["review_before_apply", "verify_after_apply", "use_installed_skills", "show_activity"].includes(input.dataset.setting);
+    try { await saveSettingsPanel(); } catch (error) { addMessage("hermes", `Settings reset failed: ${error.message}`); }
+  });
+  els.saveSettingsButton?.addEventListener("click", async () => {
+    els.saveSettingsButton.disabled = true;
+    try { await saveSettingsPanel(); } catch (error) { addMessage("hermes", `Settings save failed: ${error.message}`); }
+    finally { els.saveSettingsButton.disabled = false; }
+  });
+}
+
 function wireParityUi() {
   els.attachButton?.addEventListener("click", () => els.fileInput?.click());
   els.overflowButton?.addEventListener("click", () => {
@@ -1816,10 +1863,6 @@ function wireParityUi() {
     } finally {
       els.reloadSkillsButton.disabled = false;
     }
-  });
-  els.settingsButton?.addEventListener("click", () => {
-    setMenuOpen(els.overflowMenu, els.overflowButton, false);
-    addMessage("hermes", "Settings are not enabled in this live deployment yet; no setting was changed.");
   });
   try { setScope(localStorage.getItem("hermes-scope") || "workbook"); } catch { setScope("workbook"); }
 }
@@ -1968,6 +2011,7 @@ Office.onReady((info) => {
   loadReviewMode();
   wireDropzone();
   wireParityUi();
+  wireSettingsUi();
   wireActions();
   startBridgeMonitor();
   setStatus("Ready");

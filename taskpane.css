@@ -1,3 +1,20 @@
+.settings-panel {
+  margin: 8px 12px;
+  padding: 12px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-md);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-nous);
+}
+.settings-heading, .settings-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.settings-note { margin: 6px 0 10px; color: var(--text-secondary); font-size: 12px; }
+.settings-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-top: 1px solid var(--stroke-soft); }
+.settings-row input { accent-color: var(--accent); }
+.settings-info { display: grid; gap: 2px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--stroke-soft); color: var(--text-secondary); font-size: 11px; }
+.settings-info strong { color: var(--text-primary); }
+.settings-actions { margin-top: 12px; }
+
+
 /* Hermes for Excel — task pane skin.
    Ported from the desktop design system (apps/desktop/src/styles.css +
    DESIGN.md): Nous blue accent, flat-not-boxed surfaces, hairline strokes,

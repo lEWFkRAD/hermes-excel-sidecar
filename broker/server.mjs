@@ -63,6 +63,42 @@ function requireTransportSecurity() {
 // documents and exported CSVs are never reachable over HTTP (serveStatic only ever
 // serves the pane whitelist below). Defaults per-platform; override with HERMES_EXCEL_DATA_DIR.
 const dataDir = process.env.HERMES_EXCEL_DATA_DIR || defaultDataDir();
+const settingsPath = path.join(dataDir, "settings.json");
+const DEFAULT_SETTINGS = Object.freeze({
+  review_before_apply: true,
+  verify_after_apply: true,
+  memory_read_only: true,
+  use_installed_skills: true,
+  external_access_approval: true,
+  credential_approval: true,
+  show_activity: true,
+  project_name: "Hermes-Excel",
+  project_path: "/home/eltajm/Hermes-Excel",
+  workbook_session_identity: true,
+  session_id_display: true,
+});
+async function loadExcelSettings() {
+  try {
+    const parsed = JSON.parse(await readFile(settingsPath, "utf8"));
+    return { ...DEFAULT_SETTINGS, ...parsed, credential_approval: true, external_access_approval: true, memory_read_only: true };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+async function saveExcelSettings(input) {
+  const current = await loadExcelSettings();
+  const allowed = Object.keys(DEFAULT_SETTINGS);
+  const next = { ...current };
+  for (const key of allowed) {
+    if (typeof input?.[key] === typeof DEFAULT_SETTINGS[key]) next[key] = input[key];
+  }
+  next.credential_approval = true;
+  next.external_access_approval = true;
+  next.memory_read_only = true;
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  return next;
+}
 const uploadsDir = path.join(dataDir, "uploads");
 const exportsDir = path.join(dataDir, "exports");
 
@@ -2702,6 +2738,11 @@ if (isMainModule) {
 
         if (req.method === "GET" && apiPath === "/api/health") return send(res, 200, await healthStatus(), undefined, origin);
         if (req.method === "GET" && apiPath === "/api/capabilities") return send(res, 200, buildCapabilities(), undefined, origin);
+        if (req.method === "GET" && apiPath === "/api/settings") return send(res, 200, { settings: await loadExcelSettings() }, undefined, origin);
+        if (req.method === "PUT" && apiPath === "/api/settings") {
+          const body = await readJson(req, 32 * 1024);
+          return send(res, 200, { settings: await saveExcelSettings(body.settings || body) }, undefined, origin);
+        }
         if (req.method === "POST" && apiPath === "/api/reload-skills") {
           const upstream = await fetch(excelAdapterUrl.replace(/\/ingest$/, "/reload-skills"), {
             method: "POST",

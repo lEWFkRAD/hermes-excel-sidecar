@@ -58,6 +58,18 @@
         </div>
       </section>
 
+      <section id="settingsPanel" class="settings-panel" hidden aria-label="Hermes Excel settings">
+        <div class="settings-heading"><strong>Settings</strong><button id="closeSettingsButton" type="button" class="ghost">Close</button></div>
+        <p class="settings-note">General Excel access and safety policy. Credential approval and memory read-only are always enforced.</p>
+        <label class="settings-row"><input type="checkbox" data-setting="review_before_apply" /> Review workbook changes before applying</label>
+        <label class="settings-row"><input type="checkbox" data-setting="verify_after_apply" /> Verify workbook changes after applying</label>
+        <label class="settings-row"><input type="checkbox" data-setting="use_installed_skills" /> Use installed skills</label>
+        <label class="settings-row"><input type="checkbox" data-setting="show_activity" /> Show live tool activity</label>
+        <div class="settings-info"><strong>Always enforced</strong><span>Memory: read-only · External access: approval · Credentials: separate approval</span></div>
+        <div class="settings-info"><strong>Project</strong><span>Hermes-Excel · /home/eltajm/Hermes-Excel</span></div>
+        <div class="settings-actions"><button id="resetSettingsButton" type="button" class="ghost">Reset</button><button id="saveSettingsButton" type="button" class="primary">Save settings</button></div>
+      </section>
+
       <section id="messages" class="messages" aria-live="polite"></section>
 
       <form id="chatForm" class="composer" aria-label="Hermes chat composer">
