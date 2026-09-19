@@ -867,6 +867,17 @@ async function askHermes(prompt, filesToSend, initialToolResults = []) {
   let toolResults = [...initialToolResults];
   let parsedFiles = null;
   let response = null;
+  let recoveryAttempted = false;
+
+  // The gateway keeps a durable transcript per Excel conversation_id. If an
+  // old Excel session has grown beyond the model context window, recover once
+  // by starting a fresh workbook conversation instead of replaying the same
+  // doomed request forever.
+  const rotateAfterAdapterFailure = (candidate) => {
+    const text = String(candidate?.message || "");
+    return !recoveryAttempted && candidate?.source === "fallback" &&
+      (candidate?.fallback_reason === "adapter_invalid" || /context|too long|cannot be shrunk|expired request/i.test(text));
+  };
 
   // The model may ask to read ranges before answering; loop up to 5 read rounds.
   for (let loopCount = 0; loopCount < 6; loopCount += 1) {
@@ -894,6 +905,17 @@ async function askHermes(prompt, filesToSend, initialToolResults = []) {
     } catch (error) {
       if (error.name === "AbortError") throw new Error("Canceled.");
       throw error;
+    }
+
+    if (rotateAfterAdapterFailure(response)) {
+      recoveryAttempted = true;
+      state.conversationId = randomId("conversation");
+      if (els.sessionBadge) els.sessionBadge.textContent = state.conversationId.slice(-8);
+      state.history = [];
+      toolResults = [...initialToolResults];
+      parsedFiles = null;
+      addMessage("hermes", "The previous Excel session was too large or expired. Hermes started a fresh session and is retrying this request.");
+      continue;
     }
 
     if (response.parsed_files) parsedFiles = response.parsed_files;
