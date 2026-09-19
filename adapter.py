@@ -325,7 +325,7 @@ class ExcelAdapter(BasePlatformAdapter):
             if not token or scope != f"cynteka.{tenant}.read":
                 return web.json_response({"error": "approved Cynteka credential is unavailable on the VPS"}, status=503)
             from urllib.parse import quote
-            url = f"{base}/api/v1/offers?search={quote(material)}&page=1&pageSize=100&isoDate"
+            url = f"{base}/api/v1/offers?search={quote(material)}&page=1&pageSize=25&isoDate"
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), raise_for_status=False) as session:
                 async with session.get(url, headers={"Accept": "application/json", "ZakupayToken": token}, allow_redirects=False) as response:
                     raw = await response.content.read(512 * 1024 + 1)
