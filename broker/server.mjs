@@ -2221,7 +2221,7 @@ async function callHermesPlatform(body, { signal } = {}) {
     // for workbook output and an attachment parsed to a table.
     const salvage = deterministicTableProposal(body, { salvage: true });
     if (salvage) return { ...salvage, fallback_reason: reason };
-    return diagnosticFallback(body, reason);
+    return { ...diagnosticFallback(body, reason), fallback_detail: String(error.message || "").slice(0, 240) };
   }
 }
 
