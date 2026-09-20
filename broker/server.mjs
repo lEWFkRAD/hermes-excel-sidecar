@@ -1518,6 +1518,11 @@ function normalizeAction(action) {
       values,
     };
   }
+  if (type === "export") {
+    const values = normalizeMatrix(action.values || action.table);
+    if (!values) return null;
+    return { type, name: safeExportName(action.name), values };
+  }
   if (type === "create_table") {
     const range = String(action.range || "").trim();
     if (!range) return null;

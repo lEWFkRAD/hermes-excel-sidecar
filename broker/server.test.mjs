@@ -393,6 +393,13 @@ test("normalizeAction: all action types plus unknown", () => {
   assert.strictEqual(normalizeAction({ type: "unknown" }), null);
 });
 
+test("normalizeAction: export remains typed and bounded", () => {
+  assert.deepStrictEqual(normalizeAction({ type: "export", name: "report.csv", values: [["x", 1]] }), {
+    type: "export", name: "report.csv", values: [["x", 1]],
+  });
+  assert.strictEqual(normalizeAction({ type: "export", values: [] }), null);
+});
+
 test("normalizeAction: table and filter operations remain typed", () => {
   assert.deepStrictEqual(normalizeAction({ type: "create_table", range: "Sales!A1:D20", has_headers: true, name: "Sales_2026" }), {
     type: "create_table", range: "Sales!A1:D20", has_headers: true, name: "Sales_2026",
