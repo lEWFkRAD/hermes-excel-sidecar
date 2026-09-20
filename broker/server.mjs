@@ -398,11 +398,13 @@ function buildReceipt({ requestId = "", model = llmModel, source = "hermes-platf
   const timestamp = generatedAt && !Number.isNaN(Date.parse(generatedAt)) ? new Date(generatedAt).toISOString() : new Date().toISOString();
   const receipt = {
     request_id: String(requestId || "").slice(0, 128),
+    event_id: "",
     model_used: String(model || "").slice(0, 160),
     source: String(source || "").slice(0, 40),
     action_count: safeCount,
     generated_at: timestamp,
   };
+  receipt.event_id = `evt:proposal:${receipt.request_id || "anonymous"}`;
   if (fallbackReason) receipt.fallback_reason = String(fallbackReason).slice(0, 40);
   return receipt;
 }

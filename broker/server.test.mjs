@@ -1002,6 +1002,7 @@ test("buildReceipt: secret-free model + bounded audit metadata", () => {
   assert.strictEqual(receipt.action_count, 3);
   assert.strictEqual(receipt.generated_at, "2026-09-20T00:00:00.000Z");
   assert.strictEqual(receipt.request_id, "excel-request-12345678");
+  assert.strictEqual(receipt.event_id, "evt:proposal:excel-request-12345678");
   assert.equal(Object.hasOwn(receipt, "token"), false);
   assert.equal(Object.hasOwn(receipt, "api_key"), false);
   assert.equal(Object.hasOwn(receipt, "authorization"), false);
