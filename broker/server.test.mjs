@@ -39,6 +39,7 @@ import {
   buildSystemPrompt,
   fallbackResponse,
   diagnosticFallback,
+  buildReceipt,
   normalizeOwnerIdentity,
   adapterOwnerContractMatches,
   isProfileSensitiveApiRequest,
@@ -963,6 +964,34 @@ test("buildAccountingDataSheet: pins the summary + transactions shape", () => {
   assert.ok(sheet.some((row) => row.length === 5 && row[0] === "Date" && row[4] === "Balance"));
 });
 
+test("buildReceipt: secret-free model + bounded audit metadata", () => {
+  const receipt = buildReceipt({
+    requestId: "excel-request-12345678",
+    model: "hermes-agent",
+    source: "hermes-platform",
+    actionCount: 3,
+    fallbackReason: "",
+    generatedAt: "2026-09-20T00:00:00.000Z",
+  });
+  assert.strictEqual(receipt.model_used, "hermes-agent");
+  assert.strictEqual(receipt.source, "hermes-platform");
+  assert.strictEqual(receipt.action_count, 3);
+  assert.strictEqual(receipt.generated_at, "2026-09-20T00:00:00.000Z");
+  assert.strictEqual(receipt.request_id, "excel-request-12345678");
+  assert.equal(Object.hasOwn(receipt, "token"), false);
+  assert.equal(Object.hasOwn(receipt, "api_key"), false);
+  assert.equal(Object.hasOwn(receipt, "authorization"), false);
+
+  // Bounded + fail-closed on garbage input.
+  const bounded = buildReceipt({ requestId: "x".repeat(500), model: "", source: "weird", actionCount: -2 });
+  assert.ok(bounded.request_id.length <= 128);
+  assert.ok(bounded.model_used.length <= 160);
+  assert.strictEqual(bounded.action_count, 0);
+  assert.ok(/^\d{4}-\d{2}-\d{2}T/.test(bounded.generated_at));
+  // No fallback_reason key when not provided (bounded audit, no noise).
+  assert.equal(Object.hasOwn(bounded, "fallback_reason"), false);
+});
+
 test("capMessagesSize: trims oldest history, never the system prompt, to fit budget", () => {
   const messages = [
     { role: "system", content: "S" },
@@ -978,9 +1007,12 @@ test("capMessagesSize: trims oldest history, never the system prompt, to fit bud
 test("callHermesModel: invalid JSON twice falls back; claims-success-without-actions is repaired", async () => {
   // Injected model that never returns JSON → two bad replies → honest fallback.
   const bad = async () => "totally not json";
-  const fb = await callHermesModel({ prompt: "do something", files: [] }, { post: bad });
+  const fb = await callHermesModel({ prompt: "do something", files: [], request_id: "req-receipt-1" }, { post: bad });
   assert.strictEqual(fb.source, "fallback");
   assert.deepStrictEqual(fb.actions, []);
+  // The fallback response still carries a secret-free receipt.
+  assert.ok(fb.receipt, "fallback response carries a receipt");
+  assert.equal(Object.hasOwn(fb.receipt, "token"), false);
 
   // First reply claims success with no actions; the corrective retry supplies them.
   let call = 0;
@@ -991,12 +1023,16 @@ test("callHermesModel: invalid JSON twice falls back; claims-success-without-act
       : '{"message":"Created.","actions":[{"type":"create_sheet","name":"X","values":[["A","B"],["1","2"]]}]}';
   };
   const fixed = await callHermesModel(
-    { prompt: "put this into a spreadsheet", files: [] },
+    { prompt: "put this into a spreadsheet", files: [], request_id: "req-receipt-2" },
     { post: claimsThenFixes },
   );
   assert.strictEqual(fixed.source, "llm");
   assert.strictEqual(fixed.actions.length, 1);
   assert.strictEqual(fixed.actions[0].type, "create_sheet");
+  // The llm result reports the model actually used + bounded audit metadata.
+  assert.strictEqual(fixed.receipt.action_count, 1);
+  assert.strictEqual(fixed.receipt.source, "llm");
+  assert.ok(fixed.receipt.model_used.length > 0);
 });
 
 test("uniqueExportName: safeExportName caps length and keeps the .csv suffix", () => {

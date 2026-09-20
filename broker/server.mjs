@@ -393,6 +393,20 @@ function buildCapabilities({ version = excelVersion, defaultModel = llmModel, mo
   };
 }
 
+function buildReceipt({ requestId = "", model = llmModel, source = "hermes-platform", actionCount = 0, fallbackReason = "", generatedAt = null } = {}) {
+  const safeCount = Number.isFinite(Number(actionCount)) ? Math.max(0, Math.floor(Number(actionCount))) : 0;
+  const timestamp = generatedAt && !Number.isNaN(Date.parse(generatedAt)) ? new Date(generatedAt).toISOString() : new Date().toISOString();
+  const receipt = {
+    request_id: String(requestId || "").slice(0, 128),
+    model_used: String(model || "").slice(0, 160),
+    source: String(source || "").slice(0, 40),
+    action_count: safeCount,
+    generated_at: timestamp,
+  };
+  if (fallbackReason) receipt.fallback_reason = String(fallbackReason).slice(0, 40);
+  return receipt;
+}
+
 async function healthStatus() {
   const status = {
     ok: true,
@@ -2220,6 +2234,7 @@ async function callHermesPlatform(body, { signal } = {}) {
     const actions = removeSatisfiedReadActions(normalizeActions(captured.proposal, body), body.tool_results);
     return { message: String(captured.message || captured.proposal.message || "Proposal ready for review."),
       actions, files, source: "hermes-platform",
+      receipt: buildReceipt({ requestId: body.request_id, model: llmModel, source: "hermes-platform", actionCount: actions.length }),
       ...(actions.some((action) => action.type === "read_range")
         ? { parsed_files: (body.files || []).map((file) => ({ ...file, base64: undefined, tables: undefined })) } : {}) };
   } catch (error) {
@@ -2408,6 +2423,7 @@ async function callHermesModel(body, { signal, post: injectedPost } = {}) {
       actions,
       files: fileSummary,
       source: rawFallbackReason ? "raw-fallback" : "llm",
+      receipt: buildReceipt({ requestId: body.request_id, model: llmModel, source: rawFallbackReason ? "raw-fallback" : "llm", actionCount: actions.length, fallbackReason: rawFallbackReason }),
       ...(rawFallbackReason ? { fallback_reason: rawFallbackReason } : {}),
     };
     if (actions.some((action) => action.type === "read_range")) {
@@ -2445,6 +2461,7 @@ function diagnosticFallback(body, fallbackReason = "adapter_unavailable") {
     })),
     source: "fallback",
     fallback_reason: fallbackReason,
+    receipt: buildReceipt({ requestId: body.request_id, model: llmModel, source: "fallback", actionCount: 0, fallbackReason }),
   };
 }
 
@@ -2529,6 +2546,7 @@ function fallbackResponse(body, reason = null) {
       extraction_error: file.extraction_error,
     })),
     source: "fallback",
+    receipt: buildReceipt({ requestId: body.request_id, model: llmModel, source: "fallback", actionCount: 0, fallbackReason: reason || "" }),
   };
 }
 
@@ -2898,6 +2916,7 @@ export {
   fetchJsonWithTimeout,
   healthStatus,
   buildCapabilities,
+  buildReceipt,
   extractLinkCandidates,
   normalizeExternalAccessRequest,
   readHermesApiServerKey,
