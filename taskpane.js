@@ -477,6 +477,9 @@ const els = {
   sessionBadge: document.getElementById("sessionBadge"),
   workbookLabel: document.getElementById("workbookLabel"),
   sheetLabel: document.getElementById("sheetLabel"),
+  contextDisclosure: document.getElementById("contextDisclosure"),
+  contextDisclosureSummary: document.getElementById("contextDisclosureSummary"),
+  contextDisclosureDetails: document.getElementById("contextDisclosureDetails"),
   scopeButton: document.getElementById("scopeButton"),
   scopeMenu: document.getElementById("scopeMenu"),
   overflowButton: document.getElementById("overflowButton"),
@@ -517,6 +520,24 @@ const els = {
 
 function setStatus(text) {
   els.status.textContent = text;
+}
+
+function updateContextDisclosure(context, files = []) {
+  if (!els.contextDisclosureSummary || !els.contextDisclosureDetails) return;
+  const sheetMetadata = (Array.isArray(context?.workbook?.sheets) ? context.workbook.sheets : [])
+    .slice(0, 8)
+    .map((sheet) => `${String(sheet?.name || "Unnamed").slice(0, 48)}${sheet?.usedRange ? `:${String(sheet.usedRange).slice(0, 48)}` : ""}`);
+  const sheets = sheetMetadata.length;
+  const sheetSummary = sheetMetadata.length ? `Sheets: ${sheetMetadata.join(", ")}${context?.workbook?.sheets?.length > sheetMetadata.length ? " …" : ""}` : "Sheets: none";
+  const selection = context?.selection || {};
+  const address = String(selection.address || "");
+  const dimensions = selection.rowCount && selection.columnCount ? ` (${selection.rowCount}×${selection.columnCount})` : "";
+  const sampled = Array.isArray(selection.values) ? selection.values.reduce((count, row) => count + (Array.isArray(row) ? row.length : 0), 0) : 0;
+  const scope = context?.scope || state.uiScope;
+  const fileCount = Array.isArray(files) ? files.length : 0;
+  els.contextDisclosureSummary.textContent = `Hermes will receive ${sheets} sheet metadata item(s) and ${scope} context.`;
+  const parts = [sheetSummary, address ? `Selection: ${address}${dimensions}` : "Selection: unavailable", sampled ? `${sampled} sampled cell(s)` : "no sampled cells", selection.truncated ? "selection truncated" : "selection complete", fileCount ? `${fileCount} attachment(s)` : "no attachments", "external access: approval required"];
+  els.contextDisclosureDetails.textContent = parts.join(" · ");
 }
 
 const renderedMessages = [];
@@ -825,12 +846,14 @@ async function readWorkbookContext() {
     if (els.workbookLabel) els.workbookLabel.textContent = `Workbook · ${state.workbookId.slice(-8)}`;
     if (els.sheetLabel) els.sheetLabel.textContent = `Sheet: ${active.name} · Selected: ${selected.address}`;
     setStatus("Ready");
-    return {
+    const disclosureContext = {
       workbook: state.workbook,
       selection: state.selection,
       scope: state.uiScope,
       selected_target: selected.address,
     };
+    updateContextDisclosure(disclosureContext, state.files);
+    return disclosureContext;
   });
 }
 
@@ -888,10 +911,15 @@ async function postChat(payload, options = {}) {
   throw new Error(`Could not reach the local Hermes bridge. Tried ${errors.join(" | ")}`);
 }
 
+function promptTargetsSelection(prompt) {
+  return /\b(this\s+(cell|range|selection)|selected\s+(cell|range)|here)\b|\b(bu\s+(hücre|hucre|aralık|aralik)|seçili\s+(hücre|hucre|aralık|aralik)|buraya)\b/i.test(String(prompt || ""));
+}
+
 async function askHermes(prompt, filesToSend, initialToolResults = []) {
   validateAttachmentSizes(filesToSend);
   state.controller = new AbortController();
   const context = await readWorkbookContext();
+  updateContextDisclosure(context, filesToSend);
   const files = [];
   for (const file of filesToSend) files.push(await fileToPayload(file));
 
@@ -930,6 +958,7 @@ async function askHermes(prompt, filesToSend, initialToolResults = []) {
           loop_count: loopCount,
           scope: state.uiScope,
           selected_target: context.selected_target,
+          selection_is_write_target: promptTargetsSelection(prompt),
         },
         { signal: state.controller.signal },
       );
@@ -1027,37 +1056,42 @@ function cancelWork() {
   setStatus("Canceling...");
 }
 
+function proposalRisk(action) {
+  const type = String(action?.type || "");
+  if (type === "write_cells") return { level: "low", undo: "guarded" };
+  return { level: ["delete_sheet", "delete_rows", "delete_columns", "clear_range", "sort_range", "merge_cells"].includes(type) ? "high" : "medium", undo: "not fully reversible" };
+}
+
 function describeActions(actions) {
-  return (actions || [])
-    .map((action) => {
-      if (!action) return null;
-      if (action.type === "write_cells") {
-        const rows = (action.values || []).length;
-        const cols = (action.values || [])[0]?.length || 0;
-        return `Write ${rows}×${cols} to ${action.start_cell}`;
-      }
-      if (action.type === "create_sheet") return `Create sheet "${action.name}" (${(action.values || []).length} rows)`;
-      if (action.type === "format_cells") return `Format ${action.range}`;
-      if (action.type === "conditional_format") return `Highlight ${action.range} where value ${action.operator} ${action.value}`;
-      if (action.type === "merge_cells") return `Merge ${action.range}`;
-      if (action.type === "unmerge_cells") return `Unmerge ${action.range}`;
-      if (action.type === "insert_rows") return `Insert rows at ${action.range}`;
-      if (action.type === "insert_columns") return `Insert columns at ${action.range}`;
-      if (action.type === "delete_rows") return `Delete rows ${action.range}`;
-      if (action.type === "delete_columns") return `Delete columns ${action.range}`;
-      if (action.type === "set_column_width") return `Set column width on ${action.range}`;
-      if (action.type === "set_row_height") return `Set row height on ${action.range}`;
-      if (action.type === "freeze_panes") return `Freeze ${action.rows || 0} row(s) / ${action.columns || 0} column(s)`;
-      if (action.type === "unfreeze_panes") return "Unfreeze panes";
-      if (action.type === "autofit") return `Autofit ${action.range}`;
-      if (action.type === "rename_sheet") return `Rename sheet to "${action.to}"`;
-      if (action.type === "delete_sheet") return `Delete sheet "${action.name}"`;
-      if (action.type === "sort_range") return `Sort ${action.range}`;
-      if (action.type === "clear_range") return `Clear ${action.target} of ${action.range}`;
-      return null;
-    })
-    .filter(Boolean)
-    .join("\n");
+  return (actions || []).map((action) => {
+    if (!action) return null;
+    let label = "";
+    if (action.type === "write_cells") {
+      const rows = (action.values || []).length;
+      const cols = (action.values || [])[0]?.length || 0;
+      label = `Write ${rows}×${cols} to ${action.start_cell}`;
+    } else if (action.type === "create_sheet") label = `Create sheet "${action.name}" (${(action.values || []).length} rows)`;
+    else if (action.type === "format_cells") label = `Format ${action.range}`;
+    else if (action.type === "conditional_format") label = `Highlight ${action.range} where value ${action.operator} ${action.value}`;
+    else if (action.type === "merge_cells") label = `Merge ${action.range}`;
+    else if (action.type === "unmerge_cells") label = `Unmerge ${action.range}`;
+    else if (action.type === "insert_rows") label = `Insert rows at ${action.range}`;
+    else if (action.type === "insert_columns") label = `Insert columns at ${action.range}`;
+    else if (action.type === "delete_rows") label = `Delete rows ${action.range}`;
+    else if (action.type === "delete_columns") label = `Delete columns ${action.range}`;
+    else if (action.type === "set_column_width") label = `Set column width on ${action.range}`;
+    else if (action.type === "set_row_height") label = `Set row height on ${action.range}`;
+    else if (action.type === "freeze_panes") label = `Freeze ${action.rows || 0} row(s) / ${action.columns || 0} column(s)`;
+    else if (action.type === "unfreeze_panes") label = "Unfreeze panes";
+    else if (action.type === "autofit") label = `Autofit ${action.range}`;
+    else if (action.type === "rename_sheet") label = `Rename sheet to "${action.to}"`;
+    else if (action.type === "delete_sheet") label = `Delete sheet "${action.name}"`;
+    else if (action.type === "sort_range") label = `Sort ${action.range}`;
+    else if (action.type === "clear_range") label = `Clear ${action.target} of ${action.range}`;
+    if (!label) return null;
+    const risk = proposalRisk(action);
+    return `${label} · Risk: ${risk.level} · Undo: ${risk.undo}`;
+  }).filter(Boolean).join("\n");
 }
 
 function normalizeMatrix(values) {

@@ -341,6 +341,13 @@ test("normalizeMatrix: pads ragged rows, coerces objects, passes scalars, caps s
   assert.strictEqual(capped[0].length, 30);
 });
 
+test("normalizeActions derives selection targeting from the prompt, not caller flags", () => {
+  assert.deepStrictEqual(normalizeActions({ actions: [{ type: "write_cells", values: [[1]] }] }, { prompt: "Create a report", selection: { address: "Sheet1!D9" }, selection_is_write_target: true }), []);
+  const selectionWrite = normalizeActions({ actions: [{ type: "write_cells", values: [[1]] }] }, { prompt: "Write this into the selected cell", selection: { address: "Sheet1!D9" } });
+  assert.equal(selectionWrite.length, 1);
+  assert.equal(selectionWrite[0].start_cell, "Sheet1!D9");
+});
+
 test("normalizeAction: all action types plus unknown", () => {
   assert.strictEqual(normalizeAction({ type: "write_cells" }), null);
   const wc = normalizeAction({ type: "write_cells", values: [[1]] });
@@ -456,8 +463,8 @@ test("normalizeAction: structured structural ops (replacing execute_office_js)",
   assert.strictEqual(normalizeAction({ type: "delete_sheet", name: "Old" }).name, "Old");
 });
 
-test("normalizeActions: prefers actions array, falls back to legacy write", () => {
-  const fromActions = normalizeActions({ actions: [{ type: "write_cells", values: [[1]] }] }, {});
+test("normalizeActions: preserves explicit actions and gates legacy selection writes", () => {
+  const fromActions = normalizeActions({ actions: [{ type: "write_cells", start_cell: "Sheet1!A1", values: [[1]] }] }, {});
   assert.strictEqual(fromActions.length, 1);
   assert.strictEqual(fromActions[0].type, "write_cells");
 
@@ -467,7 +474,7 @@ test("normalizeActions: prefers actions array, falls back to legacy write", () =
 
   const selection = normalizeActions(
     { write: { mode: "selection", values: [[1]] } },
-    { selection: { address: "B2" } },
+    { prompt: "Write this in the selected cell", selection: { address: "B2" }, selection_is_write_target: true },
   );
   assert.strictEqual(selection.length, 1);
   assert.strictEqual(selection[0].type, "write_cells");
@@ -823,7 +830,7 @@ test("translateMatrixFormulas: shifts formula cells, leaves literals", () => {
   assert.strictEqual(atH23[1][1], 4);
 });
 
-test("normalizeActions: resolves anchor from selection and rebases formulas (the H23 regression)", () => {
+test("normalizeActions: uses explicitly targeted selection and rebases formulas (the H23 regression)", () => {
   const parsed = {
     actions: [
       {
@@ -835,8 +842,8 @@ test("normalizeActions: resolves anchor from selection and rebases formulas (the
       },
     ],
   };
-  // Model omitted start_cell; selection is H23 -> must resolve and rebase.
-  const resolved = normalizeActions(parsed, { selection: { address: "Sheet1!H23" } });
+  // User explicitly targeted the selected range; selection is H23 -> resolve and rebase.
+  const resolved = normalizeActions(parsed, { prompt: "Put this in the selected range", selection: { address: "Sheet1!H23" }, selection_is_write_target: true });
   assert.strictEqual(resolved[0].start_cell, "Sheet1!H23");
   assert.strictEqual(resolved[0].values[1][1], "=H24*I24");
 

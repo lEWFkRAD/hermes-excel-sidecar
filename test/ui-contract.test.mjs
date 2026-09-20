@@ -13,6 +13,13 @@ test('task pane exposes the compact workbook scope and overflow UI contract', ()
   assert.match(html, /Review edits/);
 });
 
+test('task pane exposes a bounded context disclosure before a prompt is sent', () => {
+  for (const id of ['contextDisclosure', 'contextDisclosureSummary', 'contextDisclosureDetails']) {
+    assert.match(html, new RegExp(`id=["']${id}["']`));
+  }
+  assert.match(css, /\.context-disclosure/);
+});
+
 test('task pane keeps narrow panes responsive and avoids header button overflow', () => {
   assert.match(css, /@media\s*\(max-width:\s*360px\)/);
   assert.match(css, /\.topbar-actions[^{]*\{[\s\S]*?flex-direction:\s*column/);

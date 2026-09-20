@@ -46,6 +46,13 @@ function pane({ rows = 1, columns = 1 } = {}) {
 }
 const action = { type: 'write_cells', start_cell: 'Sheet1!A1', values: [[20]], auto_format: true };
 
+test('proposal descriptions disclose destructive risk and undo coverage', () => {
+  const p = pane();
+  const preview = p.sandbox.describeActions([{ type: 'clear_range', range: 'Sheet1!A1:B2', target: 'all' }]);
+  assert.match(preview, /Risk: high/);
+  assert.match(preview, /Undo: not fully reversible/);
+});
+
 test('oversized attachments are rejected before reading a workbook or encoding files', async () => {
   const p = pane();
   await assert.rejects(p.sandbox.askHermes('test', [{ size: 101 * 1024 * 1024 }]), /100 MB per-file/);

@@ -1483,7 +1483,7 @@ function normalizeAction(action) {
     if (!values) return null;
     return {
       type,
-      // Empty when omitted; normalizeActions resolves it to the selection or A1.
+      // Empty when omitted; normalizeActions accepts it only for an explicitly targeted selection.
       start_cell: String(action.start_cell || action.startCell || ""),
       values,
       allow_overwrite: action.allow_overwrite !== false,
@@ -1670,6 +1670,10 @@ function normalizeAction(action) {
   return null;
 }
 
+function promptTargetsSelection(prompt) {
+  return /\b(this\s+(cell|range|selection)|selected\s+(cell|range)|here)\b|\b(bu\s+(hücre|hucre|aralık|aralik)|seçili\s+(hücre|hucre|aralık|aralik)|buraya)\b/i.test(String(prompt || ""));
+}
+
 function legacyWriteToActions(write, body) {
   if (!write || typeof write !== "object") return [];
   const mode = String(write.mode || "none");
@@ -1678,8 +1682,8 @@ function legacyWriteToActions(write, body) {
   if (mode === "new_sheet") {
     return [{ type: "create_sheet", name: write.name || "Hermes Output", values }];
   }
-  if (mode === "selection") {
-    return [{ type: "write_cells", start_cell: body.selection?.address || "A1", values, allow_overwrite: true }];
+  if (mode === "selection" && promptTargetsSelection(body?.prompt) && body.selection?.address) {
+    return [{ type: "write_cells", start_cell: body.selection.address, values, allow_overwrite: true }];
   }
   return [];
 }
@@ -1688,16 +1692,19 @@ function normalizeActions(parsed, body) {
   const actions = Array.isArray(parsed?.actions)
     ? parsed.actions.map(normalizeAction).filter(Boolean)
     : legacyWriteToActions(parsed?.write, body);
-  // Resolve the write anchor (selection when the model omitted start_cell) and
-  // rebase A1-authored formulas to it. create_sheet always lands at A1.
+  const normalized = [];
   for (const action of actions) {
     if (action.type === "write_cells") {
-      action.start_cell = action.start_cell || body?.selection?.address || "A1";
+      if (!action.start_cell && promptTargetsSelection(body?.prompt) && body?.selection?.address) {
+        action.start_cell = body.selection.address;
+      }
+      if (!action.start_cell) continue;
       const { rowOffset, colOffset } = anchorFromAddress(action.start_cell);
       action.values = translateMatrixFormulas(action.values, rowOffset, colOffset);
     }
+    normalized.push(action);
   }
-  return actions;
+  return normalized;
 }
 
 function removeSatisfiedReadActions(actions, toolResults) {
@@ -2072,7 +2079,7 @@ function buildSystemPrompt(loopBudgetExhausted) {
     "Never invent, estimate, or placeholder financial numbers. If data is missing and cannot be read, state exactly what is missing.",
     "Never claim you created, populated, or wrote anything unless THIS reply includes the actions that do it. A success message with an empty actions array is a failure: the add-in writes nothing without actions.",
     "Formulas you put inside a values matrix must be written as if the table's top-left cell is A1 (header in row 1, first data row in row 2): e.g. a Total in the first data row is =B2*C2 and a column total is =SUM(D2:D4). The add-in automatically relocates these to wherever the table is placed. Do not try to guess the absolute anchor yourself.",
-    "Choose create_sheet for a brand-new report/schedule/export that should stand alone. Choose write_cells to add to or edit the sheet the user is on; omit start_cell to write at the user's current selection, or set start_cell explicitly (e.g. Sheet1!A1).",
+    "Choose create_sheet for a brand-new report/schedule/export that should stand alone. Choose write_cells to add to or edit a sheet. Always set start_cell explicitly (e.g. Sheet1!A1), except when the user explicitly says this cell/selected range/buraya; only then may you omit it to target the selection.",
     "Use actions whenever the user asks you to create, edit, format, populate, reconcile, match, or write spreadsheet output.",
     "Use create_sheet for new reports, schedules, balance sheets, exports, and generated tables.",
     "Use write_cells for edits to the current sheet or a requested range. start_cell may include a sheet name like Sheet1!A1.",
