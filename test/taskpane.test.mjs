@@ -79,6 +79,16 @@ test('review mode binds typed table and chart operations instead of rejecting th
   assert.equal(proposal.result.actions[1].type, 'create_chart');
 });
 
+test('review preconditions capture a deterministic preimage fingerprint', async () => {
+  const p = pane();
+  assert.notEqual(p.sandbox.preimageFingerprint({ address: 'Sheet1!A1', formulas: [[10]], numberFormat: [['0.00']] }),
+    p.sandbox.preimageFingerprint({ address: 'Sheet1!A1', formulas: [[11]], numberFormat: [['0.00']] }));
+  const proposal = await p.sandbox.bindProposalToWorkbook({ actions: [action] });
+  assert.match(proposal.preconditions[0].preimage_hash, /^fnv1a64:[0-9a-f]{16}$/);
+  await p.sandbox.applyReviewedProposal(proposal);
+  assert.equal(p.state.undoStack.at(-1).writes[0].preimage_hash, proposal.preconditions[0].preimage_hash);
+});
+
 test('review preview shows bounded old-to-new cell diffs for the whole proposal', async () => {
   const p = pane();
   const proposal = await p.sandbox.bindProposalToWorkbook({ actions: [

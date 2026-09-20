@@ -52,6 +52,20 @@ function stableMatrix(value) {
   return JSON.stringify(value || []);
 }
 
+// Integrity evidence for a captured preimage. Validation still compares complete
+// formulas/number formats; this fingerprint makes transaction/audit records concise.
+function preimageFingerprint({ address = "", worksheetId = "", formulas = [], numberFormat = [] } = {}) {
+  const input = JSON.stringify({ address, worksheetId, formulas, numberFormat });
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= BigInt(input.charCodeAt(index));
+    hash = (hash * prime) & mask;
+  }
+  return `fnv1a64:${hash.toString(16).padStart(16, "0")}`;
+}
+
 function compactMatrix(matrix, maxCells = 400, maxCellChars = 256) {
   const rows = [];
   let cells = 0;
@@ -170,6 +184,7 @@ async function bindProposalToWorkbook(result) {
         worksheetName: target.worksheet.name,
         formulas: target.formulas,
         numberFormat: target.numberFormat,
+        preimage_hash: preimageFingerprint({ address: target.address, worksheetId: target.worksheet.id, formulas: target.formulas, numberFormat: target.numberFormat }),
       });
     }
     return {
@@ -268,6 +283,7 @@ async function applyReviewedProposal(proposal) {
         if (seenWriteAddresses.has(match.range.address)) throw new Error(`Overlapping duplicate reviewed write: ${match.range.address}.`);
         seenWriteAddresses.add(match.range.address);
         undoWrites.push({ address: match.range.address, worksheetId: match.range.worksheet.id, range: match.range,
+          preimage_hash: match.precondition.preimage_hash,
           before: { formulas: match.range.formulas, numberFormat: match.range.numberFormat } });
         match.range.values = values;
         match.range.numberFormat = match.precondition.numberFormat;
@@ -314,7 +330,7 @@ async function applyReviewedProposal(proposal) {
     if (undoWrites.length) {
       await context.sync();
       state.undoStack.push({ kind: "reviewed_change_set", writes: undoWrites.map((write) => ({
-        address: write.address, worksheetId: write.worksheetId, before: write.before,
+        address: write.address, worksheetId: write.worksheetId, preimage_hash: write.preimage_hash, before: write.before,
         formatted: false,
         after: { formulas: write.range.formulas, numberFormat: write.range.numberFormat },
       })) });
