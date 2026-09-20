@@ -1104,6 +1104,26 @@ function describeActions(actions) {
   }).filter(Boolean).join("\n");
 }
 
+function describeProposal(proposal) {
+  const actions = proposal?.result?.actions || [];
+  const lines = [describeActions(actions)];
+  const diffs = [];
+  for (const precondition of proposal?.preconditions || []) {
+    if (precondition.type !== "write_cells") continue;
+    const action = actions.find((candidate) => candidate?.type === "write_cells" && candidate.start_cell === precondition.address);
+    if (!action) continue;
+    const before = precondition.formulas?.[0]?.[0];
+    const after = action.values?.[0]?.[0];
+    if (before !== undefined || after !== undefined) {
+      diffs.push(`${precondition.address}: ${String(before ?? "").slice(0, 80)} → ${String(after ?? "").slice(0, 80)}`);
+    }
+    const count = Math.max(0, (action.values?.length || 0) * (action.values?.[0]?.length || 0) - 1);
+    if (count) diffs.push(`${precondition.address}: ${count} additional cell(s) in this bounded write.`);
+  }
+  if (diffs.length) lines.push(`Old → new:\n${diffs.join("\n")}`);
+  return lines.filter(Boolean).join("\n");
+}
+
 function normalizeMatrix(values) {
   if (!Array.isArray(values)) return [];
   const rows = values
@@ -2172,9 +2192,9 @@ function wireActions() {
       const applyable = actions.filter((action) => action && action.type !== "read_range");
 
       if (state.reviewMode && applyable.length) {
-        // Hold the changes; let the user approve them first.
-        addMessage("hermes", `Review these changes:\n${describeActions(applyable)}`);
+        // Bind preconditions before showing the exact old→new review summary.
         const proposal = await bindProposalToWorkbook(result);
+        addMessage("hermes", `Review these changes:\n${describeProposal(proposal)}`);
         renderReviewButtons(proposal, filesToSend, fileLines);
         stopWorkIndicator("Waiting for review");
         return;

@@ -79,6 +79,18 @@ test('review mode binds typed table and chart operations instead of rejecting th
   assert.equal(proposal.result.actions[1].type, 'create_chart');
 });
 
+test('review preview shows bounded old-to-new cell diffs for the whole proposal', async () => {
+  const p = pane();
+  const proposal = await p.sandbox.bindProposalToWorkbook({ actions: [
+    { type: 'write_cells', start_cell: 'Sheet1!A1', values: [[20]] },
+    { type: 'create_table', range: 'Sheet1!A1:D20', has_headers: true, name: 'Orders' },
+  ] });
+  const preview = p.sandbox.describeProposal(proposal);
+  assert.match(preview, /Write 1×1 to Sheet1!A1/);
+  assert.match(preview, /Sheet1!A1: 10 → 20/);
+  assert.match(preview, /Create table "Orders"/);
+});
+
 test('structural table, chart, and filter actions reject unbounded or oversized ranges', async () => {
   const p = pane({ rows: 100001, columns: 1 });
   await assert.rejects(
