@@ -76,6 +76,13 @@ ACTION_SCHEMAS.extend([
         "ascending": {"type": "boolean"}, "has_header": {"type": "boolean"}}, ["range", "column"]),
     _action("clear_range", {"range": RANGE, "target": {"type": "string", "enum": ["contents", "formats", "all"]}}, ["range"]),
 ])
+ACTION_SCHEMAS.extend([
+    _action("create_table", {"range": RANGE, "has_headers": {"type": "boolean"}, "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,159}$", "maxLength": 160}}, ["range", "has_headers"]),
+    _action("delete_table", {"name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,159}$", "maxLength": 160}}, ["name"]),
+    _action("create_chart", {"range": RANGE, "chart_type": {"type": "string", "enum": ["ColumnClustered", "BarClustered", "Line", "Pie", "Area"]}, "title": {"type": "string", "maxLength": 255}, "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,159}$", "maxLength": 160}}, ["range", "chart_type"]),
+    _action("auto_filter", {"range": RANGE}, ["range"]),
+    _action("remove_filter", {"sheet": RANGE}, []),
+])
 ACTION_TYPES = {schema["properties"]["type"]["const"] for schema in ACTION_SCHEMAS}
 
 

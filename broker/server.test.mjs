@@ -393,6 +393,23 @@ test("normalizeAction: all action types plus unknown", () => {
   assert.strictEqual(normalizeAction({ type: "unknown" }), null);
 });
 
+test("normalizeAction: table and filter operations remain typed", () => {
+  assert.deepStrictEqual(normalizeAction({ type: "create_table", range: "Sales!A1:D20", has_headers: true, name: "Sales_2026" }), {
+    type: "create_table", range: "Sales!A1:D20", has_headers: true, name: "Sales_2026",
+  });
+  assert.strictEqual(normalizeAction({ type: "create_table", range: "Sales!A1:D20", has_headers: true, name: "Sales 2026" }), null);
+  assert.strictEqual(normalizeAction({ type: "create_table", range: "" }), null);
+  assert.deepStrictEqual(normalizeAction({ type: "delete_table", name: "Orders" }), { type: "delete_table", name: "Orders" });
+  assert.strictEqual(normalizeAction({ type: "delete_table" }), null);
+  assert.deepStrictEqual(normalizeAction({ type: "create_chart", range: "Sales!A1:D20", chart_type: "Line", title: "Monthly Sales" }), {
+    type: "create_chart", range: "Sales!A1:D20", chart_type: "Line", title: "Monthly Sales",
+  });
+  assert.strictEqual(normalizeAction({ type: "create_chart", range: "A1:B2", chart_type: "Scatter" }), null);
+  assert.deepStrictEqual(normalizeAction({ type: "auto_filter", range: "A1:D20" }), { type: "auto_filter", range: "A1:D20" });
+  assert.strictEqual(normalizeAction({ type: "auto_filter" }), null);
+  assert.deepStrictEqual(normalizeAction({ type: "remove_filter", sheet: "Sales" }), { type: "remove_filter", sheet: "Sales" });
+});
+
 test("normalizeAction: conditional_format normalizes operator synonyms, defaults colors, requires range", () => {
   assert.strictEqual(normalizeAction({ type: "conditional_format" }), null);
 

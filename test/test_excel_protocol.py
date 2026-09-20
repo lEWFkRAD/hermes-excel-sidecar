@@ -305,6 +305,25 @@ class ToolValidationTests(unittest.TestCase):
         tool.validate_schema({"type": "insert_columns", "at": "E", "count": 2},
                              next(s for s in tool.ACTION_SCHEMAS if s["properties"]["type"]["const"] == "insert_columns"))
 
+    def test_table_and_filter_actions_are_typed_and_bounded(self):
+        table_schema = next(s for s in tool.ACTION_SCHEMAS if s["properties"]["type"]["const"] == "create_table")
+        tool.validate_schema({"type": "create_table", "range": "A1:D10", "has_headers": True, "name": "Orders_2026"},
+                             table_schema)
+        with self.assertRaises(ValueError):
+            tool.validate_schema({"type": "create_table", "range": "", "has_headers": True}, table_schema)
+        with self.assertRaises(ValueError):
+            tool.validate_schema({"type": "create_table", "range": "A1:D10", "has_headers": True, "name": "Orders 2026"}, table_schema)
+        with self.assertRaises(ValueError):
+            tool.validate_schema({"type": "create_table", "range": "A1:D10", "has_headers": True, "name": "x" * 260}, table_schema)
+
+        filter_schema = next(s for s in tool.ACTION_SCHEMAS if s["properties"]["type"]["const"] == "auto_filter")
+        tool.validate_schema({"type": "auto_filter", "range": "A1:D10"}, filter_schema)
+        with self.assertRaises(ValueError):
+            tool.validate_schema({"type": "auto_filter", "range": ""}, filter_schema)
+
+        self.assertIn("remove_filter", tool.ACTION_TYPES)
+        self.assertIn("delete_table", tool.ACTION_TYPES)
+
 
 class FakeRequest:
     def __init__(self, body, token="secret-token", query=None):

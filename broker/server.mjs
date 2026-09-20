@@ -1489,6 +1489,11 @@ async function pruneUploads(maxAgeMs = Number(process.env.HERMES_EXCEL_UPLOADS_T
   }
 }
 
+function normalizeExcelObjectName(value) {
+  const name = String(value || "").trim();
+  return /^[A-Za-z_][A-Za-z0-9_]{0,159}$/.test(name) ? name : "";
+}
+
 function normalizeAction(action) {
   if (!action || typeof action !== "object") return null;
   const type = String(action.type || "");
@@ -1512,6 +1517,35 @@ function normalizeAction(action) {
       name: action.name ? String(action.name).slice(0, 31) : "Hermes Output",
       values,
     };
+  }
+  if (type === "create_table") {
+    const range = String(action.range || "").trim();
+    if (!range) return null;
+    const rawName = action.name === undefined || action.name === null ? "" : String(action.name).trim();
+    const name = rawName ? normalizeExcelObjectName(rawName) : "";
+    if (rawName && !name) return null;
+    return { type, range: range.slice(0, 80), has_headers: action.has_headers === true, ...(name ? { name } : {}) };
+  }
+  if (type === "delete_table") {
+    const name = normalizeExcelObjectName(action.name);
+    return name ? { type, name } : null;
+  }
+  if (type === "create_chart") {
+    const range = String(action.range || "").trim();
+    const chartType = ["ColumnClustered", "BarClustered", "Line", "Pie", "Area"].includes(String(action.chart_type || "")) ? String(action.chart_type) : "";
+    if (!range || !chartType) return null;
+    const title = String(action.title || "").trim();
+    const rawName = action.name === undefined || action.name === null ? "" : String(action.name).trim();
+    const name = rawName ? normalizeExcelObjectName(rawName) : "";
+    if (rawName && !name) return null;
+    return { type, range: range.slice(0, 80), chart_type: chartType, ...(title ? { title: title.slice(0, 255) } : {}), ...(name ? { name } : {}) };
+  }
+  if (type === "auto_filter") {
+    const range = String(action.range || "").trim();
+    return range ? { type, range: range.slice(0, 80) } : null;
+  }
+  if (type === "remove_filter") {
+    return { type, sheet: action.sheet ? String(action.sheet).slice(0, 31) : "" };
   }
   if (type === "format_cells") {
     return {

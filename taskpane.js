@@ -108,6 +108,11 @@ const REVIEW_PASSTHROUGH_ACTIONS = new Set([
   "autofit",
   "unmerge_cells",
   "rename_sheet",
+  "create_table",
+  "delete_table",
+  "create_chart",
+  "auto_filter",
+  "remove_filter",
 ]);
 
 async function bindProposalToWorkbook(result) {
@@ -1071,6 +1076,11 @@ function describeActions(actions) {
       const cols = (action.values || [])[0]?.length || 0;
       label = `Write ${rows}×${cols} to ${action.start_cell}`;
     } else if (action.type === "create_sheet") label = `Create sheet "${action.name}" (${(action.values || []).length} rows)`;
+    else if (action.type === "create_table") label = `Create table "${action.name || "(Excel-generated name)"}" from ${action.range}`;
+    else if (action.type === "delete_table") label = `Delete table "${action.name}"`;
+    else if (action.type === "create_chart") label = `Create ${action.chart_type} chart from ${action.range}${action.title ? ` titled "${action.title}"` : ""}`;
+    else if (action.type === "auto_filter") label = `Enable filter on ${action.range}`;
+    else if (action.type === "remove_filter") label = `Remove filters${action.sheet ? ` from ${action.sheet}` : ""}`;
     else if (action.type === "format_cells") label = `Format ${action.range}`;
     else if (action.type === "conditional_format") label = `Highlight ${action.range} where value ${action.operator} ${action.value}`;
     else if (action.type === "merge_cells") label = `Merge ${action.range}`;
@@ -1132,9 +1142,20 @@ function rangeFromRef(context, ref) {
 
 // Whole-column (A:A) / whole-row (1:1) ranges would format ~1M cells — reject so a
 // stray model range can't freeze Excel or apply a conditional format to the grid.
+const MAX_STRUCTURAL_MUTATION_CELLS = 100_000;
 function isUnboundedRange(ref) {
   const { address } = parseStartCell(ref);
   return /^[A-Za-z]{1,3}:[A-Za-z]{1,3}$/.test(address) || /^\d+:\d+$/.test(address);
+}
+
+async function requireBoundedMutationRange(context, range, ref) {
+  if (isUnboundedRange(ref)) throw new Error(`"${ref}" is unbounded; use a specific bounded range.`);
+  range.load(["rowCount", "columnCount"]);
+  await context.sync();
+  if (range.rowCount * range.columnCount > MAX_STRUCTURAL_MUTATION_CELLS) {
+    throw new Error(`"${ref}" exceeds the ${MAX_STRUCTURAL_MUTATION_CELLS.toLocaleString()}-cell safety limit.`);
+  }
+  return range;
 }
 
 function safeSheetName(name, fallback = "Hermes Output") {
@@ -1624,6 +1645,51 @@ async function clearRangeAction(action) {
   });
 }
 
+async function createTableAction(action) {
+  return Excel.run(async (context) => {
+    const range = await requireBoundedMutationRange(context, rangeFromRef(context, action.range), action.range);
+    range.worksheet.tables.add(range.address, action.has_headers === true, action.name || undefined);
+    await context.sync();
+    return `Created table${action.name ? ` "${action.name}"` : ""} from ${action.range}.`;
+  });
+}
+
+async function deleteTableAction(action) {
+  return Excel.run(async (context) => {
+    context.workbook.tables.getItem(action.name).delete();
+    await context.sync();
+    return `Deleted table "${action.name}".`;
+  });
+}
+
+async function createChartAction(action) {
+  return Excel.run(async (context) => {
+    const range = await requireBoundedMutationRange(context, rangeFromRef(context, action.range), action.range);
+    const chart = range.worksheet.charts.add(action.chart_type, range.address, Excel.ChartSeriesBy.columns);
+    if (action.name) chart.name = action.name;
+    if (action.title) { chart.title.text = action.title; chart.title.visible = true; }
+    await context.sync();
+    return `Created ${action.chart_type} chart from ${action.range}.`;
+  });
+}
+
+async function autoFilterAction(action) {
+  return Excel.run(async (context) => {
+    const range = await requireBoundedMutationRange(context, rangeFromRef(context, action.range), action.range);
+    range.worksheet.autoFilter.apply(range);
+    await context.sync();
+    return `Enabled filter on ${action.range}.`;
+  });
+}
+
+async function removeFilterAction(action) {
+  return Excel.run(async (context) => {
+    worksheetFor(context, action.sheet).autoFilter.clearCriteria();
+    await context.sync();
+    return `Removed filters${action.sheet ? ` from ${action.sheet}` : ""}.`;
+  });
+}
+
 // Dispatch table: action type → handler. Every entry is a fixed Office.js call.
 const STRUCTURAL_ACTIONS = {
   merge_cells: (action) => mergeCellsAction(action),
@@ -1641,6 +1707,11 @@ const STRUCTURAL_ACTIONS = {
   delete_sheet: (action) => deleteSheetAction(action),
   sort_range: (action) => sortRangeAction(action),
   clear_range: (action) => clearRangeAction(action),
+  create_table: (action) => createTableAction(action),
+  delete_table: (action) => deleteTableAction(action),
+  create_chart: (action) => createChartAction(action),
+  auto_filter: (action) => autoFilterAction(action),
+  remove_filter: (action) => removeFilterAction(action),
 };
 
 function actionsFromLegacyWrite(write) {

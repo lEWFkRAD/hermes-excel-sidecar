@@ -53,6 +53,44 @@ test('proposal descriptions disclose destructive risk and undo coverage', () => 
   assert.match(preview, /Undo: not fully reversible/);
 });
 
+test('table and filter proposals remain visible as typed Office.js operations', () => {
+  const p = pane();
+  const preview = p.sandbox.describeActions([
+    { type: 'create_table', range: 'Sheet1!A1:D20', has_headers: true, name: 'Orders' },
+    { type: 'create_chart', range: 'Sheet1!A1:D20', chart_type: 'Line', title: 'Monthly Sales' },
+    { type: 'auto_filter', range: 'Sheet1!A1:D20' },
+    { type: 'delete_table', name: 'Orders' },
+  ]);
+  assert.match(preview, /Create table "Orders" from Sheet1!A1:D20/);
+  assert.match(preview, /Create Line chart from Sheet1!A1:D20/);
+  assert.match(preview, /Enable filter on Sheet1!A1:D20/);
+  assert.match(preview, /Delete table "Orders"/);
+});
+
+test('review mode binds typed table and chart operations instead of rejecting them', async () => {
+  const p = pane();
+  const proposal = await p.sandbox.bindProposalToWorkbook({ actions: [
+    { type: 'create_table', range: 'Sheet1!A1:D20', has_headers: true, name: 'Orders' },
+    { type: 'create_chart', range: 'Sheet1!A1:D20', chart_type: 'Line' },
+    { type: 'auto_filter', range: 'Sheet1!A1:D20' },
+  ] });
+  assert.equal(proposal.result.actions.length, 3);
+  assert.equal(proposal.result.actions[0].type, 'create_table');
+  assert.equal(proposal.result.actions[1].type, 'create_chart');
+});
+
+test('structural table, chart, and filter actions reject unbounded or oversized ranges', async () => {
+  const p = pane({ rows: 100001, columns: 1 });
+  await assert.rejects(
+    p.sandbox.requireBoundedMutationRange({ sync: async () => {} }, p.range, 'Sheet1!A1:A100001'),
+    /exceeds the 100,000-cell safety limit/,
+  );
+  await assert.rejects(
+    p.sandbox.requireBoundedMutationRange({ sync: async () => {} }, p.range, 'Sheet1!A:A'),
+    /unbounded/,
+  );
+});
+
 test('oversized attachments are rejected before reading a workbook or encoding files', async () => {
   const p = pane();
   await assert.rejects(p.sandbox.askHermes('test', [{ size: 101 * 1024 * 1024 }]), /100 MB per-file/);
