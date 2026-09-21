@@ -35,7 +35,7 @@ schema, the read loop, and the formula-anchoring contract.
 - **Model-first chat** with per-workbook conversation memory (last 12 turns,
   persists across pane reopens) and a Clear button.
 - **Workbook actions**: write cells, create formatted sheets, apply styles,
-  run scoped Office.js — all via a structured JSON contract, applied by the
+  perform typed structural operations — all via a structured JSON contract, applied by the
   pane, never by agent tools.
 - **Cross-sheet reads**: Hermes sees every sheet's used range and can request
   cell values (`read_range`, up to 5 rounds) for tie-outs and reconciliations.
@@ -62,7 +62,11 @@ and workbook context; export requests retain their smaller limit. Large PDFs
 still require a working attachment parser, and extraction/context limits remain
 in effect. Upload acceptance does not mean every page is included in model context.
 
-- Excel (desktop) on Windows or macOS with add-in sideloading allowed.
+- Excel with ExcelApi 1.1+ and a modern webview, with add-in sideloading allowed.
+  Optional operations are gated at 1.2, 1.6 and 1.7 before any changes apply.
+  See [Excel compatibility](EXCEL-COMPATIBILITY.md) for Windows 2016/2019/2021/2024,
+  Microsoft 365, Mac and web targets, browser limitations, and testing gaps.
+  Automated installation is Windows-only; Mac remains a manual qualification target.
 - Node.js 20+ on PATH (matching `package.json` and the supported CI matrix).
 - A running Hermes gateway with the `api_server` platform enabled on
   `http://127.0.0.1:8642/v1` (`hermes gateway run`). The key is read automatically

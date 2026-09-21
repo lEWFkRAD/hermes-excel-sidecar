@@ -7,6 +7,15 @@ Versioning and uses GitHub Releases for distributable plugin archives.
 
 ### Fixed
 
+- Declare and check the ExcelApi 1.1 baseline, use compatible bounded-range and
+  worksheet lookup APIs, and preflight optional operations before any mutations.
+  New-sheet presentation skips unavailable automatic autofit/freeze features.
+- Preserve Undo barriers after uncertain formatting, structural, sheet-creation
+  or reviewed-write failures. Older webviews no longer need AbortSignal.timeout
+  for activity polling; failed initialization retains visible startup guidance.
+- Document version/platform qualification gaps and add simulated API-tier tests.
+- Unsaved workbooks no longer share a persisted default chat history key.
+
 - Large attachments now support 100 MiB per file and 150 MiB per message with a
   210 MiB chat envelope. Native file encoding avoids per-byte string assembly;
   bounded uploads return actionable HTTP 413 errors instead of connection drops.

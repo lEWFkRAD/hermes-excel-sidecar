@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { normalizeWorkbook } from '../broker/server.mjs';
 
 const source = fs.readFileSync(new URL('../taskpane.js', import.meta.url), 'utf8');
 const clone = (value) => JSON.parse(JSON.stringify(value));
-function pane({ rows = 1, columns = 1 } = {}) {
+function pane({ rows = 1, columns = 1, api = 7 } = {}) {
   const messages = [];
   const loads = [];
   const originalFormat = { fill: 'yellow', font: 'Calibri', border: 'double', alignment: 'right', locked: false, columnWidth: 18 };
@@ -13,16 +14,21 @@ function pane({ rows = 1, columns = 1 } = {}) {
   let syncCount = 0;
   let failSync = 0;
   const sheet = { id: 'sheet-original', name: 'Sheet1', load() {}, getRange: () => range,
-    getUsedRangeOrNullObject: () => ({ isNullObject: true, load() {} }) };
+    getUsedRangeOrNullObject: () => ({ isNullObject: true, load() {} }),
+    getUsedRange: () => ({ address: 'Sheet1!A1', rowCount: 1, columnCount: 1, load() {} }) };
   const range = {
     address: 'Sheet1!A1', rowCount: rows, columnCount: columns, worksheet: sheet,
     format: clone(originalFormat), load(fields) { loads.push({ fields: [...fields], rows: this.rowCount, columns: this.columnCount }); },
     get formulas() { return clone(formulas); }, set formulas(value) { formulas = clone(value); },
     get values() { return clone(formulas); }, set values(value) { formulas = clone(value); },
     get numberFormat() { return clone(numberFormat); }, set numberFormat(value) { numberFormat = clone(value); },
-    getCell() { return this; },
-    getResizedRange(r, c) {
+    getCell(r, c) {
+      if (r === 0 && c === 0) return this;
+      return { endRow: r, endColumn: c };
+    },
+    getBoundingRect(end) {
       if (rows === 1 && columns === 1) return this;
+      const r = end.endRow || 0, c = end.endColumn || 0;
       return { rowCount: r + 1, columnCount: c + 1, values: [['sample']], formulas: [['sample']],
         load(fields) { loads.push({ fields: [...fields], rows: r + 1, columns: c + 1 }); } };
     },
@@ -34,13 +40,14 @@ function pane({ rows = 1, columns = 1 } = {}) {
   const sandbox = {
     window: { location: { origin: 'https://localhost:8788' } },
     document: { querySelector: () => null, getElementById: () => ({}) },
-    Office: { onReady() {} },
+    Office: { onReady() {}, context: { requirements: { isSetSupported: (name, version) => name === 'ExcelApi' && Number(version.split('.')[1]) <= api } } },
     Excel: { run: async (fn) => fn(context) },
-    crypto: { getRandomValues: (bytes) => bytes.fill(1) }, Uint8Array, Blob,
+    crypto: { getRandomValues: (bytes) => bytes.fill(1) }, Uint8Array, Blob, AbortController, setTimeout, clearTimeout,
   };
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
+  const persistHistory = sandbox.saveChatHistory;
   vm.runInContext('addMessage = (...args) => messages.push(args); saveChatHistory = () => {}; setStatus = () => {}; state.workbookId = "book-1";', Object.assign(sandbox, { messages }));
-  return { sandbox, range, sheet, loads, originalFormat,
+  return { sandbox, range, sheet, loads, originalFormat, persistHistory,
     state: vm.runInContext('state', sandbox),
     failNextSync() { failSync = syncCount + 1; } };
 }
@@ -162,4 +169,192 @@ test('small selection retains its data without truncation', async () => {
   const p = pane(); await p.sandbox.readWorkbookContext();
   assert.equal(p.state.selection.truncated, false);
   assert.deepEqual(clone(p.state.selection.values), [[10]]);
+});
+
+for (const api of [1, 2, 4, 6, 7, 12, 20]) {
+  test(`ExcelApi 1.${api}: basic read, reviewed write and Undo work`, async () => {
+    const p = pane({ api });
+    if (api < 4) p.sheet.getUsedRangeOrNullObject = () => { throw new Error('1.4 API used on old host'); };
+    const context = await p.sandbox.readWorkbookContext();
+    assert.ok(context.workbook.excelApi.includes('1.1'));
+    assert.equal(context.workbook.excelApi.includes('1.7'), api >= 7);
+    await p.sandbox.applyReviewedProposal(await p.sandbox.bindProposalToWorkbook({ actions: [action] }));
+    assert.deepEqual(p.range.formulas, [[20]]);
+    await p.sandbox.undoLast();
+    assert.deepEqual(p.range.formulas, [[10]]);
+  });
+}
+
+for (const [type, minimum] of [
+  ['merge_cells', 2], ['unmerge_cells', 2], ['sort_range', 2], ['autofit', 2],
+  ['set_column_width', 2], ['set_row_height', 2], ['conditional_format', 6],
+  ['freeze_panes', 7], ['unfreeze_panes', 7],
+]) {
+  test(`${type} rejects the whole response before writes on an older host`, async () => {
+    const p = pane({ api: minimum - 1 });
+    const result = { actions: [action, { type }] };
+    await assert.rejects(p.sandbox.runWorkbookActions(result), /No changes were applied/);
+    await assert.rejects(p.sandbox.bindProposalToWorkbook(result), /No changes were applied/);
+    await assert.rejects(p.sandbox.applyReviewedProposal({ workbookToken: 'book-1', result }), /No changes were applied/);
+    assert.equal(p.loads.length, 0);
+    assert.deepEqual(p.range.formulas, [[10]]);
+    const supported = pane({ api: minimum });
+    assert.doesNotThrow(() => supported.sandbox.assertCompatibleActions(result.actions));
+  });
+}
+
+test('unknown capability API fails closed instead of assuming modern Excel', async () => {
+  const p = pane();
+  delete p.sandbox.Office.context;
+  await assert.rejects(p.sandbox.runWorkbookActions({ actions: [action] }), /ExcelApi 1.1/);
+  assert.equal(p.loads.length, 0);
+});
+
+test('explicit size/autofit requires 1.2, basic formatting remains available in 1.1', () => {
+  const p = pane({ api: 1 });
+  for (const extra of [{ auto_fit: true }, { column_width: 20 }, { row_height: 15 }]) {
+    assert.throws(() => p.sandbox.assertCompatibleActions([{ type: 'format_cells', ...extra }]), /ExcelApi 1.2/);
+  }
+  assert.doesNotThrow(() => p.sandbox.assertCompatibleActions([{ type: 'format_cells', bold: true }]));
+});
+
+test('1.1 full-sheet selection stays bounded and blank used range is conservatively A1', async () => {
+  const p = pane({ api: 1, rows: 1048576, columns: 16384 });
+  p.sheet.getUsedRangeOrNullObject = () => { throw new Error('unsupported'); };
+  await p.sandbox.readWorkbookContext();
+  assert.equal(p.state.workbook.sheets[0].usedRange, 'Sheet1!A1');
+  for (const load of p.loads.filter(load => load.fields.includes('values') || load.fields.includes('formulas'))) {
+    assert.ok(load.rows <= 100 && load.columns <= 16);
+  }
+});
+
+test('absolute range sizing uses 1.1 cells and bounding rectangle at non-A1 origins', () => {
+  const p = pane({ api: 1 });
+  const cell = (row, column) => ({ row, column,
+    getCell: (r, c) => cell(row + r, column + c),
+    getBoundingRect: end => ({ top: row, left: column, bottom: end.row, right: end.column }),
+  });
+  assert.deepEqual(p.sandbox.sizedRange(cell(22, 7), 3, 4), { top: 22, left: 7, bottom: 24, right: 10 });
+  assert.throws(() => p.sandbox.sizedRange(cell(0, 0), 0, 2), /positive integers/);
+});
+
+for (const api of [1, 2, 6, 7]) {
+  test(`new-sheet presentation on 1.${api} calls only available optional APIs`, () => {
+    const p = pane({ api });
+    let autofits = 0, freezes = 0;
+    const format = { font: {}, fill: {}, borders: { getItem: () => ({}) } };
+    if (api >= 2) {
+      format.autofitColumns = () => autofits++;
+      format.autofitRows = () => autofits++;
+    }
+    const target = { format, getCell() { return this; }, getBoundingRect() { return this; } };
+    const sheet = api >= 7 ? { freezePanes: { freezeRows: () => freezes++ } } : {};
+    p.sandbox.Excel.BorderIndex = {};
+    p.sandbox.Excel.BorderLineStyle = { continuous: 'Continuous' };
+    p.sandbox.Excel.BorderWeight = {};
+    p.sandbox.Excel.HorizontalAlignment = {};
+    p.sandbox.Excel.VerticalAlignment = {};
+    p.sandbox.applyProfessionalTableFormat(sheet, target, [['Heading', 'Value'], ['Item', 3]]);
+    assert.equal(autofits > 0, api >= 2);
+    assert.equal(freezes, api >= 7 ? 1 : 0);
+  });
+}
+
+for (const reviewed of [false, true]) {
+  test(`failed formatting protects earlier Undo records (review=${reviewed})`, async () => {
+    const p = pane();
+    await p.sandbox.writeCellsAction(action);
+    p.sandbox.formatCellsAction = async () => { throw new Error('partial sync failure'); };
+    const result = { actions: [{ type: 'format_cells', range: 'Sheet1!A1' }] };
+    if (reviewed) await p.sandbox.applyReviewedProposal(await p.sandbox.bindProposalToWorkbook(result));
+    else await p.sandbox.runWorkbookActions(result);
+    assert.equal(p.state.undoStack.at(-1).kind, 'non_undoable');
+    await p.sandbox.undoLast();
+    assert.deepEqual(p.range.formulas, [[20]]);
+  });
+}
+
+test('failed create_sheet prevents Undo from reaching an unrelated prior write', async () => {
+  const p = pane();
+  await p.sandbox.writeCellsAction(action);
+  p.sandbox.createSheetAction = async () => { throw new Error('unverified sheet creation'); };
+  await p.sandbox.runWorkbookActions({ actions: [{ type: 'create_sheet' }] });
+  assert.equal(p.state.undoStack.at(-1).kind, 'non_undoable');
+});
+
+test('capability hints are bounded and preserved by workbook normalization', () => {
+  const workbook = normalizeWorkbook({ excelApi: ['1.1', '1.7', '1.7', 'invented', { text: 'untrusted' }] });
+  assert.deepEqual(workbook.excelApi, ['1.1', '1.7']);
+  assert.equal('excelApi' in normalizeWorkbook({}), false);
+});
+
+test('activity fetch supports browsers without AbortSignal.timeout and clears timers', async () => {
+  const p = pane();
+  let cleared = 0;
+  p.sandbox.clearTimeout = timer => { cleared++; clearTimeout(timer); };
+  p.sandbox.fetch = async (url, options) => {
+    assert.ok(options.signal instanceof AbortSignal);
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+  assert.deepEqual(await p.sandbox.fetchJsonWithDeadline('/api/activity', {}, 3000), { ok: true });
+  assert.equal(cleared, 1);
+  p.sandbox.fetch = async () => { throw new Error('network failure'); };
+  await assert.rejects(p.sandbox.fetchJsonWithDeadline('/api/activity', {}, 3000), /network failure/);
+  assert.equal(cleared, 2);
+});
+
+test('activity deadline also aborts a stalled response body', async () => {
+  const p = pane();
+  p.sandbox.fetch = async (url, { signal }) => ({ ok: true,
+    json: () => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')))),
+  });
+  await assert.rejects(p.sandbox.fetchJsonWithDeadline('/api/activity', {}, 5), /aborted/);
+});
+
+for (const failAt of [2, 4]) {
+  test(`reviewed apply sync failure ${failAt} leaves an Undo barrier`, async () => {
+    const p = pane();
+    await p.sandbox.writeCellsAction(action);
+    const proposal = await p.sandbox.bindProposalToWorkbook({ actions: [{ ...action, values: [[30]] }] });
+    const originalRun = p.sandbox.Excel.run;
+    p.sandbox.Excel.run = fn => originalRun(async context => {
+      let calls = 0; const sync = context.sync;
+      context.sync = async () => { if (++calls === failAt) throw new Error('injected reviewed failure'); await sync(); };
+      try { return await fn(context); } finally { context.sync = sync; }
+    });
+    await assert.rejects(p.sandbox.applyReviewedProposal(proposal), /injected reviewed failure/);
+    assert.equal(p.state.undoStack.at(-1).kind, 'non_undoable');
+  });
+}
+
+test('sheet deletion lookup works without 1.4 null-object APIs', async () => {
+  const p = pane({ api: 1 });
+  let deleted = false;
+  p.sheet.delete = () => { deleted = true; };
+  assert.match(await p.sandbox.deleteSheetAction({ name: 'missing' }), /not found/);
+  assert.equal(deleted, false);
+  assert.match(await p.sandbox.deleteSheetAction({ name: 'sheet1' }), /Deleted/);
+  assert.equal(deleted, true);
+});
+
+test('unsaved workbooks never read or write a shared persisted chat', () => {
+  const p = pane();
+  let reads = 0, writes = 0;
+  p.sandbox.localStorage = {
+    getItem() { reads++; return JSON.stringify({ history: [{ content: 'another workbook' }], messages: [] }); },
+    setItem() { writes++; },
+  };
+  for (const key of ['', 'default']) {
+    p.state.workbookKey = key;
+    p.sandbox.loadChatHistory();
+    p.persistHistory();
+    assert.equal(p.state.history.length, 0);
+  }
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+  p.state.workbookKey = 'file:///synthetic.xlsx';
+  p.sandbox.loadChatHistory();
+  p.persistHistory();
+  assert.equal(reads, 1);
+  assert.equal(writes, 1);
 });
