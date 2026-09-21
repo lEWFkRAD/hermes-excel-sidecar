@@ -11,6 +11,58 @@ function bridgeHeaders(extra = {}) {
 
 const REVIEW_MODE_STORAGE_KEY = "hermes-review-mode";
 
+// Office product names/build numbers do not reliably identify API support.
+// Keep the baseline at 1.1; gate explicit newer operations before any writes.
+function supportsExcelApi(version) {
+  try {
+    return Office.context.requirements.isSetSupported("ExcelApi", version) === true;
+  } catch {
+    return false;
+  }
+}
+
+const ACTION_API_REQUIREMENTS = Object.freeze({
+  merge_cells: "1.2", unmerge_cells: "1.2", sort_range: "1.2",
+  set_column_width: "1.2", set_row_height: "1.2", autofit: "1.2",
+  conditional_format: "1.6", freeze_panes: "1.7", unfreeze_panes: "1.7",
+});
+
+function assertCompatibleActions(actions) {
+  if (!supportsExcelApi("1.1")) throw new Error("This host does not support ExcelApi 1.1. No changes were applied.");
+  const unavailable = [];
+  for (const action of actions) {
+    if (!action) continue;
+    let version = ACTION_API_REQUIREMENTS[action.type];
+    if (action.type === "format_cells" &&
+        (action.auto_fit === true || action.column_width != null || action.row_height != null)) version = "1.2";
+    if (version && !supportsExcelApi(version)) unavailable.push(`${action.type} (ExcelApi ${version})`);
+  }
+  if (unavailable.length) {
+    throw new Error(`This Excel host cannot apply ${[...new Set(unavailable)].join(", ")}. No changes were applied. Ask Hermes to omit these operations or update Excel.`);
+  }
+}
+
+// Absolute dimensions from the top-left cell. Both APIs are available in 1.1;
+// getResizedRange requires 1.2 and can accidentally expand a multi-cell input.
+function sizedRange(range, rows, columns) {
+  if (!Number.isInteger(rows) || rows < 1 || !Number.isInteger(columns) || columns < 1) {
+    throw new Error("Range dimensions must be positive integers.");
+  }
+  const first = range.getCell(0, 0);
+  return first.getBoundingRect(first.getCell(rows - 1, columns - 1));
+}
+
+async function fetchJsonWithDeadline(url, options, milliseconds) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), milliseconds);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return response.ok ? await response.json() : null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const state = {
   files: [],
   selection: null,
@@ -77,6 +129,7 @@ const REVIEW_PASSTHROUGH_ACTIONS = new Set([
 
 async function bindProposalToWorkbook(result) {
   const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
+  assertCompatibleActions(actions);
   const unsupported = actions.filter(
     (action) =>
       action &&
@@ -111,7 +164,7 @@ async function bindProposalToWorkbook(result) {
       }
       const values = normalizeMatrix(action.values || action.table);
       const start = rangeFromRef(context, action.start_cell || action.startCell);
-      const target = start.getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
+      const target = sizedRange(start, values.length, Math.max(...values.map((row) => row.length)));
       target.load(["address", "formulas", "numberFormat"]);
       target.worksheet.load(["id", "name"]);
       const actionIndex = resolvedActions.length;
@@ -185,6 +238,7 @@ async function validateProposalIsCurrent(proposal) {
 
 async function applyReviewedProposal(proposal) {
   if (!proposal || proposal.workbookToken !== state.workbookId) throw new Error("This proposal belongs to a different workbook.");
+  assertCompatibleActions(proposal.result.actions || []);
   const statusLines = await Excel.run(async (context) => {
     const sheets = context.workbook.worksheets;
     sheets.load("items/id,items/name");
@@ -234,7 +288,7 @@ async function applyReviewedProposal(proposal) {
         statuses.push(`Wrote ${values.length} row(s) to ${match.range.address}.`);
       } else if (action.type === "create_sheet") {
         const sheet = sheets.add(action.name);
-        const target = sheet.getRange("A1").getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
+        const target = sizedRange(sheet.getRange("A1"), values.length, Math.max(...values.map((row) => row.length)));
         target.values = values;
         statuses.push(`Created ${action.name} and wrote ${values.length} row(s).`);
         createdSheets.push({ name: action.name, sheet, target, values });
@@ -243,15 +297,18 @@ async function applyReviewedProposal(proposal) {
     try {
       await context.sync();
     } catch (commitError) {
+      pushNonUndoable("reviewed change whose completion could not be verified");
       try {
         for (const write of undoWrites) {
           write.range.formulas = write.before.formulas;
           write.range.numberFormat = write.before.numberFormat;
         }
-        const created = createdSheets.map((entry) => sheets.getItemOrNullObject(entry.name));
-        for (const sheet of created) sheet.load("isNullObject");
+        sheets.load("items/name");
         await context.sync();
-        for (const sheet of created) if (!sheet.isNullObject) sheet.delete();
+        for (const entry of createdSheets) {
+          const sheet = sheets.items.find((item) => item.name === entry.name);
+          if (sheet) sheet.delete();
+        }
         await context.sync();
       } catch (restoreError) {
         throw new Error(`Apply failed and automatic restoration could not be confirmed (${commitError.message}; restore: ${restoreError.message}). Inspect the listed targets before continuing.`);
@@ -272,7 +329,12 @@ async function applyReviewedProposal(proposal) {
       write.range.load(["formulas", "numberFormat"]);
     }
     if (undoWrites.length) {
-      await context.sync();
+      try {
+        await context.sync();
+      } catch (error) {
+        pushNonUndoable("reviewed write whose completion could not be verified");
+        throw error;
+      }
       state.undoStack.push({ kind: "reviewed_change_set", writes: undoWrites.map((write) => ({
         address: write.address, worksheetId: write.worksheetId, before: write.before,
         formatted: false,
@@ -296,11 +358,11 @@ async function applyReviewedProposal(proposal) {
       continue;
     }
     if (!REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) continue;
+    passthroughApplied = true; // A rejected sync can still have applied earlier commands.
     try {
       if (action.type === "format_cells") statusLines.push(await formatCellsAction(action));
       else if (action.type === "conditional_format") statusLines.push(await conditionalFormatAction(action));
       else if (STRUCTURAL_ACTIONS[action.type]) statusLines.push(await STRUCTURAL_ACTIONS[action.type](action));
-      passthroughApplied = true;
     } catch (error) {
       statusLines.push(`One step failed (${action.type}): ${error.message} — other changes were still applied.`);
     }
@@ -344,12 +406,16 @@ function addMessage(role, text, persist = true) {
 }
 
 function historyStorageKey() {
-  return `hermes-chat:${state.workbookKey || "default"}`;
+  // Unsaved workbooks have no stable document URL. Never share a default key
+  // across them or replay another workbook's persisted conversation to Hermes.
+  return state.workbookKey && state.workbookKey !== "default" ? `hermes-chat:${state.workbookKey}` : null;
 }
 
 function loadChatHistory() {
+  const key = historyStorageKey();
+  if (!key) return;
   try {
-    const raw = localStorage.getItem(historyStorageKey());
+    const raw = localStorage.getItem(key);
     if (!raw) return;
     const data = JSON.parse(raw);
     if (data && Array.isArray(data.history)) state.history = data.history.slice(-40);
@@ -364,9 +430,11 @@ function loadChatHistory() {
 }
 
 function saveChatHistory() {
+  const key = historyStorageKey();
+  if (!key) return;
   try {
     localStorage.setItem(
-      historyStorageKey(),
+      key,
       JSON.stringify({ history: state.history.slice(-40), messages: renderedMessages.slice(-80) }),
     );
   } catch {}
@@ -377,7 +445,8 @@ function clearChat() {
   state.undoStack = [];
   renderedMessages.length = 0;
   try {
-    localStorage.removeItem(historyStorageKey());
+    const key = historyStorageKey();
+    if (key) localStorage.removeItem(key);
   } catch {}
   els.messages.replaceChildren();
   addMessage("hermes", "Chat cleared. Workbook changes were not reverted; use Undo for that.", false);
@@ -469,12 +538,10 @@ async function pollActivity() {
   try {
     for (const brokerUrl of brokerUrls) {
       try {
-        const response = await fetch(
+        const data = await fetchJsonWithDeadline(
           `${brokerUrl}/api/activity?request_id=${encodeURIComponent(requestId)}`,
-          { headers: bridgeHeaders(), signal: AbortSignal.timeout(3000) },
+          { headers: bridgeHeaders() }, 3000,
         );
-        if (!response.ok) return;
-        const data = await response.json();
         // Ignore replies that raced past this request's completion.
         if (!data?.ok || !data.text || state.activeRequestId !== requestId) return;
         const line = String(data.text).split("\n").map((part) => part.trim()).filter(Boolean).pop() || "";
@@ -599,21 +666,23 @@ async function readWorkbookContext() {
 
     const selectionTruncated = selected.rowCount > 100 || selected.columnCount > 16;
     const selectionSample = selectionTruncated
-      ? selected.getCell(0, 0).getResizedRange(Math.min(selected.rowCount, 100) - 1, Math.min(selected.columnCount, 16) - 1)
+      ? sizedRange(selected, Math.min(selected.rowCount, 100), Math.min(selected.columnCount, 16))
       : selected;
     selectionSample.load(["values", "formulas"]);
 
     const usedRanges = sheets.items.map((sheet) => {
-      const usedRange = sheet.getUsedRangeOrNullObject();
+      const nullable = supportsExcelApi("1.4");
+      const usedRange = nullable ? sheet.getUsedRangeOrNullObject() : sheet.getUsedRange();
       usedRange.load(["address", "rowCount", "columnCount"]);
-      return { sheet, usedRange };
+      return { sheet, usedRange, nullable };
     });
     await context.sync();
 
     state.workbook = {
       activeSheet: active.name,
-      sheets: usedRanges.map(({ sheet, usedRange }) =>
-        usedRange.isNullObject
+      excelApi: ["1.1", "1.2", "1.4", "1.6", "1.7"].filter(supportsExcelApi),
+      sheets: usedRanges.map(({ sheet, usedRange, nullable }) =>
+        nullable && usedRange.isNullObject
           ? { name: sheet.name, usedRange: "", rowCount: 0, columnCount: 0 }
           : {
               name: sheet.name,
@@ -646,9 +715,7 @@ async function executeReadRange(rangeRef) {
 
       const truncated = range.rowCount > 300 || range.columnCount > 30;
       const target = truncated
-        ? range
-            .getCell(0, 0)
-            .getResizedRange(Math.min(range.rowCount, 300) - 1, Math.min(range.columnCount, 30) - 1)
+        ? sizedRange(range, Math.min(range.rowCount, 300), Math.min(range.columnCount, 30))
         : range;
       target.load(["values", "formulas"]);
       await context.sync();
@@ -750,7 +817,7 @@ async function verifyWrittenRange(address) {
       await context.sync();
       const truncated = range.rowCount > 300 || range.columnCount > 30;
       const target = truncated
-        ? range.getCell(0, 0).getResizedRange(Math.min(range.rowCount, 300) - 1, Math.min(range.columnCount, 30) - 1)
+        ? sizedRange(range, Math.min(range.rowCount, 300), Math.min(range.columnCount, 30))
         : range;
       target.load("values");
       await context.sync();
@@ -992,7 +1059,7 @@ function styleRange(range, rows, columns, action = {}) {
   if (action.border_left) setBorder(range.format, Excel.BorderIndex.edgeLeft, action.border_left, borderColor);
   if (action.border_right) setBorder(range.format, Excel.BorderIndex.edgeRight, action.border_right, borderColor);
 
-  if (action.auto_fit !== false) {
+  if (action.auto_fit !== false && supportsExcelApi("1.2")) {
     range.format.autofitColumns();
     range.format.autofitRows();
   }
@@ -1003,23 +1070,23 @@ function applyProfessionalTableFormat(sheet, target, values) {
   const columnCount = Math.max(...values.map((row) => row.length));
   styleRange(target, rowCount, columnCount, { borders: "thin", auto_fit: true });
 
-  const header = target.getCell(0, 0).getResizedRange(0, columnCount - 1);
+  const header = sizedRange(target, 1, columnCount);
   styleRange(header, 1, columnCount, { style: "header", auto_fit: true });
 
   values.forEach((row, index) => {
     const labelText = row.map((cell) => String(cell ?? "").toLowerCase()).join(" ");
     if (index > 0 && /\b(total|net income|gross profit|ebitda|ending balance)\b/.test(labelText)) {
-      const totalRow = target.getCell(index, 0).getResizedRange(0, columnCount - 1);
+      const totalRow = sizedRange(target.getCell(index, 0), 1, columnCount);
       styleRange(totalRow, 1, columnCount, { style: "total-row", auto_fit: true });
     }
   });
 
   if (rowCount > 1 && columnCount > 1) {
-    const body = target.getCell(1, 1).getResizedRange(rowCount - 2, columnCount - 2);
+    const body = sizedRange(target.getCell(1, 1), rowCount - 1, columnCount - 1);
     fillNumberFormat(body, '#,##0.00;[Red](#,##0.00);"-"', rowCount - 1, columnCount - 1);
   }
 
-  sheet.freezePanes.freezeRows(1);
+  if (supportsExcelApi("1.7")) sheet.freezePanes.freezeRows(1);
 }
 
 // A change Hermes can't programmatically reverse (formatting, conditional format,
@@ -1125,7 +1192,7 @@ async function writeCellsAction(action) {
 
   return Excel.run(async (context) => {
     const start = rangeFromRef(context, action.start_cell || action.startCell);
-    const target = start.getResizedRange(values.length - 1, Math.max(...values.map((row) => row.length)) - 1);
+    const target = sizedRange(start, values.length, Math.max(...values.map((row) => row.length)));
     target.load(["address", "formulas", "numberFormat"]);
     target.worksheet.load("id");
     await context.sync();
@@ -1167,10 +1234,7 @@ async function createSheetAction(action) {
     }
 
     const sheet = sheets.add(name);
-    const target = sheet.getRange("A1").getResizedRange(
-      values.length - 1,
-      Math.max(...values.map((row) => row.length)) - 1,
-    );
+    const target = sizedRange(sheet.getRange("A1"), values.length, Math.max(...values.map((row) => row.length)));
     target.values = values;
     applyProfessionalTableFormat(sheet, target, values);
     sheet.activate();
@@ -1339,9 +1403,11 @@ async function renameSheetAction(action) {
 
 async function deleteSheetAction(action) {
   return Excel.run(async (context) => {
-    const sheet = context.workbook.worksheets.getItemOrNullObject(action.name);
+    const sheets = context.workbook.worksheets;
+    sheets.load("items/name");
     await context.sync();
-    if (sheet.isNullObject) return `Sheet "${action.name}" was not found.`;
+    const sheet = sheets.items.find((item) => item.name.toLowerCase() === action.name.toLowerCase());
+    if (!sheet) return `Sheet "${action.name}" was not found.`;
     sheet.delete();
     await context.sync();
     return `Deleted sheet "${action.name}".`;
@@ -1402,10 +1468,14 @@ function actionsFromLegacyWrite(write) {
 
 async function runWorkbookActions(result) {
   const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
+  assertCompatibleActions(actions);
   const statusLines = [];
   let nonUndoableApplied = false;
   for (const action of actions) {
     if (!action || typeof action !== "object") continue;
+    if (["format_cells", "conditional_format"].includes(action.type) || STRUCTURAL_ACTIONS[action.type]) {
+      nonUndoableApplied = true; // Preserve the Undo barrier even after a partial failure.
+    }
     // One bad action must not abort the rest or mask the statuses of writes that
     // already succeeded.
     try {
@@ -1424,15 +1494,12 @@ async function runWorkbookActions(result) {
       }
       if (action.type === "format_cells") {
         statusLines.push(await formatCellsAction(action));
-        nonUndoableApplied = true;
       }
       if (action.type === "conditional_format") {
         statusLines.push(await conditionalFormatAction(action));
-        nonUndoableApplied = true;
       }
       if (STRUCTURAL_ACTIONS[action.type]) {
         statusLines.push(await STRUCTURAL_ACTIONS[action.type](action));
-        nonUndoableApplied = true;
       }
       if (action.type === "unsupported") {
         statusLines.push(
@@ -1441,6 +1508,7 @@ async function runWorkbookActions(result) {
       }
       if (action.type === "export") statusLines.push(await exportAction(action));
     } catch (error) {
+      if (action.type === "create_sheet") nonUndoableApplied = true;
       statusLines.push(`One step failed (${action.type}): ${error.message} — other changes were still applied.`);
     }
   }
@@ -1691,6 +1759,13 @@ Office.onReady((info) => {
     setStatus("Open this add-in inside Excel.");
     return;
   }
+  if (!supportsExcelApi("1.1")) {
+    setStatus("This Excel version lacks ExcelApi 1.1. Update Excel to use Hermes.");
+    els.sendButton.disabled = true;
+    return;
+  }
+  const startupHelp = document.getElementById("startupHelp");
+  if (startupHelp) startupHelp.hidden = true;
   try {
     state.workbookKey = Office.context?.document?.url || "default";
   } catch {

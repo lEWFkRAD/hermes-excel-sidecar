@@ -315,6 +315,11 @@ class ExcelAdapter(BasePlatformAdapter):
             "relative to an A1-based table: the bridge rebases them to the write destination. "
             "For create_sheet, formulas are also A1-based and that sheet starts at A1. "
             "Formatting action ranges must refer to the actual destination sheet and cells. "
+            "When context.workbook.excelApi is present, propose only supported operations: "
+            "merge/unmerge, sort, autofit and row/column sizing require 1.2; conditional_format "
+            "requires 1.6; freeze_panes/unfreeze_panes require 1.7. For older hosts, omit those "
+            "operations and explain the limitation. ExcelApi support does not establish formula "
+            "function availability; prefer traditional formulas unless newer functions are requested. "
             "Use create_sheet when the user asks for a new worksheet; use write_cells for "
             "the current selection. Use only fields defined by the excel_response schema."
         )

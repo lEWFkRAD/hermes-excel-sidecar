@@ -1832,7 +1832,10 @@ function normalizeWorkbook(workbook) {
       });
     }
   }
-  return { activeSheet, sheets };
+  const excelApi = Array.isArray(workbook.excelApi)
+    ? ["1.1", "1.2", "1.4", "1.6", "1.7"].filter((version) => workbook.excelApi.includes(version))
+    : undefined;
+  return { activeSheet, sheets, ...(excelApi ? { excelApi } : {}) };
 }
 
 function buildSystemPrompt(loopBudgetExhausted) {
