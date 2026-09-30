@@ -9,8 +9,6 @@ function bridgeHeaders(extra = {}) {
   return bridgeToken ? { ...extra, "x-hermes-token": bridgeToken } : extra;
 }
 
-const REVIEW_MODE_STORAGE_KEY = "hermes-review-mode";
-
 // Office product names/build numbers do not reliably identify API support.
 // Keep the baseline at 1.1; gate explicit newer operations before any writes.
 function supportsExcelApi(version) {
@@ -78,11 +76,8 @@ const state = {
   undoStack: [],
   workbookId: "",
   conversationId: "",
-  pendingProposal: null,
   workbookKey: "",
   controller: null,
-  // Default off (2026-08-04, Jeff): apply immediately; the checkbox re-enables staging.
-  reviewMode: false,
   // Live-activity relay: the in-flight request id and the freshest streamed
   // draft line from Hermes, shown in place of the canned progress stages.
   activeRequestId: null,
@@ -98,277 +93,6 @@ function randomId(prefix) {
 
 function stableMatrix(value) {
   return JSON.stringify(value || []);
-}
-
-function consumePendingProposal(proposalId) {
-  if (!state.pendingProposal || state.pendingProposal.proposalId !== proposalId || state.pendingProposal.consumed) {
-    return false;
-  }
-  state.pendingProposal.consumed = true;
-  return true;
-}
-
-// Formatting/layout actions that may ride through review mode without cell-level
-// preconditions: they cannot destroy cell contents, so the guarded write path
-// stays intact and these apply afterwards as announced non-undoable steps
-// (same contract review-off mode already gives them). Destructive or
-// cell-shifting actions (insert/delete/sort/clear/merge/delete_sheet) stay
-// blocked in review mode because they can move or erase data the preconditions
-// never captured.
-const REVIEW_PASSTHROUGH_ACTIONS = new Set([
-  "format_cells",
-  "conditional_format",
-  "set_column_width",
-  "set_row_height",
-  "freeze_panes",
-  "unfreeze_panes",
-  "autofit",
-  "unmerge_cells",
-  "rename_sheet",
-]);
-
-async function bindProposalToWorkbook(result) {
-  const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
-  assertCompatibleActions(actions);
-  const unsupported = actions.filter(
-    (action) =>
-      action &&
-      !["write_cells", "create_sheet", "export"].includes(action.type) &&
-      !REVIEW_PASSTHROUGH_ACTIONS.has(action.type),
-  );
-  if (unsupported.length) {
-    throw new Error(
-      `Review mode can't safely apply: ${unsupported.map((a) => a.type).join(", ")}. No changes were applied. Uncheck "Review changes before applying" to run these, or ask Hermes to avoid them.`,
-    );
-  }
-  return Excel.run(async (context) => {
-    const sheets = context.workbook.worksheets;
-    sheets.load("items/id,items/name");
-    const resolvedActions = [];
-    const preconditions = [];
-    const requestedSheetNames = new Set();
-    const writeBindings = [];
-    for (const action of actions) {
-      if (!action || action.type === "export" || REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) {
-        resolvedActions.push(action);
-        continue;
-      }
-      if (action.type === "create_sheet") {
-        const requested = safeSheetName(action.name || action.sheet_name || action.sheetName);
-        const folded = requested.toLowerCase();
-        if (requestedSheetNames.has(folded)) throw new Error(`Duplicate create_sheet name: "${requested}".`);
-        requestedSheetNames.add(folded);
-        resolvedActions.push({ ...action, name: requested });
-        preconditions.push({ type: "create_sheet", name: requested, absent: true });
-        continue;
-      }
-      const values = normalizeMatrix(action.values || action.table);
-      const start = rangeFromRef(context, action.start_cell || action.startCell);
-      const target = sizedRange(start, values.length, Math.max(...values.map((row) => row.length)));
-      target.load(["address", "formulas", "numberFormat"]);
-      target.worksheet.load(["id", "name"]);
-      const actionIndex = resolvedActions.length;
-      resolvedActions.push(null);
-      writeBindings.push({ action, target, actionIndex });
-    }
-    // Capture sheet identity and every target from one coherent workbook read.
-    await context.sync();
-    const sheetIdentity = sheets.items.map((sheet) => ({ id: sheet.id, name: sheet.name }));
-    for (const { action, target, actionIndex } of writeBindings) {
-      resolvedActions[actionIndex] = { ...action, start_cell: target.address, auto_format: action.auto_format === true, review_bound: true };
-      preconditions.push({
-        type: "write_cells",
-        address: target.address,
-        worksheetId: target.worksheet.id,
-        worksheetName: target.worksheet.name,
-        formulas: target.formulas,
-        numberFormat: target.numberFormat,
-      });
-    }
-    return {
-      proposalId: randomId("proposal"),
-      workbookToken: state.workbookId,
-      sheetIdentity,
-      result: { ...result, actions: resolvedActions },
-      preconditions,
-      consumed: false,
-    };
-  });
-}
-
-async function validateProposalIsCurrent(proposal) {
-  if (!proposal || proposal.workbookToken !== state.workbookId) return "This proposal belongs to a different workbook.";
-  return Excel.run(async (context) => {
-    const sheets = context.workbook.worksheets;
-    sheets.load("items/id,items/name");
-    const rangeChecks = [];
-    for (const precondition of proposal.preconditions) {
-      if (precondition.type === "create_sheet") {
-        continue;
-      }
-      const range = rangeFromRef(context, precondition.address);
-      range.load(["formulas", "numberFormat"]);
-      range.worksheet.load("id");
-      rangeChecks.push({ precondition, range });
-    }
-    // One read barrier for the complete proposal: no earlier target is accepted
-    // while later targets are still being fetched.
-    await context.sync();
-    const currentById = new Map(sheets.items.map((sheet) => [sheet.id, sheet.name]));
-    const expectedSignature = stableMatrix(proposal.sheetIdentity.map((sheet) => [sheet.id, sheet.name]));
-    const currentSignature = stableMatrix(sheets.items.map((sheet) => [sheet.id, sheet.name]));
-    if (expectedSignature !== currentSignature) return "The workbook's sheet structure changed.";
-    for (const precondition of proposal.preconditions) {
-      if (precondition.type === "create_sheet" && sheets.items.some((sheet) => sheet.name.toLowerCase() === precondition.name.toLowerCase())) {
-        return `A sheet named "${precondition.name}" now exists.`;
-      }
-    }
-    for (const { precondition, range } of rangeChecks) {
-      if (currentById.get(precondition.worksheetId) !== precondition.worksheetName) {
-        return `The target sheet "${precondition.worksheetName}" was renamed or removed.`;
-      }
-      if (range.worksheet.id !== precondition.worksheetId || stableMatrix(range.formulas) !== stableMatrix(precondition.formulas) ||
-          stableMatrix(range.numberFormat) !== stableMatrix(precondition.numberFormat)) {
-        return `${precondition.address} changed after the proposal was prepared.`;
-      }
-    }
-    return "";
-  });
-}
-
-async function applyReviewedProposal(proposal) {
-  if (!proposal || proposal.workbookToken !== state.workbookId) throw new Error("This proposal belongs to a different workbook.");
-  assertCompatibleActions(proposal.result.actions || []);
-  const statusLines = await Excel.run(async (context) => {
-    const sheets = context.workbook.worksheets;
-    sheets.load("items/id,items/name");
-    const writeChecks = [];
-    for (const precondition of proposal.preconditions) {
-      if (precondition.type !== "write_cells") continue;
-      const range = rangeFromRef(context, precondition.address);
-      range.load(["address", "formulas", "numberFormat"]);
-      range.worksheet.load(["id", "name"]);
-      writeChecks.push({ precondition, range });
-    }
-    await context.sync();
-    const expectedSignature = stableMatrix(proposal.sheetIdentity.map((sheet) => [sheet.id, sheet.name]));
-    const currentSignature = stableMatrix(sheets.items.map((sheet) => [sheet.id, sheet.name]));
-    if (expectedSignature !== currentSignature) throw new Error("Proposal is stale: the workbook's sheet structure changed.");
-    for (const precondition of proposal.preconditions) {
-      if (precondition.type === "create_sheet" && sheets.items.some((sheet) => sheet.name.toLowerCase() === precondition.name.toLowerCase())) {
-        throw new Error(`Proposal is stale: a sheet named "${precondition.name}" now exists.`);
-      }
-    }
-    for (const { precondition, range } of writeChecks) {
-      if (range.worksheet.id !== precondition.worksheetId || range.worksheet.name !== precondition.worksheetName ||
-          stableMatrix(range.formulas) !== stableMatrix(precondition.formulas) ||
-          stableMatrix(range.numberFormat) !== stableMatrix(precondition.numberFormat)) {
-        throw new Error(`Proposal is stale: ${precondition.address} changed after review began.`);
-      }
-    }
-
-    // No await occurs between the compare and queued mutations. Office.js sends
-    // the complete batch at the next sync, minimizing the optimistic-lock race.
-    const undoWrites = [];
-    const createdSheets = [];
-    const statuses = [];
-    const seenWriteAddresses = new Set();
-    for (const action of proposal.result.actions || []) {
-      if (!action || action.type === "export" || REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) continue;
-      const values = normalizeMatrix(action.values || action.table);
-      if (action.type === "write_cells") {
-        const match = writeChecks.find((item) => item.precondition.address === action.start_cell);
-        if (!match) throw new Error(`Missing bound precondition for ${action.start_cell}.`);
-        if (seenWriteAddresses.has(match.range.address)) throw new Error(`Overlapping duplicate reviewed write: ${match.range.address}.`);
-        seenWriteAddresses.add(match.range.address);
-        undoWrites.push({ address: match.range.address, worksheetId: match.range.worksheet.id, range: match.range,
-          before: { formulas: match.range.formulas, numberFormat: match.range.numberFormat } });
-        match.range.values = values;
-        match.range.numberFormat = match.precondition.numberFormat;
-        statuses.push(`Wrote ${values.length} row(s) to ${match.range.address}.`);
-      } else if (action.type === "create_sheet") {
-        const sheet = sheets.add(action.name);
-        const target = sizedRange(sheet.getRange("A1"), values.length, Math.max(...values.map((row) => row.length)));
-        target.values = values;
-        statuses.push(`Created ${action.name} and wrote ${values.length} row(s).`);
-        createdSheets.push({ name: action.name, sheet, target, values });
-      }
-    }
-    try {
-      await context.sync();
-    } catch (commitError) {
-      pushNonUndoable("reviewed change whose completion could not be verified");
-      try {
-        for (const write of undoWrites) {
-          write.range.formulas = write.before.formulas;
-          write.range.numberFormat = write.before.numberFormat;
-        }
-        sheets.load("items/name");
-        await context.sync();
-        for (const entry of createdSheets) {
-          const sheet = sheets.items.find((item) => item.name === entry.name);
-          if (sheet) sheet.delete();
-        }
-        await context.sync();
-      } catch (restoreError) {
-        throw new Error(`Apply failed and automatic restoration could not be confirmed (${commitError.message}; restore: ${restoreError.message}). Inspect the listed targets before continuing.`);
-      }
-      throw new Error(`Apply failed; the reviewed targets were restored (${commitError.message}).`);
-    }
-    // Style only newly created sheets. In-place writes preserve all formatting.
-    try {
-      for (const created of createdSheets) {
-        applyProfessionalTableFormat(created.sheet, created.target, created.values);
-        created.sheet.activate();
-      }
-      if (undoWrites.length || createdSheets.length) await context.sync();
-    } catch (styleError) {
-      statuses.push(`Presentation formatting failed (${styleError.message}) — the written data itself is fine.`);
-    }
-    for (const write of undoWrites) {
-      write.range.load(["formulas", "numberFormat"]);
-    }
-    if (undoWrites.length) {
-      try {
-        await context.sync();
-      } catch (error) {
-        pushNonUndoable("reviewed write whose completion could not be verified");
-        throw error;
-      }
-      state.undoStack.push({ kind: "reviewed_change_set", writes: undoWrites.map((write) => ({
-        address: write.address, worksheetId: write.worksheetId, before: write.before,
-        formatted: false,
-        after: { formulas: write.range.formulas, numberFormat: write.range.numberFormat },
-      })) });
-    }
-    for (const entry of createdSheets) {
-      state.undoStack.push({ kind: "non_undoable", type: `created sheet ${entry.name}; delete it manually if unwanted` });
-    }
-    while (state.undoStack.length > 10) state.undoStack.shift();
-    return statuses;
-  });
-  // Passthrough formatting/layout steps run only after every guarded write has
-  // committed, in proposal order. One failed step reports and moves on, matching
-  // review-off behavior — the reviewed writes above are already safely applied.
-  let passthroughApplied = false;
-  for (const action of proposal.result.actions || []) {
-    if (!action) continue;
-    if (action.type === "export") {
-      statusLines.push(await exportAction(action));
-      continue;
-    }
-    if (!REVIEW_PASSTHROUGH_ACTIONS.has(action.type)) continue;
-    passthroughApplied = true; // A rejected sync can still have applied earlier commands.
-    try {
-      if (action.type === "format_cells") statusLines.push(await formatCellsAction(action));
-      else if (action.type === "conditional_format") statusLines.push(await conditionalFormatAction(action));
-      else if (STRUCTURAL_ACTIONS[action.type]) statusLines.push(await STRUCTURAL_ACTIONS[action.type](action));
-    } catch (error) {
-      statusLines.push(`One step failed (${action.type}): ${error.message} — other changes were still applied.`);
-    }
-  }
-  if (passthroughApplied) pushNonUndoable("formatting / layout change");
-  return statusLines;
 }
 
 const els = {
@@ -387,7 +111,6 @@ const els = {
   undoButton: document.getElementById("undoButton"),
   clearButton: document.getElementById("clearButton"),
   cancelButton: document.getElementById("cancelButton"),
-  reviewToggle: document.getElementById("reviewToggle"),
 };
 
 function setStatus(text) {
@@ -873,39 +596,6 @@ function cancelWork() {
   setStatus("Canceling...");
 }
 
-function describeActions(actions) {
-  return (actions || [])
-    .map((action) => {
-      if (!action) return null;
-      if (action.type === "write_cells") {
-        const rows = (action.values || []).length;
-        const cols = (action.values || [])[0]?.length || 0;
-        return `Write ${rows}×${cols} to ${action.start_cell}`;
-      }
-      if (action.type === "create_sheet") return `Create sheet "${action.name}" (${(action.values || []).length} rows)`;
-      if (action.type === "format_cells") return `Format ${action.range}`;
-      if (action.type === "conditional_format") return `Highlight ${action.range} where value ${action.operator} ${action.value}`;
-      if (action.type === "merge_cells") return `Merge ${action.range}`;
-      if (action.type === "unmerge_cells") return `Unmerge ${action.range}`;
-      if (action.type === "insert_rows") return `Insert rows at ${action.range}`;
-      if (action.type === "insert_columns") return `Insert columns at ${action.range}`;
-      if (action.type === "delete_rows") return `Delete rows ${action.range}`;
-      if (action.type === "delete_columns") return `Delete columns ${action.range}`;
-      if (action.type === "set_column_width") return `Set column width on ${action.range}`;
-      if (action.type === "set_row_height") return `Set row height on ${action.range}`;
-      if (action.type === "freeze_panes") return `Freeze ${action.rows || 0} row(s) / ${action.columns || 0} column(s)`;
-      if (action.type === "unfreeze_panes") return "Unfreeze panes";
-      if (action.type === "autofit") return `Autofit ${action.range}`;
-      if (action.type === "rename_sheet") return `Rename sheet to "${action.to}"`;
-      if (action.type === "delete_sheet") return `Delete sheet "${action.name}"`;
-      if (action.type === "sort_range") return `Sort ${action.range}`;
-      if (action.type === "clear_range") return `Clear ${action.target} of ${action.range}`;
-      return null;
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
 function normalizeMatrix(values) {
   if (!Array.isArray(values)) return [];
   const rows = values
@@ -1138,37 +828,6 @@ async function undoLast() {
         return;
       }
       addMessage("hermes", `Undid the last write: restored ${record.address}. Existing formatting was preserved.`);
-    } else if (record.kind === "reviewed_change_set") {
-      if (record.writes.some((write) => write.formatted)) {
-        state.undoStack.push(record);
-        addMessage("hermes", "Undo refused: this older styled change lacks a complete formatting snapshot. No cells were restored.");
-        return;
-      }
-      const restored = await Excel.run(async (context) => {
-        const checks = record.writes.map((write) => {
-          const range = rangeFromRef(context, write.address);
-          range.load(["formulas", "numberFormat"]);
-          range.worksheet.load("id");
-          return { write, range };
-        });
-        await context.sync();
-        for (const { write, range } of checks) {
-          if (range.worksheet.id !== write.worksheetId || stableMatrix(range.formulas) !== stableMatrix(write.after.formulas) ||
-              stableMatrix(range.numberFormat) !== stableMatrix(write.after.numberFormat)) return false;
-        }
-        for (const { write, range } of checks) {
-          range.formulas = write.before.formulas;
-          range.numberFormat = write.before.numberFormat;
-        }
-        await context.sync();
-        return true;
-      });
-      if (!restored) {
-        state.undoStack.push(record);
-        addMessage("hermes", "Undo refused: at least one target was edited after Hermes applied this change set. No cells were restored.");
-        return;
-      }
-      addMessage("hermes", `Undid the reviewed change set (${record.writes.length} write${record.writes.length === 1 ? "" : "s"}).`);
     } else if (record.kind === "create_sheet") {
       // Legacy in-memory records are never auto-deleted: formulas alone cannot
       // prove that tables, charts, comments, formatting, or sheet settings are unchanged.
@@ -1177,7 +836,7 @@ async function undoLast() {
     }
     saveChatHistory();
   } catch (error) {
-    if (["write_cells", "reviewed_change_set"].includes(record.kind) && state.undoStack[state.undoStack.length - 1] !== record) {
+    if (record.kind === "write_cells" && state.undoStack[state.undoStack.length - 1] !== record) {
       state.undoStack.push(record);
     }
     addMessage("hermes", `Undo failed: ${error.message}`);
@@ -1616,67 +1275,6 @@ function recordAppliedResult(result, filesToSend, fileLines, statusLines) {
   if (filesToSend.length) clearFiles();
 }
 
-function renderReviewButtons(proposal, filesToSend, fileLines) {
-  if (state.pendingProposal && !state.pendingProposal.consumed) {
-    state.pendingProposal.consumed = true;
-    state.pendingProposal.bar?.remove();
-  }
-  const bar = document.createElement("div");
-  bar.className = "pending-actions";
-
-  const applyBtn = document.createElement("button");
-  applyBtn.type = "button";
-  applyBtn.className = "primary";
-  applyBtn.textContent = "Apply";
-  applyBtn.addEventListener("click", async () => {
-    if (!consumePendingProposal(proposal.proposalId)) return;
-    applyBtn.disabled = true;
-    discardBtn.disabled = true;
-    state.sending = true;
-    startWorkIndicator([]);
-    setWorkStage("Applying workbook output...");
-    try {
-      bar.remove();
-      const statusLines = await applyReviewedProposal(proposal);
-      recordAppliedResult(proposal.result, filesToSend, fileLines, statusLines);
-      stopWorkIndicator("Ready");
-    } catch (error) {
-      stopWorkIndicator("Error");
-      addMessage("hermes", `Error: ${error.message}`);
-    } finally {
-      state.sending = false;
-      state.controller = null;
-      els.sendButton.disabled = false;
-    }
-  });
-
-  const discardBtn = document.createElement("button");
-  discardBtn.type = "button";
-  discardBtn.className = "ghost";
-  discardBtn.textContent = "Discard";
-  discardBtn.addEventListener("click", () => {
-    if (!consumePendingProposal(proposal.proposalId)) return;
-    applyBtn.disabled = true;
-    discardBtn.disabled = true;
-    bar.remove();
-    addMessage("hermes", "Discarded — no changes made.");
-  });
-
-  bar.setAttribute("role", "group");
-  bar.setAttribute("aria-label", "Review pending workbook changes");
-  bar.appendChild(applyBtn);
-  bar.appendChild(discardBtn);
-  proposal.bar = bar;
-  proposal.applyBtn = applyBtn;
-  proposal.discardBtn = discardBtn;
-  state.pendingProposal = proposal;
-  els.messages.appendChild(bar);
-  els.messages.scrollTop = els.messages.scrollHeight;
-  // Move focus to Apply so keyboard/AT users land on the actionable control rather
-  // than having it announced as passive text inside the polite live region.
-  applyBtn.focus();
-}
-
 function wireActions() {
   els.prompt.addEventListener("keydown", (event) => {
     // Don't submit mid-IME-composition (CJK/accented input commits with Enter).
@@ -1690,15 +1288,6 @@ function wireActions() {
   els.undoButton.addEventListener("click", undoLast);
   els.clearButton.addEventListener("click", clearChat);
   if (els.cancelButton) els.cancelButton.addEventListener("click", cancelWork);
-  if (els.reviewToggle) {
-    els.reviewToggle.addEventListener("change", (event) => {
-      state.reviewMode = event.target.checked;
-      try {
-        localStorage.setItem(REVIEW_MODE_STORAGE_KEY, state.reviewMode ? "1" : "0");
-      } catch {}
-    });
-  }
-
   els.chatForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (state.sending || state.undoing) return;
@@ -1726,18 +1315,7 @@ function wireActions() {
       const fileLines = fileStatusLines(result);
       if (fileLines.length) addMessage("hermes", fileLines.join("\n"));
 
-      const actions = Array.isArray(result.actions) ? result.actions : actionsFromLegacyWrite(result.write);
-      const applyable = actions.filter((action) => action && action.type !== "read_range");
-
-      if (state.reviewMode && applyable.length) {
-        // Hold the changes; let the user approve them first.
-        addMessage("hermes", `Review these changes:\n${describeActions(applyable)}`);
-        const proposal = await bindProposalToWorkbook(result);
-        renderReviewButtons(proposal, filesToSend, fileLines);
-        stopWorkIndicator("Waiting for review");
-        return;
-      }
-
+      // The validated action response is applied directly; there is no approval stage.
       setWorkStage("Applying workbook output...");
       await applyResultAndRecord(result, filesToSend, fileLines);
       stopWorkIndicator("Ready");
@@ -1784,19 +1362,8 @@ Office.onReady((info) => {
   }
   state.conversationId = randomId("conversation");
   loadChatHistory();
-  loadReviewMode();
   wireDropzone();
   wireActions();
   startBridgeMonitor();
   setStatus("Ready");
 });
-
-function loadReviewMode() {
-  try {
-    const stored = localStorage.getItem(REVIEW_MODE_STORAGE_KEY);
-    if (stored !== null) state.reviewMode = stored === "1";
-  } catch {
-    // Storage may be denied; keep the safe in-memory default (review ON).
-  }
-  if (els.reviewToggle) els.reviewToggle.checked = state.reviewMode;
-}

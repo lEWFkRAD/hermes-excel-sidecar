@@ -143,8 +143,9 @@ def validate_schema(value: Any, schema: dict[str, Any], path: str = "value") -> 
 EXCEL_RESPONSE_SCHEMA = {
     "name": "excel_response",
     "description": (
-        "Finish an Excel turn by submitting a typed workbook-change proposal. "
-        "This does not modify Excel. The task pane validates and previews it before Apply."
+        "Finish an Excel turn by submitting typed workbook actions. "
+        "The task pane validates and applies them directly without an approval step. "
+        "This capture tool does not itself modify Excel; do not claim execution before pane feedback."
     ),
     "parameters": {
         "type": "object",

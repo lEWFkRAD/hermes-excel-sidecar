@@ -5,7 +5,15 @@ Versioning and uses GitHub Releases for distributable plugin archives.
 
 ## [Unreleased]
 
+### Changed
+
+- Apply validated document and chat results directly to the workbook, without
+  Apply/Discard controls or persisted review preferences. Keep structured actions,
+  host capability checks, formatting preservation, verification and guarded Undo.
+
 ### Fixed
+
+- Declare the registered llm_request middleware in the plugin manifest.
 
 - Declare and check the ExcelApi 1.1 baseline, use compatible bounded-range and
   worksheet lookup APIs, and preflight optional operations before any mutations.

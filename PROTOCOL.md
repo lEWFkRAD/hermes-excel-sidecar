@@ -152,3 +152,11 @@ adding a second translation layer double-shifts formulas.
   H23 anchor regression, multi-turn, the medium multi-action build, and export.
 - `node broker/debug-llm.mjs <body.json>` — dump the raw model reply for a
   saved request body.
+
+## Direct workbook application
+
+The task pane applies validated action responses automatically. It has no user
+approval stage. The internal `proposal` response field and `typed-proposals`
+capability retain their existing names for adapter compatibility; neither requires
+a user review step. Capture success is not workbook execution success. The pane
+reports action outcomes after application and retains guarded Undo for cell writes.

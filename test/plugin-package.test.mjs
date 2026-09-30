@@ -8,6 +8,7 @@ test("repository is an installable Hermes standalone plugin", async () => {
   assert.match(manifest, /^manifest_version: 1$/m);
   assert.match(manifest, /^name: hermes-excel-sidecar$/m);
   assert.match(manifest, /^kind: standalone$/m);
+  assert.match(manifest, /^provides_middleware:\s*\n\s*- llm_request$/m);
   const pluginVersion = manifest.match(/^version:\s*(\S+)$/m)?.[1];
   const packageMetadata = JSON.parse(await fs.readFile("package.json", "utf8"));
   assert.match(pluginVersion, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/);

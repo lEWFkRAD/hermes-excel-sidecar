@@ -44,8 +44,12 @@ schema, the read loop, and the formula-anchoring contract.
   H23 becomes `=I24*J24`; `$`-anchors and cross-sheet refs are never shifted).
 - **Post-write verification**: the pane re-reads written ranges and warns on
   error cells or all-zero formula columns.
-- **Undo** (last 10 changes), **Cancel** for in-flight requests, and an
-  optional **review-before-apply** mode (Apply/Discard per change set).
+- **Direct workbook output**: validated actions run automatically after you send
+  a request, including requests with document attachments. There is no Apply/Discard
+  step; older saved review preferences are ignored.
+- **Undo** retains the last 10 records and reverses supported cell writes while
+  preserving formatting and checking for later edits. Structural/formatting changes
+  have explicit non-undoable barriers. **Cancel** stops an in-flight request.
 - **Attachments**: drag/drop PDF/Office/CSV/text/images; TXT/CSV parse
   locally, the rest through a [Docling](https://github.com/docling-project/docling)
   service when available.

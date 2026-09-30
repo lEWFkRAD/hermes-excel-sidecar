@@ -519,8 +519,8 @@ function extractSimpleText(file, bytes) {
 // both lossy and failure-prone on large files (found live: a 12MB report died
 // exactly this way with "invalid response"). When the source HTML
 // already contains <table> markup we parse it straight to cells, with the model
-// out of the loop. The task pane still previews + Undo-gates before applying,
-// so the deterministic path stays supervised and reversible.
+// out of the loop. The task pane validates and applies directly with guarded Undo,
+// so deterministic imports use the same validation and execution reporting.
 
 const HTML_ENTITIES = {
   amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
@@ -1719,11 +1719,11 @@ function deterministicTableProposal(body, { salvage = false } = {}) {
     notes.push(`The table was large — kept the first ${rows} rows. Attach the data as .csv/.xlsx for the full set.`);
   }
   const lead = salvage
-    ? `The typed Excel adapter couldn't complete this, so I placed the source table into a new sheet "${sheetName}" verbatim — nothing was computed or invented.`
-    : `Placed the table from ${file.name} into a new sheet "${sheetName}" (${rows} rows × ${cols} cols), copied verbatim from the source.`;
+    ? `The typed Excel adapter couldn't complete this, so I extracted the source table for a new sheet "${sheetName}" verbatim — nothing was computed or invented.`
+    : `Extracted the table from ${file.name} for a new sheet "${sheetName}" (${rows} rows × ${cols} cols), copied verbatim from the source.`;
 
   return {
-    message: [lead, ...notes, "Review the sheet before applying."].join("\n"),
+    message: [lead, ...notes, "The task pane will write this table directly."].join("\n"),
     actions: [{ type: "create_sheet", name: sheetName.slice(0, 31), values }],
     files: files.map((file) => ({
       name: file.name, type: file.type, size: file.size,
@@ -2004,7 +2004,7 @@ async function callHermesPlatform(body, { signal } = {}) {
     const captured = await response.json();
     if (!captured.proposal || typeof captured.proposal !== "object") throw new Error("Excel adapter returned no proposal");
     const actions = removeSatisfiedReadActions(normalizeActions(captured.proposal, body), body.tool_results);
-    return { message: String(captured.message || captured.proposal.message || "Proposal ready for review."),
+    return { message: String(captured.message || captured.proposal.message || "Workbook actions ready."),
       actions, files, source: "hermes-platform",
       ...(actions.some((action) => action.type === "read_range")
         ? { parsed_files: (body.files || []).map((file) => ({ ...file, base64: undefined, tables: undefined })) } : {}) };
@@ -2085,7 +2085,7 @@ async function callHermesModel(body, { signal, post: injectedPost } = {}) {
       const parsed = captured.proposal;
       if (!parsed || typeof parsed !== "object") throw new Error("Excel adapter returned no proposal");
       const result = {
-        message: String(captured.message || parsed.message || "Proposal ready for review."),
+        message: String(captured.message || parsed.message || "Workbook actions ready."),
         actions: removeSatisfiedReadActions(normalizeActions(parsed, body), body.tool_results),
         files: fileSummary,
         source: "hermes-platform",
@@ -2338,7 +2338,7 @@ async function handleChat(req, res) {
 
     // Deterministic short-circuit: a plain "put this into a table" over an
     // attachment that already parsed to a table never needs the model. Build the
-    // proposal here; the pane still previews + Undo-gates it.
+    // proposal here; the pane validates and applies it directly with guarded Undo.
     const directTable = deterministicTableProposal(body);
     if (directTable) return send(res, 200, directTable, undefined, origin);
 
