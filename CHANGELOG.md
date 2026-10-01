@@ -5,6 +5,23 @@ Versioning and uses GitHub Releases for distributable plugin archives.
 
 ## [Unreleased]
 
+## September 30 hardening
+
+Typed attachment requests receive fair previews for every file and can request up
+to four additional 8,000-character excerpts using `read_attachment` (file_id,
+offset/length, optional literal query). Content stays request-local and untrusted.
+Coverage counts extracted characters supplied to the model, not pages read or
+proof that OCR captured the entire source. Retrieval rounds never apply mutations.
+
+Delayed direct results check workbook identity, active worksheet ID and the
+original selection sample before applying. This is a stale-selection guard, not
+a coauthor transaction lock; edits outside that sample still require care.
+Formatting Undo snapshots up to 1,000 cells; sizing Undo up to 1,000 rows/columns.
+Both refuse restoration after detected later changes. Delete, merge, sort,
+conditional formatting and sheet removal retain non-undoable barriers. Undo
+restores exposed format values; it does not promise restoration of theme linkage.
+Physical Office version/locale tests and browser certificate trust remain required.
+
 ### Changed
 
 - Apply validated document and chat results directly to the workbook, without

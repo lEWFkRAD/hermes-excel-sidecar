@@ -360,3 +360,67 @@ for (const api of [1, 0]) {
     }
   });
 }
+
+
+test('delayed direct application refuses selection edits and sheet replacement', async () => {
+  for (const change of ['content', 'identity']) {
+    const p = pane();
+    const guard = { workbookId: 'book-1', sheetId: p.sheet.id, selection: { address: 'Sheet1!A1', rowCount: 1, columnCount: 1, formulas: [[10]] } };
+    if (change === 'content') p.range.formulas = [[999]]; else p.sheet.id = 'replacement';
+    await assert.rejects(p.sandbox.applyResultAndRecord({ executionGuard: guard, actions: [action] }, [], []), /changed/);
+    assert.notDeepEqual(p.range.values, [[20]]);
+  }
+});
+
+
+function formattedPane(options) {
+  const p = pane(options);
+  const borders = new Map();
+  p.range.format = { load() {}, horizontalAlignment: 'Left', verticalAlignment: 'Top', wrapText: false, rowHeight: 20, columnWidth: 80,
+    font: { load() {}, name: 'Calibri', size: 11, bold: false, italic: false, underline: 'None', color: '#123456' },
+    fill: { load() {}, color: '#FFFF00', clear() { this.color = ''; } },
+    borders: { getItem(edge) { if (!borders.has(edge)) borders.set(edge, { load() {}, style: 'None', weight: 'Thin', color: '#000000' }); return borders.get(edge); } } };
+  return p;
+}
+
+test('formatting Undo restores mixed properties while refusing later edits', async () => {
+  const p = formattedPane();
+  await p.sandbox.formatCellsAction({ range: 'Sheet1!A1', bold: true, fill_color: '#000000', auto_fit: false });
+  assert.equal(p.range.format.font.bold, true);
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.font.bold, false);
+  assert.equal(p.range.format.font.name, 'Calibri');
+  assert.equal(p.range.format.fill.color, '#FFFF00');
+  await p.sandbox.formatCellsAction({ range: 'Sheet1!A1', bold: true, auto_fit: false });
+  p.range.format.font.color = '#999999';
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.font.color, '#999999');
+  assert.equal(p.state.undoStack.at(-1).kind, 'format_cells');
+});
+
+test('sizing Undo restores original width and protects a concurrent resize', async () => {
+  const p = formattedPane();
+  await p.sandbox.setSizeAction({ type: 'set_column_width', range: 'Sheet1!A1', size: 140 });
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.columnWidth, 80);
+  await p.sandbox.setSizeAction({ type: 'set_column_width', range: 'Sheet1!A1', size: 140 });
+  p.range.format.columnWidth = 170;
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.columnWidth, 170);
+});
+
+
+test('format snapshot refuses oversized targets before loading cell contents', async () => {
+  const p = pane({ rows: 100, columns: 100 });
+  await assert.rejects(p.sandbox.formatCellsAction({ range: 'Sheet1!A1:CV100' }), /1,000 cells/);
+  assert.equal(p.loads.some(load => Array.isArray(load.fields) && load.fields.includes('formulas')), false);
+});
+
+
+test('basic formatting and Undo on ExcelApi 1.1 do not load 1.2 sizing properties', async () => {
+  const p = formattedPane({ api: 1 });
+  p.range.format.load = keys => assert.ok(!keys.includes('rowHeight') && !keys.includes('columnWidth'));
+  await p.sandbox.formatCellsAction({ range: 'Sheet1!A1', bold: true, auto_fit: false });
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.font.bold, false);
+});

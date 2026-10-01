@@ -8,6 +8,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import zlib from "node:zlib";
+import { attachmentReader } from "./attachments.mjs";
 import {
   translateMatrixFormulas,
   anchorFromAddress,
@@ -1980,34 +1981,42 @@ function capMessagesSize(messages, budget) {
   return messages;
 }
 
-async function callHermesPlatform(body, { signal } = {}) {
-  const files = (body.files || []).map((file) => ({ name: file.name, type: file.type, size: file.size,
-    extraction_status: file.extraction_status, extraction_method: file.extraction_method,
-    extraction_error: file.extraction_error }));
-  let remaining = 16_000;
-  const platformFiles = files.map((file, index) => {
-    const extracted = String(body.files?.[index]?.extracted_text || "");
-    const extracted_text = extracted.slice(0, Math.max(0, remaining));
-    remaining -= extracted_text.length;
-    return { ...file, extracted_text };
-  });
+async function callHermesPlatform(body, { signal, fetchImpl = fetch } = {}) {
+  const reader = attachmentReader(body.files || []);
+  const attachmentReads = [];
+  let readCount = 0;
   try {
-    const response = await fetch(excelAdapterUrl, { method: "POST",
-      headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) },
-      body: JSON.stringify({ request_id: String(body.request_id || randomUUID()),
-        workbook_id: String(body.workbook_id || "legacy-workbook"),
-        conversation_id: String(body.conversation_id || body.workbook_id || "legacy-conversation"),
-        round: Number(body.loop_count || body.round || 0), prompt: String(body.prompt || ""),
-        context: { workbook: body.workbook, selection: body.selection, history: body.history,
-          tool_results: body.tool_results, files: platformFiles } }), signal });
-    if (!response.ok) throw new Error(`Excel adapter HTTP ${response.status}: ${await response.text().catch(() => "")}`);
-    const captured = await response.json();
-    if (!captured.proposal || typeof captured.proposal !== "object") throw new Error("Excel adapter returned no proposal");
-    const actions = removeSatisfiedReadActions(normalizeActions(captured.proposal, body), body.tool_results);
-    return { message: String(captured.message || captured.proposal.message || "Workbook actions ready."),
-      actions, files, source: "hermes-platform",
-      ...(actions.some((action) => action.type === "read_range")
-        ? { parsed_files: (body.files || []).map((file) => ({ ...file, base64: undefined, tables: undefined })) } : {}) };
+    for (let attempt = 0; attempt <= 4; attempt += 1) {
+      if (attempt) body.request_id = `excel-read-${randomUUID()}`;
+      const response = await fetchImpl(excelAdapterUrl, { method: "POST",
+        headers: { "content-type": "application/json", ...(excelAdapterToken ? { "x-excel-token": excelAdapterToken } : {}) },
+        body: JSON.stringify({ request_id: String(body.request_id || randomUUID()),
+          workbook_id: String(body.workbook_id || "legacy-workbook"),
+          conversation_id: String(body.conversation_id || body.workbook_id || "legacy-conversation"),
+          round: Number(body.loop_count || body.round || 0), prompt: String(body.prompt || ""),
+          context: { workbook: body.workbook, selection: body.selection, history: body.history,
+            tool_results: body.tool_results, files: reader.previews, attachment_reads: attachmentReads,
+            attachment_reads_remaining: 4 - readCount } }), signal });
+      if (!response.ok) throw new Error(`Excel adapter HTTP ${response.status}: ${await response.text().catch(() => "")}`);
+      const captured = await response.json();
+      if (!captured.proposal || typeof captured.proposal !== "object") throw new Error("Excel adapter returned no proposal");
+      const reads = (captured.proposal.actions || []).filter(action => action.type === "read_attachment");
+      if (reads.length) {
+        if (readCount + reads.length > 4) throw new Error("Attachment retrieval budget exhausted; narrow the requested pages or text");
+        for (const action of reads) attachmentReads.push(reader.read(action));
+        readCount += reads.length;
+        // Read rounds never execute co-returned mutations. Only a final response
+        // without retrieval requests may be applied by the pane.
+        continue;
+      }
+      const actions = removeSatisfiedReadActions(normalizeActions(captured.proposal, body), body.tool_results);
+      const files = reader.summaries();
+      return { message: String(captured.message || captured.proposal.message || "Workbook actions ready."),
+        actions, files, source: "hermes-platform",
+        ...(actions.some(action => action.type === "read_range")
+          ? { parsed_files: (body.files || []).map(file => ({ ...file, base64: undefined })) } : {}) };
+    }
+    throw new Error("Attachment retrieval did not finish within the request budget");
   } catch (error) {
     if (signal?.aborted || error?.name === "AbortError") throw error;
     const reason = /HTTP 504|timed out/i.test(error.message) ? "adapter_timeout" :
@@ -2581,6 +2590,7 @@ if (isMainModule) {
 }
 
 export {
+  callHermesPlatform,
   readJson,
   validateUploadBatch,
   parseDelimitedText,

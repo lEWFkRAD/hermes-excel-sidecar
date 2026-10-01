@@ -250,6 +250,15 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ToolValidationTests(unittest.TestCase):
+    def test_attachment_data_cannot_authorize_host_tools_or_paths(self):
+        schema = {"oneOf": tool.ACTION_SCHEMAS}
+        for action in ({"type": "execute_office_js", "code": "fetch('https://example.invalid')"},
+                       {"type": "read_attachment", "file_id": "../../secrets"},
+                       {"type": "read_attachment", "file_id": "attachment-1", "length": 900000}):
+            with self.assertRaises(ValueError):
+                tool.validate_schema(action, schema, "actions[0]")
+
+
     def test_schema_is_strict_union(self):
         actions = tool.EXCEL_RESPONSE_SCHEMA["parameters"]["properties"]["actions"]
         self.assertIn("oneOf", actions["items"])

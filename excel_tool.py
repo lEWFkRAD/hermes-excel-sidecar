@@ -29,6 +29,10 @@ def _action(kind: str, properties: dict[str, Any], required: list[str]) -> dict[
 
 RANGE = {"type": "string", "minLength": 1, "maxLength": 160}
 ACTION_SCHEMAS = [
+    _action("read_attachment", {"file_id": {"type": "string", "pattern": "^attachment-[1-9][0-9]?$", "maxLength": 20},
+        "offset": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "length": {"type": "integer", "minimum": 1, "maximum": 8000},
+        "query": {"type": "string", "minLength": 1, "maxLength": 160}}, ["file_id"]),
     _action("write_cells", {"start_cell": RANGE, "values": MATRIX, "allow_overwrite": {"type": "boolean"},
                              "auto_format": {"type": "boolean"}}, ["values"]),
     _action("create_sheet", {"name": {"type": "string", "minLength": 1, "maxLength": 31}, "values": MATRIX}, ["name", "values"]),

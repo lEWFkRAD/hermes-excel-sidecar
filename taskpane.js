@@ -383,7 +383,7 @@ async function readWorkbookContext() {
     const active = sheets.getActiveWorksheet();
     const selected = workbook.getSelectedRange();
     sheets.load("items/name");
-    active.load("name");
+    active.load(["name", "id"]);
     selected.load(["address", "rowCount", "columnCount"]);
     await context.sync();
 
@@ -403,6 +403,7 @@ async function readWorkbookContext() {
 
     state.workbook = {
       activeSheet: active.name,
+      activeSheetId: active.id,
       excelApi: ["1.1", "1.2", "1.4", "1.6", "1.7"].filter(supportsExcelApi),
       sheets: usedRanges.map(({ sheet, usedRange, nullable }) =>
         nullable && usedRange.isNullObject
@@ -522,6 +523,8 @@ async function askHermes(prompt, filesToSend) {
     const readActions = (response.actions || []).filter((action) => action && action.type === "read_range");
     if (!readActions.length || loopCount >= 5) {
       response.actions = (response.actions || []).filter((action) => action && action.type !== "read_range");
+      response.executionGuard = { workbookId: state.workbookId, sheetId: context.workbook.activeSheetId,
+        selection: JSON.parse(JSON.stringify(context.selection)) };
       return response;
     }
 
@@ -828,6 +831,35 @@ async function undoLast() {
         return;
       }
       addMessage("hermes", `Undid the last write: restored ${record.address}. Existing formatting was preserved.`);
+    } else if (record.kind === "format_cells") {
+      const restored = await Excel.run(async context => {
+        const range = rangeFromRef(context, record.after.address);
+        const current = await formattingSnapshot(context, range);
+        if (JSON.stringify(current) !== JSON.stringify(record.after)) return false;
+        restoreFormatting(range, record.before);
+        await context.sync();
+        return true;
+      });
+      if (!restored) {
+        state.undoStack.push(record);
+        addMessage("hermes", "Undo refused: the formatted cells or their layout were changed after Hermes. No formatting was restored.");
+        return;
+      }
+      addMessage("hermes", `Restored formatting on ${record.before.address}.`);
+    } else if (record.kind === "layout") {
+      const restored = await Excel.run(async context => {
+        const range = rangeFromRef(context, record.address);
+        range.worksheet.load("id");
+        const cells = record.after.map((_, i) => range.getCell(record.field === "rowHeight" ? i : 0, record.field === "columnWidth" ? i : 0));
+        cells.forEach(cell => cell.format.load(record.field));
+        await context.sync();
+        if (range.worksheet.id !== record.worksheetId || cells.some((cell, i) => cell.format[record.field] !== record.after[i])) return false;
+        cells.forEach((cell, i) => { cell.format[record.field] = record.before[i]; });
+        await context.sync();
+        return true;
+      });
+      if (!restored) { state.undoStack.push(record); addMessage("hermes", "Undo refused: row or column sizing changed after Hermes."); return; }
+      addMessage("hermes", `Restored sizing on ${record.address}.`);
     } else if (record.kind === "create_sheet") {
       // Legacy in-memory records are never auto-deleted: formulas alone cannot
       // prove that tables, charts, comments, formatting, or sheet settings are unchanged.
@@ -836,7 +868,7 @@ async function undoLast() {
     }
     saveChatHistory();
   } catch (error) {
-    if (record.kind === "write_cells" && state.undoStack[state.undoStack.length - 1] !== record) {
+    if (["write_cells", "format_cells", "layout"].includes(record.kind) && state.undoStack[state.undoStack.length - 1] !== record) {
       state.undoStack.push(record);
     }
     addMessage("hermes", `Undo failed: ${error.message}`);
@@ -908,6 +940,47 @@ async function createSheetAction(action) {
   });
 }
 
+// Bounded snapshots of the properties our formatter can change. Structural
+// deletion/merge/sort still retain barriers: they need a richer Office restore API.
+async function formattingSnapshot(context, range) {
+  range.load(["address", "rowCount", "columnCount"]);
+  range.worksheet.load("id");
+  await context.sync();
+  if (range.rowCount * range.columnCount > 1000) throw new Error("Undo-safe formatting is limited to 1,000 cells per action; use smaller ranges.");
+  range.load(["formulas", "numberFormat"]);
+  const cells = [];
+  const layoutKeys = ["horizontalAlignment", "verticalAlignment", "wrapText"];
+  if (supportsExcelApi("1.2")) layoutKeys.push("rowHeight", "columnWidth");
+  const edges = ["EdgeTop", "EdgeBottom", "EdgeLeft", "EdgeRight"];
+  for (let r = 0; r < range.rowCount; r++) for (let c = 0; c < range.columnCount; c++) {
+    const cell = range.getCell(r, c), format = cell.format;
+    format.load(layoutKeys);
+    format.font.load(["name", "size", "bold", "italic", "underline", "color"]);
+    format.fill.load("color");
+    const borders = edges.map(edge => { const border = format.borders.getItem(edge); border.load(["style", "weight", "color"]); return border; });
+    cells.push({ r, c, format, borders });
+  }
+  await context.sync();
+  return { address: range.address, worksheetId: range.worksheet.id,
+    formulas: JSON.parse(JSON.stringify(range.formulas)), numberFormat: JSON.parse(JSON.stringify(range.numberFormat)),
+    cells: cells.map(({ r, c, format, borders }) => ({ r, c,
+      font: Object.fromEntries(["name", "size", "bold", "italic", "underline", "color"].map(key => [key, format.font[key]])),
+      fill: format.fill.color,
+      layout: Object.fromEntries(layoutKeys.map(key => [key, format[key]])),
+      borders: borders.map(border => ({ style: border.style, weight: border.weight, color: border.color })) })) };
+}
+
+function restoreFormatting(range, snapshot) {
+  range.numberFormat = snapshot.numberFormat;
+  for (const item of snapshot.cells) {
+    const format = range.getCell(item.r, item.c).format;
+    Object.assign(format.font, item.font);
+    if (item.fill) format.fill.color = item.fill; else format.fill.clear();
+    Object.assign(format, item.layout);
+    ["EdgeTop", "EdgeBottom", "EdgeLeft", "EdgeRight"].forEach((edge, i) => Object.assign(format.borders.getItem(edge), item.borders[i]));
+  }
+}
+
 async function formatCellsAction(action) {
   if (isUnboundedRange(action.range)) {
     throw new Error(`"${action.range}" is an unbounded whole-column/row range; use a bounded range like Sheet1!A2:D100.`);
@@ -916,8 +989,17 @@ async function formatCellsAction(action) {
     const range = rangeFromRef(context, action.range);
     range.load(["address", "rowCount", "columnCount"]);
     await context.sync();
-    styleRange(range, range.rowCount, range.columnCount, action);
-    await context.sync();
+    const before = await formattingSnapshot(context, range);
+    try {
+      styleRange(range, range.rowCount, range.columnCount, action);
+      await context.sync();
+      const after = await formattingSnapshot(context, range);
+      state.undoStack.push({ kind: "format_cells", before, after });
+      if (state.undoStack.length > 10) state.undoStack.shift();
+    } catch (error) {
+      pushNonUndoable("formatting whose completion could not be verified");
+      throw error;
+    }
     return `Formatted ${range.address}.`;
   });
 }
@@ -1016,9 +1098,20 @@ async function deleteCellsAction(action, axis) {
 async function setSizeAction(action) {
   return Excel.run(async (context) => {
     const range = rangeFromRef(context, action.range);
-    if (action.type === "set_column_width") range.format.columnWidth = action.size;
-    else range.format.rowHeight = action.size;
+    const field = action.type === "set_column_width" ? "columnWidth" : "rowHeight";
+    range.load(["address", "rowCount", "columnCount"]); range.worksheet.load("id");
     await context.sync();
+    const count = field === "columnWidth" ? range.columnCount : range.rowCount;
+    if (count > 1000) throw new Error("Undo-safe sizing is limited to 1,000 rows or columns per action.");
+    const cells = Array.from({ length: count }, (_, i) => range.getCell(field === "rowHeight" ? i : 0, field === "columnWidth" ? i : 0));
+    cells.forEach(cell => cell.format.load(field)); await context.sync();
+    const before = cells.map(cell => cell.format[field]);
+    try {
+      range.format[field] = action.size;
+      await context.sync(); cells.forEach(cell => cell.format.load(field)); await context.sync();
+      state.undoStack.push({ kind: "layout", address: range.address, worksheetId: range.worksheet.id, field, before, after: cells.map(cell => cell.format[field]) });
+      if (state.undoStack.length > 10) state.undoStack.shift();
+    } catch (error) { pushNonUndoable("sizing whose completion could not be verified"); throw error; }
     return `Set ${action.type === "set_column_width" ? "column width" : "row height"} on ${action.range}.`;
   });
 }
@@ -1132,7 +1225,7 @@ async function runWorkbookActions(result) {
   let nonUndoableApplied = false;
   for (const action of actions) {
     if (!action || typeof action !== "object") continue;
-    if (["format_cells", "conditional_format"].includes(action.type) || STRUCTURAL_ACTIONS[action.type]) {
+    if (action.type === "conditional_format" || (STRUCTURAL_ACTIONS[action.type] && !["set_column_width", "set_row_height"].includes(action.type))) {
       nonUndoableApplied = true; // Preserve the Undo barrier even after a partial failure.
     }
     // One bad action must not abort the rest or mask the statuses of writes that
@@ -1167,7 +1260,7 @@ async function runWorkbookActions(result) {
       }
       if (action.type === "export") statusLines.push(await exportAction(action));
     } catch (error) {
-      if (action.type === "create_sheet") nonUndoableApplied = true;
+      if (["create_sheet", "format_cells", "set_column_width", "set_row_height"].includes(action.type)) nonUndoableApplied = true;
       statusLines.push(`One step failed (${action.type}): ${error.message} — other changes were still applied.`);
     }
   }
@@ -1200,7 +1293,9 @@ function fileStatusLines(result) {
     .filter((file) => file?.name)
     .map((file) => {
       if (file.extraction_status === "parsed") {
-        return `${file.name}: read with ${file.extraction_method || "parser"}.`;
+        const coverage = file.coverage;
+        return coverage ? `${file.name}: ${coverage.supplied_chars.toLocaleString()} of ${coverage.extracted_chars.toLocaleString()} extracted characters supplied to Hermes${coverage.partial ? " (partial coverage)" : ""}.`
+          : `${file.name}: read with ${file.extraction_method || "parser"}.`;
       }
       if (file.extraction_status === "failed") {
         return `${file.name}: not readable (${file.extraction_error || "parser failed"}).`;
@@ -1258,7 +1353,24 @@ function wireDropzone() {
   els.fileInput.addEventListener("change", (event) => addFiles(event.target.files));
 }
 
+async function assertExecutionContext(guard) {
+  if (!guard) return; // Legacy/test callers do not represent a delayed request.
+  if (guard.workbookId !== state.workbookId) throw new Error("Workbook changed while Hermes was working. Send the request again.");
+  await Excel.run(async context => {
+    const active = context.workbook.worksheets.getActiveWorksheet();
+    active.load("id");
+    const target = rangeFromRef(context, guard.selection.address);
+    const sample = sizedRange(target, Math.min(guard.selection.rowCount, 100), Math.min(guard.selection.columnCount, 16));
+    sample.load("formulas");
+    await context.sync();
+    if (active.id !== guard.sheetId || stableMatrix(sample.formulas) !== stableMatrix(guard.selection.formulas)) {
+      throw new Error("The selected sheet or cells changed while Hermes was working. No actions were applied; send the request again.");
+    }
+  });
+}
+
 async function applyResultAndRecord(result, filesToSend, fileLines) {
+  await assertExecutionContext(result.executionGuard);
   const statusLines = await runWorkbookActions(result);
   recordAppliedResult(result, filesToSend, fileLines, statusLines);
 }
