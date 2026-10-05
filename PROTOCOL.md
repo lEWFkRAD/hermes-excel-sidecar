@@ -79,6 +79,7 @@ file-writing path and runs only on an explicit export action.
 | `conditional_format` | `range`, `operator`, `value`, `value2?`, `fill_color`, `font_color` | pane |
 | structural ops | `merge_cells`/`unmerge_cells` (`range`), `insert_rows`/`delete_rows`/`insert_columns`/`delete_columns` (`sheet?`,`at`,`count`), `set_column_width`/`set_row_height` (`range`,`width`/`height`), `freeze_panes` (`rows`,`columns`)/`unfreeze_panes`, `autofit` (`range`), `rename_sheet` (`from?`,`to`), `delete_sheet` (`name`), `sort_range` (`range`,`column`,`ascending`,`has_header`), `clear_range` (`range`,`target`) | pane |
 | `read_range` | `range`, `reason` | pane (loop) |
+| `read_attachment` | `file_id`, `offset?`, `length?`, `query?` | bridge (bounded request-local retrieval) |
 | `export` | `name`, `values` | pane → POST /api/export |
 
 `conditional_format` applies a native Office.js cell-value rule so the model
@@ -152,3 +153,21 @@ adding a second translation layer double-shifts formulas.
   H23 anchor regression, multi-turn, the medium multi-action build, and export.
 - `node broker/debug-llm.mjs <body.json>` — dump the raw model reply for a
   saved request body.
+
+## Direct workbook application
+
+The task pane applies validated action responses automatically. It has no user
+approval stage. The internal `proposal` response field and `typed-proposals`
+capability retain their existing names for adapter compatibility; neither requires
+a user review step. Capture success is not workbook execution success. The pane
+reports action outcomes after application and retains guarded Undo for cell writes.
+
+
+### Attachment coverage
+
+Each attachment gets a request-local ID and a fair share of the initial text
+budget. `read_attachment` supplies at most 8,000 additional characters per read
+and four retrieval rounds per bridge request. No filesystem path is accepted.
+Mutations returned alongside attachment reads are discarded until the model
+returns its final response. File summaries disclose supplied/extracted character
+counts and partial coverage; those counts do not certify model comprehension.

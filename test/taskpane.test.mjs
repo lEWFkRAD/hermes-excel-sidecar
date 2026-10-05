@@ -8,6 +8,11 @@ const source = fs.readFileSync(new URL('../taskpane.js', import.meta.url), 'utf8
 const clone = (value) => JSON.parse(JSON.stringify(value));
 function pane({ rows = 1, columns = 1, api = 7 } = {}) {
   const messages = [];
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, { value: "", events: {}, addEventListener(name, fn) { this.events[name] = fn; } });
+    return elements.get(id);
+  };
   const loads = [];
   const originalFormat = { fill: 'yellow', font: 'Calibri', border: 'double', alignment: 'right', locked: false, columnWidth: 18 };
   let formulas = [[10]], numberFormat = [['0.00']];
@@ -39,7 +44,7 @@ function pane({ rows = 1, columns = 1, api = 7 } = {}) {
     sync: async () => { syncCount++; if (syncCount === failSync) throw new Error('simulated Office failure'); } };
   const sandbox = {
     window: { location: { origin: 'https://localhost:8788' } },
-    document: { querySelector: () => null, getElementById: () => ({}) },
+    document: { querySelector: () => null, getElementById: element },
     Office: { onReady() {}, context: { requirements: { isSetSupported: (name, version) => name === 'ExcelApi' && Number(version.split('.')[1]) <= api } } },
     Excel: { run: async (fn) => fn(context) },
     crypto: { getRandomValues: (bytes) => bytes.fill(1) }, Uint8Array, Blob, AbortController, setTimeout, clearTimeout,
@@ -47,7 +52,7 @@ function pane({ rows = 1, columns = 1, api = 7 } = {}) {
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
   const persistHistory = sandbox.saveChatHistory;
   vm.runInContext('addMessage = (...args) => messages.push(args); saveChatHistory = () => {}; setStatus = () => {}; state.workbookId = "book-1";', Object.assign(sandbox, { messages }));
-  return { sandbox, range, sheet, loads, originalFormat, persistHistory,
+  return { sandbox, range, sheet, loads, originalFormat, persistHistory, elements, messages,
     state: vm.runInContext('state', sandbox),
     failNextSync() { failSync = syncCount + 1; } };
 }
@@ -131,26 +136,6 @@ test('unverified write does not allow Undo to cascade into an earlier record', a
   assert.equal(p.state.undoStack.at(-1).kind, 'non_undoable');
 });
 
-test('reviewed write and Undo preserve formatting', async () => {
-  const p = pane();
-  const proposal = await p.sandbox.bindProposalToWorkbook({ actions: [action] });
-  await p.sandbox.applyReviewedProposal(proposal);
-  assert.deepEqual(p.range.formulas, [[20]]);
-  assert.deepEqual(p.range.format, p.originalFormat);
-  await p.sandbox.undoLast();
-  assert.deepEqual(p.range.formulas, [[10]]);
-  assert.deepEqual(p.range.format, p.originalFormat);
-});
-
-test('reviewed Undo refuses subsequent content changes', async () => {
-  const p = pane();
-  await p.sandbox.applyReviewedProposal(await p.sandbox.bindProposalToWorkbook({ actions: [action] }));
-  p.range.formulas = [[999]];
-  await p.sandbox.undoLast();
-  assert.deepEqual(p.range.formulas, [[999]]);
-  assert.equal(p.state.undoStack.length, 1);
-});
-
 for (const [rows, columns] of [[1048576, 1], [1, 16384], [1048576, 16384]]) {
   test(`selection ${rows}x${columns} samples at most 100x16 cells`, async () => {
     const p = pane({ rows, columns });
@@ -172,13 +157,13 @@ test('small selection retains its data without truncation', async () => {
 });
 
 for (const api of [1, 2, 4, 6, 7, 12, 20]) {
-  test(`ExcelApi 1.${api}: basic read, reviewed write and Undo work`, async () => {
+  test(`ExcelApi 1.${api}: basic read, direct write and Undo work`, async () => {
     const p = pane({ api });
     if (api < 4) p.sheet.getUsedRangeOrNullObject = () => { throw new Error('1.4 API used on old host'); };
     const context = await p.sandbox.readWorkbookContext();
     assert.ok(context.workbook.excelApi.includes('1.1'));
     assert.equal(context.workbook.excelApi.includes('1.7'), api >= 7);
-    await p.sandbox.applyReviewedProposal(await p.sandbox.bindProposalToWorkbook({ actions: [action] }));
+    await p.sandbox.writeCellsAction(action);
     assert.deepEqual(p.range.formulas, [[20]]);
     await p.sandbox.undoLast();
     assert.deepEqual(p.range.formulas, [[10]]);
@@ -194,8 +179,6 @@ for (const [type, minimum] of [
     const p = pane({ api: minimum - 1 });
     const result = { actions: [action, { type }] };
     await assert.rejects(p.sandbox.runWorkbookActions(result), /No changes were applied/);
-    await assert.rejects(p.sandbox.bindProposalToWorkbook(result), /No changes were applied/);
-    await assert.rejects(p.sandbox.applyReviewedProposal({ workbookToken: 'book-1', result }), /No changes were applied/);
     assert.equal(p.loads.length, 0);
     assert.deepEqual(p.range.formulas, [[10]]);
     const supported = pane({ api: minimum });
@@ -260,19 +243,15 @@ for (const api of [1, 2, 6, 7]) {
   });
 }
 
-for (const reviewed of [false, true]) {
-  test(`failed formatting protects earlier Undo records (review=${reviewed})`, async () => {
-    const p = pane();
-    await p.sandbox.writeCellsAction(action);
-    p.sandbox.formatCellsAction = async () => { throw new Error('partial sync failure'); };
-    const result = { actions: [{ type: 'format_cells', range: 'Sheet1!A1' }] };
-    if (reviewed) await p.sandbox.applyReviewedProposal(await p.sandbox.bindProposalToWorkbook(result));
-    else await p.sandbox.runWorkbookActions(result);
-    assert.equal(p.state.undoStack.at(-1).kind, 'non_undoable');
-    await p.sandbox.undoLast();
-    assert.deepEqual(p.range.formulas, [[20]]);
-  });
-}
+test('failed formatting protects earlier Undo records', async () => {
+  const p = pane();
+  await p.sandbox.writeCellsAction(action);
+  p.sandbox.formatCellsAction = async () => { throw new Error('partial sync failure'); };
+  await p.sandbox.runWorkbookActions({ actions: [{ type: 'format_cells', range: 'Sheet1!A1' }] });
+  assert.equal(p.state.undoStack.at(-1).kind, 'non_undoable');
+  await p.sandbox.undoLast();
+  assert.deepEqual(p.range.formulas, [[20]]);
+});
 
 test('failed create_sheet prevents Undo from reaching an unrelated prior write', async () => {
   const p = pane();
@@ -311,22 +290,6 @@ test('activity deadline also aborts a stalled response body', async () => {
   await assert.rejects(p.sandbox.fetchJsonWithDeadline('/api/activity', {}, 5), /aborted/);
 });
 
-for (const failAt of [2, 4]) {
-  test(`reviewed apply sync failure ${failAt} leaves an Undo barrier`, async () => {
-    const p = pane();
-    await p.sandbox.writeCellsAction(action);
-    const proposal = await p.sandbox.bindProposalToWorkbook({ actions: [{ ...action, values: [[30]] }] });
-    const originalRun = p.sandbox.Excel.run;
-    p.sandbox.Excel.run = fn => originalRun(async context => {
-      let calls = 0; const sync = context.sync;
-      context.sync = async () => { if (++calls === failAt) throw new Error('injected reviewed failure'); await sync(); };
-      try { return await fn(context); } finally { context.sync = sync; }
-    });
-    await assert.rejects(p.sandbox.applyReviewedProposal(proposal), /injected reviewed failure/);
-    assert.equal(p.state.undoStack.at(-1).kind, 'non_undoable');
-  });
-}
-
 test('sheet deletion lookup works without 1.4 null-object APIs', async () => {
   const p = pane({ api: 1 });
   let deleted = false;
@@ -357,4 +320,107 @@ test('unsaved workbooks never read or write a shared persisted chat', () => {
   p.persistHistory();
   assert.equal(reads, 1);
   assert.equal(writes, 1);
+});
+
+for (const api of [1, 0]) {
+  test(`chat submission applies document actions directly with ExcelApi support=${api > 0}`, async () => {
+    const p = pane({ api });
+    // A legacy persisted preference must never stop a direct write for approval.
+    p.sandbox.localStorage = { getItem: () => '1', setItem() {} };
+    p.state.files = [{ name: 'synthetic.csv', size: 12 }];
+    const captured = [];
+    p.sandbox.askHermes = async (prompt, files) => {
+      captured.push({ prompt, files });
+      return { message: 'Import the attached table.', actions: [action], files: [] };
+    };
+    p.sandbox.checkBridgeHealth = async () => true;
+    p.sandbox.startWorkIndicator = () => {};
+    p.sandbox.setWorkStage = () => {};
+    p.sandbox.stopWorkIndicator = () => {};
+    p.sandbox.clearFiles = () => { p.state.files = []; };
+    p.sandbox.verifyWrittenRange = async () => ({ values: p.range.values });
+    p.sandbox.wireActions();
+    p.elements.get('prompt').value = 'Put this document table into the workbook';
+    await p.elements.get('chatForm').events.submit({ preventDefault() {} });
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].files[0].name, 'synthetic.csv');
+    assert.equal(p.state.sending, false);
+    assert.equal(p.elements.get('sendButton').disabled, false);
+    assert.ok(!p.messages.some(message => /Waiting for review|Review these changes/.test(message[1])));
+    if (api > 0) {
+      assert.deepEqual(p.range.values, [[20]]);
+      assert.equal(p.state.files.length, 0);
+      assert.equal(p.state.lastSentFiles[0].name, 'synthetic.csv');
+      await p.sandbox.undoLast();
+      assert.deepEqual(p.range.values, [[10]]);
+    } else {
+      assert.deepEqual(p.range.values, [[10]]);
+      assert.equal(p.state.files.length, 1);
+      assert.ok(p.messages.some(message => /No changes were applied/.test(message[1])));
+    }
+  });
+}
+
+
+test('delayed direct application refuses selection edits and sheet replacement', async () => {
+  for (const change of ['content', 'identity']) {
+    const p = pane();
+    const guard = { workbookId: 'book-1', sheetId: p.sheet.id, selection: { address: 'Sheet1!A1', rowCount: 1, columnCount: 1, formulas: [[10]] } };
+    if (change === 'content') p.range.formulas = [[999]]; else p.sheet.id = 'replacement';
+    await assert.rejects(p.sandbox.applyResultAndRecord({ executionGuard: guard, actions: [action] }, [], []), /changed/);
+    assert.notDeepEqual(p.range.values, [[20]]);
+  }
+});
+
+
+function formattedPane(options) {
+  const p = pane(options);
+  const borders = new Map();
+  p.range.format = { load() {}, horizontalAlignment: 'Left', verticalAlignment: 'Top', wrapText: false, rowHeight: 20, columnWidth: 80,
+    font: { load() {}, name: 'Calibri', size: 11, bold: false, italic: false, underline: 'None', color: '#123456' },
+    fill: { load() {}, color: '#FFFF00', clear() { this.color = ''; } },
+    borders: { getItem(edge) { if (!borders.has(edge)) borders.set(edge, { load() {}, style: 'None', weight: 'Thin', color: '#000000' }); return borders.get(edge); } } };
+  return p;
+}
+
+test('formatting Undo restores mixed properties while refusing later edits', async () => {
+  const p = formattedPane();
+  await p.sandbox.formatCellsAction({ range: 'Sheet1!A1', bold: true, fill_color: '#000000', auto_fit: false });
+  assert.equal(p.range.format.font.bold, true);
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.font.bold, false);
+  assert.equal(p.range.format.font.name, 'Calibri');
+  assert.equal(p.range.format.fill.color, '#FFFF00');
+  await p.sandbox.formatCellsAction({ range: 'Sheet1!A1', bold: true, auto_fit: false });
+  p.range.format.font.color = '#999999';
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.font.color, '#999999');
+  assert.equal(p.state.undoStack.at(-1).kind, 'format_cells');
+});
+
+test('sizing Undo restores original width and protects a concurrent resize', async () => {
+  const p = formattedPane();
+  await p.sandbox.setSizeAction({ type: 'set_column_width', range: 'Sheet1!A1', size: 140 });
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.columnWidth, 80);
+  await p.sandbox.setSizeAction({ type: 'set_column_width', range: 'Sheet1!A1', size: 140 });
+  p.range.format.columnWidth = 170;
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.columnWidth, 170);
+});
+
+
+test('format snapshot refuses oversized targets before loading cell contents', async () => {
+  const p = pane({ rows: 100, columns: 100 });
+  await assert.rejects(p.sandbox.formatCellsAction({ range: 'Sheet1!A1:CV100' }), /1,000 cells/);
+  assert.equal(p.loads.some(load => Array.isArray(load.fields) && load.fields.includes('formulas')), false);
+});
+
+
+test('basic formatting and Undo on ExcelApi 1.1 do not load 1.2 sizing properties', async () => {
+  const p = formattedPane({ api: 1 });
+  p.range.format.load = keys => assert.ok(!keys.includes('rowHeight') && !keys.includes('columnWidth'));
+  await p.sandbox.formatCellsAction({ range: 'Sheet1!A1', bold: true, auto_fit: false });
+  await p.sandbox.undoLast();
+  assert.equal(p.range.format.font.bold, false);
 });

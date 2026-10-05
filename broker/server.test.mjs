@@ -1164,3 +1164,16 @@ test("deterministicTableProposal: best table across ALL files, not first-file-wi
   assert.equal(result.actions[0].values.length, 3);
   assert.match(result.message, /from register\.html/);
 });
+
+
+test("deterministic import reports extracted data, not an unexecuted workbook write", () => {
+  const body = { prompt: "put this into a table", files: [{ name: "synthetic.html",
+    extraction_status: "parsed", tables: [[["Item", "Amount"], ["Example", "4"]]] }] };
+  // Exercise both the direct path and the adapter-failure salvage wording.
+  for (const salvage of [false, true]) {
+    const result = deterministicTableProposal(body, { salvage });
+    assert.ok(result);
+    assert.doesNotMatch(result.message, /placed|review .*before applying/i);
+    assert.match(result.message, /task pane will write this table directly/i);
+  }
+});

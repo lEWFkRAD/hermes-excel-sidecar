@@ -44,8 +44,12 @@ schema, the read loop, and the formula-anchoring contract.
   H23 becomes `=I24*J24`; `$`-anchors and cross-sheet refs are never shifted).
 - **Post-write verification**: the pane re-reads written ranges and warns on
   error cells or all-zero formula columns.
-- **Undo** (last 10 changes), **Cancel** for in-flight requests, and an
-  optional **review-before-apply** mode (Apply/Discard per change set).
+- **Direct workbook output**: validated actions run automatically after you send
+  a request, including requests with document attachments. There is no Apply/Discard
+  step; older saved review preferences are ignored.
+- **Undo** retains the last 10 records and reverses supported cell writes while
+  preserving formatting and checking for later edits. Structural/formatting changes
+  have explicit non-undoable barriers. **Cancel** stops an in-flight request.
 - **Attachments**: drag/drop PDF/Office/CSV/text/images; TXT/CSV parse
   locally, the rest through a [Docling](https://github.com/docling-project/docling)
   service when available.
@@ -249,3 +253,20 @@ In-place `write_cells` operations preserve existing cell formatting and layout, 
 Selection context keeps the original address and dimensions but reads at most 100 rows by 16 columns, with a `truncated` flag for larger selections. Rollback verifies task removal, stops the exact bridge supervisor and child process paths, and refuses further cleanup if those processes survive.
 
 `npm run verify` includes task-pane behavior regressions and simulated PowerShell process-cleanup tests. Python protocol tests require the Hermes gateway runtime; run with that runtime's Python and the Hermes repository on `PYTHONPATH` to avoid a skipped suite. Task-pane tests use mocked Office.js objects and do not certify live Excel behavior.
+
+## September 30 hardening
+
+Typed attachment requests receive fair previews for every file and can request up
+to four additional 8,000-character excerpts using `read_attachment` (file_id,
+offset/length, optional literal query). Content stays request-local and untrusted.
+Coverage counts extracted characters supplied to the model, not pages read or
+proof that OCR captured the entire source. Retrieval rounds never apply mutations.
+
+Delayed direct results check workbook identity, active worksheet ID and the
+original selection sample before applying. This is a stale-selection guard, not
+a coauthor transaction lock; edits outside that sample still require care.
+Formatting Undo snapshots up to 1,000 cells; sizing Undo up to 1,000 rows/columns.
+Both refuse restoration after detected later changes. Delete, merge, sort,
+conditional formatting and sheet removal retain non-undoable barriers. Undo
+restores exposed format values; it does not promise restoration of theme linkage.
+Physical Office version/locale tests and browser certificate trust remain required.

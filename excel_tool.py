@@ -29,6 +29,10 @@ def _action(kind: str, properties: dict[str, Any], required: list[str]) -> dict[
 
 RANGE = {"type": "string", "minLength": 1, "maxLength": 160}
 ACTION_SCHEMAS = [
+    _action("read_attachment", {"file_id": {"type": "string", "pattern": "^attachment-[1-9][0-9]?$", "maxLength": 20},
+        "offset": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "length": {"type": "integer", "minimum": 1, "maximum": 8000},
+        "query": {"type": "string", "minLength": 1, "maxLength": 160}}, ["file_id"]),
     _action("write_cells", {"start_cell": RANGE, "values": MATRIX, "allow_overwrite": {"type": "boolean"},
                              "auto_format": {"type": "boolean"}}, ["values"]),
     _action("create_sheet", {"name": {"type": "string", "minLength": 1, "maxLength": 31}, "values": MATRIX}, ["name", "values"]),
@@ -143,8 +147,9 @@ def validate_schema(value: Any, schema: dict[str, Any], path: str = "value") -> 
 EXCEL_RESPONSE_SCHEMA = {
     "name": "excel_response",
     "description": (
-        "Finish an Excel turn by submitting a typed workbook-change proposal. "
-        "This does not modify Excel. The task pane validates and previews it before Apply."
+        "Finish an Excel turn by submitting typed workbook actions. "
+        "The task pane validates and applies them directly without an approval step. "
+        "This capture tool does not itself modify Excel; do not claim execution before pane feedback."
     ),
     "parameters": {
         "type": "object",

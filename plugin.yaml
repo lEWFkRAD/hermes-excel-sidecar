@@ -17,3 +17,5 @@ optional_env:
     description: Hermes api_server base URL (default http://127.0.0.1:8642/v1)
   - name: HERMES_EXCEL_DOCLING_URL
     description: Optional Docling service URL for document attachments
+provides_middleware:
+  - llm_request
