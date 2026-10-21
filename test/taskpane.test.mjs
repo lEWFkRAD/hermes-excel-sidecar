@@ -53,6 +53,57 @@ function pane({ rows = 1, columns = 1, api = 7 } = {}) {
 }
 const action = { type: 'write_cells', start_cell: 'Sheet1!A1', values: [[20]], auto_format: true };
 
+for (const stage of ['context', 'attachment', 'response', 'range']) {
+  test(`Cancel during ${stage} stops the request without further work`, async () => {
+    const p = pane();
+    let posts = 0, encodes = 0, reads = 0;
+    p.sandbox.readWorkbookContext = async () => {
+      if (stage === 'context') p.sandbox.cancelWork();
+      return {};
+    };
+    p.sandbox.fileToPayload = async () => {
+      encodes++;
+      if (stage === 'attachment') p.sandbox.cancelWork();
+      return {};
+    };
+    p.sandbox.postChat = async () => {
+      posts++;
+      if (stage === 'response') p.sandbox.cancelWork();
+      return { actions: stage === 'range' ? [{ type: 'read_range', range: 'Sheet1!A1' }] : [action] };
+    };
+    p.sandbox.setWorkStage = () => {};
+    p.sandbox.executeReadRange = async () => {
+      reads++;
+      p.sandbox.cancelWork();
+      return {};
+    };
+    await assert.rejects(p.sandbox.askHermes('test', [{ size: 1 }, { size: 1 }]), /^Error: Canceled\.$/);
+    assert.equal(posts, ['context', 'attachment'].includes(stage) ? 0 : 1);
+    assert.equal(encodes, stage === 'context' ? 0 : stage === 'attachment' ? 1 : 2);
+    assert.equal(reads, stage === 'range' ? 1 : 0);
+    assert.deepEqual(p.range.values, [[10]]);
+  });
+}
+
+test('Cancel aborts the fetch and a later request gets a fresh signal', async () => {
+  const p = pane();
+  p.sandbox.readWorkbookContext = async () => ({});
+  let signal;
+  p.sandbox.fetch = async (url, options) => {
+    signal = options.signal;
+    p.sandbox.cancelWork();
+    const error = new Error('aborted'); error.name = 'AbortError'; throw error;
+  };
+  await assert.rejects(p.sandbox.askHermes('first', []), /Canceled\./);
+  assert.equal(signal.aborted, true);
+  p.sandbox.fetch = async (url, options) => {
+    assert.notEqual(options.signal, signal);
+    assert.equal(options.signal.aborted, false);
+    return { ok: true, json: async () => ({ message: 'fresh', actions: [] }) };
+  };
+  assert.equal((await p.sandbox.askHermes('second', [])).message, 'fresh');
+});
+
 test('oversized attachments are rejected before reading a workbook or encoding files', async () => {
   const p = pane();
   await assert.rejects(p.sandbox.askHermes('test', [{ size: 101 * 1024 * 1024 }]), /100 MB per-file/);
