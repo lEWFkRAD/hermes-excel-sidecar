@@ -1,0 +1,8 @@
+{
+  "source": "OpenAI built-in imagegen",
+  "kind": "Concept illustration",
+  "sha256": "8a56edcc626993b6c238ecac456f5bad57d752320a83d2f996919a13e331bc01",
+  "prompts": [
+    "Use case: ads-marketing. Asset: premium open-source homepage/repository banner, exactly wide 2:1 (2048x1024). Create an elegant editorial physical illustration for a local Office.js workbook companion. Exact prominent title: \"Hermes for Excel\". Small subtitle only: \"Workbooks, with a thoughtful companion\". Typography is sophisticated dark emerald editorial serif, generously spaced and clearly readable in the left half, comfortably inside a 10% safe margin. On the right, a sculptural ivory ledger made of crisp paper and translucent green glass rises into a carefully aligned spreadsheet grid. Selected cells are joined by a fine brass formula ribbon; small tasteful verification marks and an offset conversation card communicate structured reads, formula placement and checked edits. No actual numeric financial data, client names, product screenshots, app chrome, stock charts, growth arrows or Microsoft logos. Warm ivory background, forest green, restrained brass details, tactile paper fibers, soft daylight and beautifully cast shadows. Quiet premium craftsmanship and accurate tool identity rather than science-fiction technology. Keep entire title and objects uncropped, no neon, robot, network globe, watermark, fake UI text or extra slogans."
+  ]
+}
