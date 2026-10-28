@@ -1,3 +1,12 @@
+<!-- project-home:start -->
+![Hermes for Excel concept banner](site/hero.png)
+
+**[Hermes for Excel project homepage](https://lewfkrad.github.io/hermes-excel-sidecar/)** · [Documentation](https://github.com/lEWFkRAD/hermes-excel-sidecar#run)
+
+Read across sheets, work with formulas, and review changes with Hermes inside Excel.
+
+<!-- project-home:end -->
+
 # Hermes for Excel
 
 [![CI](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/lEWFkRAD/hermes-excel-sidecar/actions/workflows/ci.yml)
