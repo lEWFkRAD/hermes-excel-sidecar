@@ -193,3 +193,11 @@ zero runtime npm dependencies.
 - The default output style is tuned for accounting/finance tables (header
   rows, total rows, currency formats, formulas over hardcoded totals); see the
   system prompt in `broker/server.mjs` to adjust.
+
+## Workbook preservation and bounded selection reads
+
+In-place `write_cells` operations preserve existing cell formatting and layout, even when `auto_format` is requested. New-sheet output remains automatically styled; explicit formatting actions are still available separately. Hermes Undo checks the worksheet identity, formulas, and number formats against the applied result and refuses to overwrite subsequent edits. It does not clear existing formatting.
+
+Selection context keeps the original address and dimensions but reads at most 100 rows by 16 columns, with a `truncated` flag for larger selections. Rollback verifies task removal, stops the exact bridge supervisor and child process paths, and refuses further cleanup if those processes survive.
+
+`npm run verify` includes task-pane behavior regressions and simulated PowerShell process-cleanup tests. Python protocol tests require the Hermes gateway runtime; run with that runtime's Python and the Hermes repository on `PYTHONPATH` to avoid a skipped suite. Task-pane tests use mocked Office.js objects and do not certify live Excel behavior.

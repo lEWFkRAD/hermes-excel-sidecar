@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +30,12 @@ _active_workbooks: dict[str, str] = {}
 # on close_request. Presentation-only: never persisted, never part of history.
 _activity: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
+
+# Gateway executor workers propagate ContextVars, preserving per-request ownership.
+active_request_id: ContextVar[str] = ContextVar("excel_active_request_id", default="")
+
+def get_active_request() -> PendingExcelRequest | None:
+    return get_request(active_request_id.get())
 
 
 def _set_future(item: PendingExcelRequest, future: asyncio.Future, value: Any) -> None:

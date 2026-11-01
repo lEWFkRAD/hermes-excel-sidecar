@@ -105,13 +105,18 @@ def _matches_type(value: Any, expected: str) -> bool:
 def validate_schema(value: Any, schema: dict[str, Any], path: str = "value") -> None:
     if "oneOf" in schema:
         matches = 0
+        action_errors = []
         for candidate in schema["oneOf"]:
             try:
                 validate_schema(value, candidate, path)
                 matches += 1
-            except ValueError:
-                pass
-        if matches != 1: raise ValueError(f"{path} must match exactly one allowed schema")
+            except ValueError as exc:
+                if isinstance(value, dict) and value.get("type") == candidate.get("properties", {}).get("type", {}).get("const") and "type" in value:
+                    action_errors.append(str(exc))
+        if matches != 1:
+            if matches == 0 and len(action_errors) == 1:
+                raise ValueError(action_errors[0])
+            raise ValueError(f"{path} must match exactly one allowed schema")
         return
     if "const" in schema and value != schema["const"]: raise ValueError(f"{path} has the wrong constant value")
     expected = schema.get("type")

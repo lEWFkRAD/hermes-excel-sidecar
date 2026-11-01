@@ -25,11 +25,12 @@ def register(ctx) -> None:
 
     ctx.register_tool(
         name="excel_response",
+        always_visible=True,
         toolset="hermes-excel-sidecar",
         schema=EXCEL_RESPONSE_SCHEMA,
         handler=handle_excel_response,
         check_fn=excel_response_available,
-        description="Capture a typed Excel proposal for task-pane review.",
+        description="Capture typed Excel actions for direct workbook application.",
         emoji="📊",
     )
     ctx.register_platform(

@@ -36,6 +36,38 @@ $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
+function Get-OwnedBridgeProcesses([string] $Root) {
+  $escapedRoot = [regex]::Escape([IO.Path]::GetFullPath($Root).TrimEnd('\'))
+  # Exact executable-script paths only; a similarly named sibling install is
+  # not ours. Include the cmd supervisor before its node child.
+  $ownedScript = '(?i)(?:^|["\s])' + $escapedRoot + '[\\/](?:service[\\/]bridge-service\.(?:cmd|vbs)|run-bridge\.cmd|broker[\\/]server\.mjs)(?=["\s]|$)'
+  @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+    $_.Name -in @('wscript.exe', 'cmd.exe', 'node.exe') -and
+    $_.CommandLine -and $_.CommandLine -match $ownedScript
+  })
+}
+
+function Stop-OwnedBridgeProcesses([string] $Root) {
+  # Scheduling must already be removed. Stop launchers first so a node killed
+  # below cannot be replaced by a live restart loop.
+  foreach ($pass in 1..3) {
+    $owned = @(Get-OwnedBridgeProcesses $Root)
+    if ($owned.Count -eq 0) { return }
+    $ordered = $owned | Sort-Object @{ Expression = { if ($_.Name -eq 'node.exe') { 1 } else { 0 } } }
+    foreach ($process in $ordered) {
+      try { Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop }
+      catch {
+        # A process exiting between enumeration and Stop-Process is harmless.
+        if (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue) { throw }
+      }
+    }
+  }
+  if (@(Get-OwnedBridgeProcesses $Root).Count -ne 0) {
+    throw 'Bridge processes remain alive; rollback stopped and payload retained.'
+  }
+}
+
+
 try {
   Write-Host ''
   Write-Host "Hermes for Excel rollback" -ForegroundColor White
@@ -47,11 +79,12 @@ try {
   $regTask = Join-Path $InstallDir 'install\register-task.ps1'
   if (-not (Test-Path -LiteralPath $regTask)) { $regTask = Join-Path $ScriptDir 'register-task.ps1' }
   if (Test-Path -LiteralPath $regTask) {
-    try { & powershell -NoProfile -ExecutionPolicy Bypass -File $regTask -InstallDir $InstallDir -Unregister } catch { Write-Warning $_.Exception.Message }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $regTask -InstallDir $InstallDir -Unregister
+    if ($LASTEXITCODE -ne 0) { throw "Bridge task unregistration failed with exit code $LASTEXITCODE; payload retained." }
   } else {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t) {
-      try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
+      Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
       Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
       Write-Host "    Removed task '$TaskName'."
     } else { Write-Host "    Task '$TaskName' not present." }
@@ -59,15 +92,10 @@ try {
 
   # 2. Stop any running bridge from the install dir.
   Step '2. Stop running bridge'
-  $idir = $InstallDir.TrimEnd('\')
-  try {
-    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-      Where-Object { $_.CommandLine -and ($_.CommandLine -like "*$idir*") } |
-      ForEach-Object {
-        Write-Host "    killing bridge PID $($_.ProcessId)"
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-      }
-  } catch { Write-Warning $_.Exception.Message }
+  if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    throw 'Bridge task is still registered; rollback stopped and payload retained.'
+  }
+  Stop-OwnedBridgeProcesses $InstallDir
 
   # 3. Startup shortcut.
   Step '3. Remove Startup shortcut'
@@ -104,7 +132,13 @@ try {
       $proceed = ($answer -match '^(y|yes)$')
     }
     if ($proceed) {
-      Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
+      $resolvedInstall = [IO.Path]::GetFullPath($InstallDir)
+      $expectedInstall = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'hermes\excel-addin'))
+      if ($resolvedInstall -ne $expectedInstall -or $resolvedInstall -eq [IO.Path]::GetPathRoot($resolvedInstall)) {
+        throw "Refusing unsafe rollback target: $resolvedInstall"
+      }
+      Stop-OwnedBridgeProcesses $resolvedInstall
+      Remove-Item -LiteralPath $resolvedInstall -Recurse -Force -ErrorAction Stop
       Write-Host "    Deleted '$InstallDir'."
     } else {
       Write-Host '    Left install dir in place (not confirmed).'

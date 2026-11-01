@@ -8,6 +8,8 @@ author: Jeffrey Watts
 kind: standalone
 platforms:
   - windows
+provides_middleware:
+  - llm_request
 provides_tools:
   - excel_response
 requires_env:
