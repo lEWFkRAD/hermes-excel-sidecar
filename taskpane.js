@@ -760,10 +760,18 @@ async function postChat(payload, options = {}) {
 
 async function askHermes(prompt, filesToSend) {
   validateAttachmentSizes(filesToSend);
-  state.controller = new AbortController();
+  const controller = new AbortController();
+  state.controller = controller;
+  const checkCanceled = () => {
+    if (controller.signal.aborted) throw new Error("Canceled.");
+  };
   const context = await readWorkbookContext();
+  checkCanceled();
   const files = [];
-  for (const file of filesToSend) files.push(await fileToPayload(file));
+  for (const file of filesToSend) {
+    files.push(await fileToPayload(file));
+    checkCanceled();
+  }
 
   let toolResults = [];
   let parsedFiles = null;
@@ -771,6 +779,7 @@ async function askHermes(prompt, filesToSend) {
 
   // The model may ask to read ranges before answering; loop up to 5 read rounds.
   for (let loopCount = 0; loopCount < 6; loopCount += 1) {
+    checkCanceled();
     const requestId = randomId("excel-request");
     state.activeRequestId = requestId;
     state.liveActivity = null;
@@ -788,13 +797,15 @@ async function askHermes(prompt, filesToSend) {
           tool_results: toolResults.length ? toolResults : undefined,
           loop_count: loopCount,
         },
-        { signal: state.controller.signal },
+        { signal: controller.signal },
       );
     } catch (error) {
       if (error.name === "AbortError") throw new Error("Canceled.");
       throw error;
     }
 
+    // A completed response may race Cancel even when fetch has already settled.
+    checkCanceled();
     if (response.parsed_files) parsedFiles = response.parsed_files;
     const readActions = (response.actions || []).filter((action) => action && action.type === "read_range");
     if (!readActions.length || loopCount >= 5) {
@@ -804,6 +815,7 @@ async function askHermes(prompt, filesToSend) {
 
     setWorkStage(`Hermes is reading ${readActions.map((action) => action.range).join(", ")}...`);
     const reads = await Promise.all(readActions.map((action) => executeReadRange(action.range)));
+    checkCanceled();
     toolResults = [...toolResults, ...reads];
   }
   return response;
