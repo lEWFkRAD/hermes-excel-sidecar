@@ -258,3 +258,7 @@ In-place `write_cells` operations preserve existing cell formatting and layout, 
 Selection context keeps the original address and dimensions but reads at most 100 rows by 16 columns, with a `truncated` flag for larger selections. Rollback verifies task removal, stops the exact bridge supervisor and child process paths, and refuses further cleanup if those processes survive.
 
 `npm run verify` includes task-pane behavior regressions and simulated PowerShell process-cleanup tests. Python protocol tests require the Hermes gateway runtime; run with that runtime's Python and the Hermes repository on `PYTHONPATH` to avoid a skipped suite. Task-pane tests use mocked Office.js objects and do not certify live Excel behavior.
+
+## Related projects
+
+The related [hermes-sheets](https://github.com/lEWFkRAD/hermes-sheets) plugin is a separate full grid inside Hermes Desktop (opens/edits xlsx directly). They are peers, not a replacement.
